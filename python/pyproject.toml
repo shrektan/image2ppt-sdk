@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "image2ppt"
+version = "0.1.0"
+description = "Official Python client for the image2ppt API — convert images and PDFs into editable PowerPoint (.pptx)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "image2ppt" }]
+keywords = [
+    "image2ppt",
+    "pptx",
+    "powerpoint",
+    "presentation",
+    "slides",
+    "pdf",
+    "ocr",
+    "image-to-pptx",
+    "api",
+    "sdk",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Office Suites",
+    "Topic :: Multimedia :: Graphics :: Presentation",
+    "Typing :: Typed",
+]
+dependencies = [
+    "requests>=2.25",
+    "Pillow>=9.0",
+]
+
+[project.urls]
+Homepage = "https://image2ppt.com"
+Documentation = "https://image2ppt.com/docs/api"
+Repository = "https://github.com/shrektan/image2ppt-sdk"
+Issues = "https://github.com/shrektan/image2ppt-sdk/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/image2ppt"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
