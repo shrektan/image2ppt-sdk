@@ -118,6 +118,7 @@ _CODE_TO_EXC: Dict[str, type] = {
     "API_KEY_REQUIRED": AuthenticationError,
     "ACCOUNT_DELETED": AuthenticationError,
     "INVALID_FILE": InvalidFileError,
+    "INVALID_PDF": InvalidFileError,
     "TOO_MANY_SLIDES": TooManySlidesError,
     "INSUFFICIENT_CREDITS": InsufficientCreditsError,
     "RATE_LIMITED": RateLimitedError,

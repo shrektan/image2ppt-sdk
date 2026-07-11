@@ -192,9 +192,10 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 | HTTP | code | 含义 |
 |---|---|---|
 | 409 | `NOT_READY` | 任务还没完成，成品暂不可下载。等状态变成 `completed` 再来。 |
+| 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理，无法下载（见下方「保留期」）。 |
 | 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户。 |
 
-> **保留期**：成品 PPTX 在完成后**保留 7 天**，过期自动清理，之后下载会返回 404。请在保留期内取走。（历史记录仍在，只是成品文件不再保存。）
+> **保留期**：成品 PPTX 在完成后**保留 7 天**，过期自动清理，之后下载会返回 `410 OUTPUT_EXPIRED`。请在保留期内取走。（历史记录仍在，只是成品文件不再保存。）
 
 ---
 
@@ -331,8 +332,12 @@ try {
 | 400 | `INVALID_PDF` | PDF 无法读取或解析（提交）。 |
 | 400 | `INVALID_ASPECT_RATIO` | 画幅比例不认识，用 `auto` 或 `16:9`、`4:3`（提交）。 |
 | 400 | `TOO_MANY_SLIDES` | 总页数超过 50（提交）。 |
-| 402 | `INSUFFICIENT_CREDITS` | 可用积分不足（提交）。 |
-| 429 | `RATE_LIMITED` | 触发限流，带 `Retry-After` 头（提交、轮询）。 |
+| 400 | `PAGE_RATE_EXCEEDED` | 单次提交页数就超过每分钟提交上限，永远排不进窗口（提交）。 |
+| 402 | `INSUFFICIENT_CREDITS` | 可用积分不足，或余额为 0（提交）。 |
+| 403 | `API_KEY_REQUIRED` | 缺少有效的 API key（提交）。 |
+| 403 | `ACCOUNT_DELETED` | 账号已删除（提交）。 |
+| 429 | `RATE_LIMITED` | 触发限流，带 `Retry-After` 头（提交）。轮询状态不限流。 |
 | 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户（查询、下载）。 |
 | 409 | `NOT_READY` | 任务未完成就来下载（下载）。 |
+| 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理（下载）。 |
 | 5xx | `STORAGE_FAILED` 等 | 服务端处理出错，稍后重试；反复出现请联系我们。 |

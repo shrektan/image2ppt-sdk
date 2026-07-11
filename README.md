@@ -39,7 +39,7 @@ console.log("done, credits used:", job.creditsUsed);
 2. Open the **Developer / API** page from the account menu.
 3. Create a key (looks like `i2p_live_xxxx`). It's shown in full **once** — save it.
 
-API access is available to accounts with credits. Conversion is billed per page (1 page = 1 credit), shared with the web app.
+API access is available to accounts that have purchased credits (it opens automatically on your first purchase). Conversion is billed per page (1 page = 1 credit), shared with the web app.
 
 ## API reference
 

@@ -104,7 +104,9 @@ export class Image2PPTClient {
   async wait(jobId: string, options: WaitOptions = {}): Promise<Job> {
     const pollInterval = options.pollIntervalMs ?? 5_000;
     const timeout = options.timeoutMs ?? 1_800_000;
-    const deadline = Date.now() + timeout;
+    // Monotonic clock so a system-time jump can't skew the deadline (mirrors the
+    // Python client's time.monotonic()).
+    const deadline = performance.now() + timeout;
     let interval = pollInterval;
 
     for (;;) {
@@ -206,7 +208,7 @@ export class Image2PPTClient {
   }
 
   async #sleepUntil(deadline: number, ms: number, jobId: string): Promise<void> {
-    const remaining = deadline - Date.now();
+    const remaining = deadline - performance.now();
     if (remaining <= 0) {
       throw new Image2PPTTimeoutError(`timed out waiting for job ${jobId}`, jobId);
     }
