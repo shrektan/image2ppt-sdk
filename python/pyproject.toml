@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "image2ppt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Official Python client for the image2ppt API — convert images and PDFs into editable PowerPoint (.pptx)."
 readme = "README.md"
 requires-python = ">=3.9"
