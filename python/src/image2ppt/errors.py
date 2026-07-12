@@ -128,6 +128,7 @@ _CODE_TO_EXC: Dict[str, type] = {
 }
 _STATUS_TO_EXC: Dict[int, type] = {
     401: AuthenticationError,
+    403: AuthenticationError,  # API_KEY_REQUIRED / ACCOUNT_DELETED (fallback if code absent)
     402: InsufficientCreditsError,
     404: JobNotFoundError,
     409: NotReadyError,

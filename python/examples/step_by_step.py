@@ -33,7 +33,7 @@ def main() -> int:
             job = client.submit(paths, aspect_ratio="auto")
             break
         except RateLimitedError as e:
-            wait_s = e.retry_after or 5
+            wait_s = e.retry_after if e.retry_after is not None else 5
             print(f"rate limited, retrying in {wait_s}s")
             time.sleep(wait_s)
 

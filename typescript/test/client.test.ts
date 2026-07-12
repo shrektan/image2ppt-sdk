@@ -18,6 +18,7 @@ import {
   Image2PPTTimeoutError,
   InsufficientCreditsError,
   Job,
+  JobNotFoundError,
   NotReadyError,
   RateLimitedError,
 } from "../src/index.js";
@@ -159,6 +160,43 @@ describe("wait", () => {
     await expect(c.wait("j", { pollIntervalMs: 0, timeoutMs: 0 })).rejects.toBeInstanceOf(
       Image2PPTTimeoutError,
     );
+  });
+
+  it("retries a transient 5xx then completes", async () => {
+    const c = client(
+      fetchSequence(
+        json(500, { error: { code: "STORAGE_FAILED", message: "oops" } }),
+        json(200, { jobId: "j", status: "completed" }),
+      ),
+    );
+    const job = await c.wait("j", { pollIntervalMs: 0 });
+    expect(job.isCompleted).toBe(true);
+  });
+
+  it("aborts on a 4xx (job gone) during polling", async () => {
+    const c = client(fetchSequence(json(404, { error: { code: "JOB_NOT_FOUND", message: "gone" } })));
+    await expect(c.wait("j", { pollIntervalMs: 0 })).rejects.toBeInstanceOf(JobNotFoundError);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// convert (end-to-end: submit -> wait -> download)
+// --------------------------------------------------------------------------- //
+describe("convert", () => {
+  it("submits, waits, and streams the download to disk", async () => {
+    const out = join(dir, "out.pptx");
+    const file = await tempFile();
+    const c = client(
+      fetchSequence(
+        json(201, { jobId: "job_9", status: "pending", slideCount: 1, creditsReserved: 1 }),
+        json(200, { jobId: "job_9", status: "completed", slideCount: 1, creditsUsed: 1 }),
+        new Response(Buffer.from("PPTXDATA"), { status: 200 }),
+      ),
+    );
+    const job = await c.convert([file], out, { pollIntervalMs: 0 });
+    expect(job.isCompleted).toBe(true);
+    expect(job.jobId).toBe("job_9");
+    expect((await readFile(out)).toString()).toBe("PPTXDATA");
   });
 });
 

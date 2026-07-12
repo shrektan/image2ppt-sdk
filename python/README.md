@@ -72,7 +72,7 @@ while True:
         job = client.submit(paths)
         break
     except RateLimitedError as e:
-        time.sleep(e.retry_after or 5)
+        time.sleep(e.retry_after if e.retry_after is not None else 5)
 ```
 
 ## Errors

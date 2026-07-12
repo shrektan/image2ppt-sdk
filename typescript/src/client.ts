@@ -1,9 +1,13 @@
 /** The image2ppt API client. */
 
+import { createWriteStream } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, extname } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 import {
+  Image2PPTError,
   Image2PPTTimeoutError,
   JobFailedError,
   RateLimitedError,
@@ -119,7 +123,16 @@ export class Image2PPTClient {
           await this.#sleepUntil(deadline, waitMs, jobId);
           continue;
         }
-        throw err;
+        // A single poll hit a transient server (5xx) or network error. The job may
+        // still be running, so back off and retry until the deadline instead of
+        // aborting. Client errors (4xx: job gone, bad key) are not transient.
+        const transient =
+          !(err instanceof Image2PPTError) ||
+          (err.statusCode != null && err.statusCode >= 500);
+        if (!transient) throw err;
+        await this.#sleepUntil(deadline, interval, jobId);
+        interval = Math.min(interval * 1.5, 15_000);
+        continue;
       }
 
       if (job.isCompleted) return job;
@@ -148,7 +161,14 @@ export class Image2PPTClient {
     if (!res.ok) {
       await this.#raiseForError(res);
     }
-    await writeFile(destPath, Buffer.from(await res.arrayBuffer()));
+    if (res.body) {
+      // Stream to disk in chunks so a large PPTX never sits fully in memory
+      // (mirrors the Python client's iter_content streaming).
+      await pipeline(Readable.fromWeb(res.body), createWriteStream(destPath));
+    } else {
+      // No body stream (shouldn't happen for a 200 download): buffer as a fallback.
+      await writeFile(destPath, Buffer.from(await res.arrayBuffer()));
+    }
     return destPath;
   }
 
@@ -171,13 +191,31 @@ export class Image2PPTClient {
   }
 
   // ----- internals --------------------------------------------------- //
-  #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {
-    return this.#fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: { Authorization: `Bearer ${this.#apiKey}` },
-      body: init.body,
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+  async #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {
+    try {
+      return await this.#fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers: { Authorization: `Bearer ${this.#apiKey}` },
+        body: init.body,
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      // AbortSignal.timeout aborts the whole request (including a slow large
+      // upload/download body) with a native DOMException, which is NOT an
+      // Image2PPTError. Re-wrap it so callers catching Image2PPTError — as the
+      // README/examples do — don't crash on a raw DOMException. Raise timeoutMs
+      // for large transfers; it bounds the entire request, not just idle time.
+      if (
+        err instanceof DOMException &&
+        (err.name === "TimeoutError" || err.name === "AbortError")
+      ) {
+        throw new Image2PPTError(
+          `request to ${path} exceeded timeoutMs=${this.timeoutMs}`,
+          { code: "REQUEST_TIMEOUT" },
+        );
+      }
+      throw err;
+    }
   }
 
   async #parseJson(res: Response): Promise<Record<string, unknown>> {

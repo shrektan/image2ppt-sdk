@@ -8,11 +8,13 @@ import time
 from typing import Any, Dict, Optional, Sequence
 
 import requests
+from PIL import Image, UnidentifiedImageError
 
 from ._compress import IMAGE_MIMES, compress_image_for_upload
 from .errors import (
     Image2PPTError,
     Image2PPTTimeoutError,
+    InvalidFileError,
     JobFailedError,
     RateLimitedError,
     exception_for,
@@ -103,7 +105,16 @@ class Image2PPTClient:
                     # Images: pre-compress to the server spec so its pass is a passthrough.
                     with open(path, "rb") as fh:
                         raw = fh.read()
-                    payload, out_mime = compress_image_for_upload(raw, mime)
+                    try:
+                        payload, out_mime = compress_image_for_upload(raw, mime)
+                    except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
+                        # Corrupt/truncated image, or one over Pillow's decompression-bomb
+                        # threshold. Surface it as an SDK error (like a server INVALID_FILE)
+                        # so callers catching Image2PPTError don't get a raw Pillow type.
+                        raise InvalidFileError(
+                            f"could not read image {filename!r}: {exc}",
+                            code="INVALID_FILE",
+                        ) from exc
                     if out_mime == "image/jpeg" and not filename.lower().endswith(
                         (".jpg", ".jpeg")
                     ):
@@ -162,6 +173,18 @@ class Image2PPTClient:
             except RateLimitedError as exc:
                 sleep_for = exc.retry_after if exc.retry_after is not None else interval
                 self._sleep_until(deadline, sleep_for, job_id)
+                continue
+            except (Image2PPTError, requests.RequestException) as exc:
+                # A single poll hit a transient server (5xx) or network error. The job
+                # itself may still be running, so back off and retry until the deadline
+                # instead of aborting the whole wait/convert. Client errors (4xx: job
+                # gone, bad key) are not transient — re-raise them immediately.
+                if isinstance(exc, Image2PPTError) and (
+                    exc.status_code is None or exc.status_code < 500
+                ):
+                    raise
+                self._sleep_until(deadline, interval, job_id)
+                interval = min(interval * 1.5, 15.0)
                 continue
 
             if job.is_completed:

@@ -67,6 +67,12 @@ def compress_image_for_upload(raw: bytes, mime: str) -> "tuple[bytes, str]":
             if len(compressed) <= _UPLOAD_TARGET_BYTES:
                 break
 
-    if compressed is None or len(compressed) >= len(raw):
-        return raw, mime
-    return compressed, "image/jpeg"
+    oversized = max(width, height) > _UPLOAD_MAX_DIM
+    if compressed is not None and (oversized or len(compressed) < len(raw)):
+        # Keep the re-encode when it's smaller, OR when the source is over the
+        # dimension budget — an oversized image MUST be shrunk to honor the
+        # "<= 2000px" guarantee, even if this particular re-encode is a few bytes
+        # larger. The "never blurrier AND bigger" fallback only applies to
+        # already-in-bounds images (a byte-size-only miss).
+        return compressed, "image/jpeg"
+    return raw, mime

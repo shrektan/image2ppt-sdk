@@ -105,6 +105,7 @@ const CODE_TO_CLASS: Record<string, new (m: string, i?: ErrorInit) => Image2PPTE
 };
 const STATUS_TO_CLASS: Record<number, new (m: string, i?: ErrorInit) => Image2PPTError> = {
   401: AuthenticationError,
+  403: AuthenticationError, // API_KEY_REQUIRED / ACCOUNT_DELETED (fallback if code absent)
   402: InsufficientCreditsError,
   404: JobNotFoundError,
   409: NotReadyError,

@@ -19,8 +19,10 @@ from image2ppt import (
     Image2PPTError,
     Image2PPTTimeoutError,
     InsufficientCreditsError,
+    InvalidFileError,
     Job,
     JobFailedError,
+    JobNotFoundError,
     NotReadyError,
     RateLimitedError,
 )
@@ -151,6 +153,33 @@ def test_submit_insufficient_credits(tmp_path):
         make_client(handler).submit([str(img)])
 
 
+def test_submit_pdf_uses_raw_handle_branch(tmp_path):
+    """PDFs skip compression and upload via the open-handle branch with the pdf mime."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4 not-a-real-pdf-but-not-an-image")
+    captured = {}
+
+    def handler(method, url, **kwargs):
+        captured["files"] = kwargs.get("files")
+        return FakeResponse(201, {"jobId": "job_pdf", "status": "pending", "slideCount": 3, "creditsReserved": 3})
+
+    job = make_client(handler).submit([str(pdf)])
+    assert job.job_id == "job_pdf"
+    # multipart entry: ("files", (filename, handle, mime))
+    _field, (filename, _handle, mime) = captured["files"][0]
+    assert filename == "doc.pdf"
+    assert mime == "application/pdf"
+
+
+def test_submit_corrupt_image_raises_invalid_file(tmp_path):
+    """A file with an image extension but unreadable bytes surfaces as InvalidFileError,
+    not a raw Pillow exception (which callers catching Image2PPTError would miss)."""
+    bad = tmp_path / "broken.png"
+    bad.write_bytes(b"not actually a PNG")
+    with pytest.raises(InvalidFileError):
+        make_client(lambda *a, **k: FakeResponse()).submit([str(bad)])
+
+
 # --------------------------------------------------------------------------- #
 # get_job / wait
 # --------------------------------------------------------------------------- #
@@ -201,6 +230,44 @@ def test_wait_timeout():
     with pytest.raises(Image2PPTTimeoutError) as exc:
         make_client(handler).wait("j", poll_interval=0, timeout=0)
     assert exc.value.job_id == "j"
+
+
+def test_wait_retries_transient_5xx():
+    """A single transient 5xx poll is retried, not fatal — the job finishes."""
+    responses = iter([
+        FakeResponse(500, {"error": {"code": "STORAGE_FAILED", "message": "oops"}}),
+        FakeResponse(200, {"jobId": "j", "status": "completed"}),
+    ])
+    handler = lambda *a, **k: next(responses)
+    job = make_client(handler).wait("j", poll_interval=0)
+    assert job.is_completed
+
+
+def test_wait_aborts_on_client_error():
+    """A 4xx during polling (job gone) is not transient — it propagates immediately."""
+    handler = lambda *a, **k: FakeResponse(404, {"error": {"code": "JOB_NOT_FOUND", "message": "gone"}})
+    with pytest.raises(JobNotFoundError):
+        make_client(handler).wait("j", poll_interval=0)
+
+
+# --------------------------------------------------------------------------- #
+# convert (end-to-end: submit -> wait -> download)
+# --------------------------------------------------------------------------- #
+def test_convert_end_to_end(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    out = tmp_path / "out.pptx"
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_9", "status": "pending", "slideCount": 1, "creditsReserved": 1}),
+        FakeResponse(200, {"jobId": "job_9", "status": "completed", "slideCount": 1, "creditsUsed": 1,
+                           "downloadUrl": "/api/v1/jobs/job_9/download"}),
+        FakeResponse(200, content=b"PPTXDATA"),
+    ])
+    handler = lambda *a, **k: next(responses)
+    job = make_client(handler).convert([str(img)], str(out), poll_interval=0)
+    assert job.is_completed
+    assert job.job_id == "job_9"
+    assert out.read_bytes() == b"PPTXDATA"
 
 
 # --------------------------------------------------------------------------- #
@@ -285,3 +352,13 @@ def test_compress_transparent_flattened_to_jpeg():
     assert mime == "image/jpeg"
     with Image.open(io.BytesIO(out)) as img:
         assert img.mode == "RGB"  # alpha flattened onto white
+
+
+def test_compress_oversized_incompressible_still_shrinks():
+    """A flat-color image over 2000px is tiny as PNG, so its JPEG re-encode is not
+    smaller and hits the 'never bigger' fallback. It must STILL be shrunk to
+    <=2000px — the dimension guarantee wins over the byte-size fallback."""
+    raw = png_bytes((3000, 2400))  # flat color -> highly compressible PNG
+    out, _mime = compress_image_for_upload(raw, "image/png")
+    with Image.open(io.BytesIO(out)) as img:
+        assert max(img.size) <= 2000
