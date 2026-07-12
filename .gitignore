@@ -22,6 +22,10 @@ npm-debug.log*
 .idea/
 .vscode/
 
+# Secrets / env (never commit — holds PyPI/npm tokens)
+.env
+.env.*
+
 # Local artifacts
 *.pptx
 out.pptx
