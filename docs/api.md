@@ -1,89 +1,103 @@
-# image2ppt 企业 API
+> 🌐 **English** (current) · [中文](./api.zh.md)
 
-把图片和 PDF 批量转换成可编辑的 PPTX。上传一批文件，我们在后台用 AI 拆解版面、还原成可编辑的文字与形状，合成一个 PPTX 给你下载。
+# image2ppt API
 
-本文面向对接方的开发同学，读完就能接入。
+Batch-convert images and PDFs into **editable** PowerPoint (`.pptx`). You upload a
+batch of files; image2ppt reconstructs the layout with AI (OCR, vision,
+segmentation) into editable text and shapes, and hands you back one `.pptx`.
 
----
-
-## 一分钟了解怎么用
-
-1. 登录后进入「开发者 / API」页面创建一个 API 密钥。
-2. 调 `POST /api/v1/jobs` 上传文件，拿到一个**任务号**。
-3. 每隔几秒调 `GET /api/v1/jobs/{任务号}` 查进度，直到状态变成 `completed`。
-4. 调 `GET /api/v1/jobs/{任务号}/download` 下载成品 PPTX。
-
-转换是**异步**的：提交后立刻返回任务号，真正的转换在后台跑。别在提交那一步干等结果。
+This doc is for developers integrating the API — read it top to bottom and you're
+ready to ship.
 
 ---
 
-## 认证
+## One-minute tour
 
-### 拿到密钥
+1. Sign in and open the **Developer / API** page to create an API key.
+2. Call `POST /api/v1/jobs` to upload files and get back a **job id**.
+3. Poll `GET /api/v1/jobs/{jobId}` every few seconds until `status` is `completed`.
+4. Call `GET /api/v1/jobs/{jobId}/download` to fetch the finished PPTX.
 
-登录 image2ppt 后，从账号菜单进入「开发者 / API」页面，在「API Keys」处自助创建，得到一串形如下面的密钥：
+Conversion is **asynchronous**: submitting returns a job id immediately and the
+real work runs in the background. Don't block on the submit call waiting for the
+result.
+
+---
+
+## Authentication
+
+### Get a key
+
+Sign in to image2ppt, open the **Developer / API** page from the account menu, and
+create a key under **API Keys**. You'll get a string like:
 
 ```
 i2p_live_xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-**密钥只在创建时完整显示一次，请当场保存好。** 之后页面只会显示前几位用于辨认。密钥泄露或需要轮换时，在同一页面吊销旧的、重建新的。
+**The key is shown in full only once, at creation — save it right then.** Afterward
+the page shows only the first few characters for identification. If a key leaks or
+you need to rotate, revoke the old one and create a new one on the same page.
 
-### 怎么带
+### Send it
 
-每个请求都在 HTTP 头里带上密钥：
+Pass the key in the HTTP header on every request:
 
 ```
 Authorization: Bearer i2p_live_xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-没带或带错，会返回 `401`（错误码 `INVALID_API_KEY`）。
+A missing or wrong key returns `401` (code `INVALID_API_KEY`).
 
-### 基础地址
+### Base URL
 
 ```
 https://image2ppt.com
 ```
 
-下文所有路径都拼在这个地址后面。
+All paths below are appended to this base URL.
 
 ---
 
-## 统一约定
+## Conventions
 
-- 请求和响应的 JSON 都用 UTF-8。
-- **所有错误**都是同一个信封格式，HTTP 状态码 + 一个 `error` 对象：
+- Request and response JSON is UTF-8.
+- **Every error** uses the same envelope — an HTTP status code plus an `error`
+  object:
 
   ```json
   {
     "error": {
       "code": "INVALID_FILE",
-      "message": "不支持的文件格式：.bmp"
+      "message": "Unsupported file format: .bmp"
     }
   }
   ```
 
-  你的代码应当按 `code` 分支处理，`message` 面向人看、可能会调整措辞，别拿它做逻辑判断。
+  Branch your code on `code`. `message` is human-facing and its wording may
+  change — don't build logic on it.
 
 ---
 
-## 端点
+## Endpoints
 
-### 1. 提交任务 `POST /api/v1/jobs`
+### 1. Submit a job — `POST /api/v1/jobs`
 
-上传一批文件，创建一个转换任务。请求体是 `multipart/form-data`。
+Upload a batch of files and create a conversion job. The request body is
+`multipart/form-data`.
 
-**字段**
+**Fields**
 
-| 字段 | 必填 | 说明 |
+| Field | Required | Description |
 |---|---|---|
-| `files` | 是 | 一个或多个文件。支持 `png` / `jpeg` / `webp` / `gif` / `pdf`，**单文件不超过 35MB**。同一个字段名 `files` 重复出现来传多个文件。 |
-| `locale` | 否 | 成品语言环境，`zh-CN`（默认）或 `en`。 |
-| `aspectRatio` | 否 | 幻灯片比例，`auto`（默认，随原图）/ `16:9` / `4:3`。 |
+| `files` | Yes | One or more files. `png` / `jpeg` / `webp` / `gif` / `pdf`, **each ≤ 35MB**. Repeat the `files` field name to send multiple files. |
+| `locale` | No | Output locale: `zh-CN` (default) or `en`. |
+| `aspectRatio` | No | Slide ratio: `auto` (default, follows the source) / `16:9` / `4:3`. |
 
-**页数怎么算**：一张图片算 1 页，一个 PDF 按它的实际页数算。一次提交的**总页数不能超过 50**。
+**How pages are counted**: an image is 1 page; a PDF counts as its actual page
+count. The **total per submission must be ≤ 50 pages**.
 
-**成功响应** `201 Created`
+**Success** — `201 Created`
 
 ```json
 {
@@ -94,10 +108,11 @@ https://image2ppt.com
 }
 ```
 
-- `slideCount`：这次要转换的总页数。
-- `creditsReserved`：为这次任务**锁定**的积分（= 页数）。提交时锁定，完成时结算。
+- `slideCount`: total pages to convert in this job.
+- `creditsReserved`: credits **held** for this job (= page count). Held on submit,
+  settled on completion.
 
-**curl 示例**
+**curl example**
 
 ```bash
 curl -X POST https://image2ppt.com/api/v1/jobs \
@@ -105,27 +120,27 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
   -F "files=@slide1.png" \
   -F "files=@slide2.png" \
   -F "files=@report.pdf" \
-  -F "locale=zh-CN" \
+  -F "locale=en" \
   -F "aspectRatio=16:9"
 ```
 
-**可能的错误**
+**Possible errors**
 
-| HTTP | code | 含义 |
+| HTTP | code | Meaning |
 |---|---|---|
-| 401 | `INVALID_API_KEY` | 密钥无效或缺失。 |
-| 400 | `INVALID_FILE` | 文件格式不支持，或单文件超过 35MB。 |
-| 400 | `TOO_MANY_SLIDES` | 总页数超过 50。 |
-| 402 | `INSUFFICIENT_CREDITS` | 可用积分不够覆盖这次提交。 |
-| 429 | `RATE_LIMITED` | 触发限流，见下方「限流」。 |
+| 401 | `INVALID_API_KEY` | Key missing or invalid. |
+| 400 | `INVALID_FILE` | Unsupported format, or a single file over 35MB. |
+| 400 | `TOO_MANY_SLIDES` | Total pages over 50. |
+| 402 | `INSUFFICIENT_CREDITS` | Not enough credits to cover this submission. |
+| 429 | `RATE_LIMITED` | Rate limit hit — see [Rate limits](#rate-limits). |
 
 ---
 
-### 2. 查询任务状态 `GET /api/v1/jobs/{jobId}`
+### 2. Get job status — `GET /api/v1/jobs/{jobId}`
 
-轮询这个端点看进度。
+Poll this endpoint for progress.
 
-**成功响应** `200 OK`
+**Success** — `200 OK`
 
 ```json
 {
@@ -141,20 +156,20 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 }
 ```
 
-**字段**
+**Fields**
 
-| 字段 | 说明 |
+| Field | Description |
 |---|---|
-| `status` | `pending`（排队中）/ `processing`（转换中）/ `completed`（已完成）/ `failed`（已失败）。 |
-| `progress` | 进度百分比，0–100。 |
-| `slideCount` | 总页数。 |
-| `creditsUsed` | 结算后实际扣除的积分。 |
-| `creditsRefunded` | 部分成功时退回的失败页积分，见「计费与退款」。 |
-| `createdAt` / `completedAt` | 创建时间 / 完成时间（未完成时为 `null`）。 |
-| `downloadUrl` | **仅当 `completed`** 时给出，是下载端点的相对路径；其余状态为 `null`。 |
-| `error` | **仅当 `failed`** 时给出，形如 `{"code": "...", "message": "..."}`。 |
+| `status` | `pending` (queued) / `processing` / `completed` / `failed`. |
+| `progress` | Percent complete, 0–100. |
+| `slideCount` | Total pages. |
+| `creditsUsed` | Credits actually charged after settlement. |
+| `creditsRefunded` | Credits refunded for failed pages on partial success — see [Billing & refunds](#billing--refunds). |
+| `createdAt` / `completedAt` | Creation / completion time (`null` until complete). |
+| `downloadUrl` | Given **only when `completed`** — a relative path to the download endpoint; `null` otherwise. |
+| `error` | Given **only when `failed`** — `{"code": "...", "message": "..."}`. |
 
-**失败时的样子**
+**A failed job looks like**
 
 ```json
 {
@@ -167,41 +182,46 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
   "createdAt": "2026-07-07T08:00:00Z",
   "completedAt": "2026-07-07T08:01:00Z",
   "downloadUrl": null,
-  "error": { "code": "CONVERSION_FAILED", "message": "转换失败，请稍后重试" }
+  "error": { "code": "CONVERSION_FAILED", "message": "Conversion failed, please retry later" }
 }
 ```
 
-**可能的错误**
+**Possible errors**
 
-| HTTP | code | 含义 |
+| HTTP | code | Meaning |
 |---|---|---|
-| 404 | `JOB_NOT_FOUND` | 任务号不存在，或不属于当前密钥所在账户。 |
+| 404 | `JOB_NOT_FOUND` | Job id doesn't exist, or isn't owned by this key's account. |
 
-> **提示**：任务号只在你自己的账户内可见，别人拿不到、也查不到你的任务。
+> **Note**: job ids are visible only within your own account — nobody else can fetch
+> or see your jobs.
 
 ---
 
-### 3. 下载成品 `GET /api/v1/jobs/{jobId}/download`
+### 3. Download the result — `GET /api/v1/jobs/{jobId}/download`
 
-任务完成后，从这里下载 PPTX。
+Once the job is complete, download the PPTX here.
 
-**成功响应** `200 OK`，响应体就是 PPTX 二进制流（`Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation`）。
+**Success** — `200 OK`, with the PPTX binary as the response body
+(`Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation`).
 
-**可能的错误**
+**Possible errors**
 
-| HTTP | code | 含义 |
+| HTTP | code | Meaning |
 |---|---|---|
-| 409 | `NOT_READY` | 任务还没完成，成品暂不可下载。等状态变成 `completed` 再来。 |
-| 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理，无法下载（见下方「保留期」）。 |
-| 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户。 |
+| 409 | `NOT_READY` | Job isn't complete yet; the result isn't downloadable. Wait for `completed`. |
+| 410 | `OUTPUT_EXPIRED` | The result was cleaned up after its retention window — see [Retention](#retention). |
+| 404 | `JOB_NOT_FOUND` | Job id doesn't exist or isn't owned by this account. |
 
-> **保留期**：成品 PPTX 在完成后**保留 7 天**，过期自动清理，之后下载会返回 `410 OUTPUT_EXPIRED`。请在保留期内取走。（历史记录仍在，只是成品文件不再保存。）
+> <a id="retention"></a>**Retention**: the finished PPTX is **kept for 7 days** after
+> completion, then auto-deleted; downloads afterward return `410 OUTPUT_EXPIRED`.
+> Fetch it within the window. (The job record stays; only the output file is
+> removed.)
 
 ---
 
-### 4. 查询账户 `GET /api/v1/account`
+### 4. Get account — `GET /api/v1/account`
 
-**成功响应** `200 OK`
+**Success** — `200 OK`
 
 ```json
 {
@@ -210,20 +230,24 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 }
 ```
 
-`credits` 是当前**可用**积分（不含已被进行中任务锁定的部分）。API 转换与网页端共用同一份积分。
+`credits` is your currently **available** balance (excluding credits held by
+in-flight jobs). API conversions and the web app share the same credit pool.
 
 ---
 
-## 限流
+## Rate limits
 
-按**账户**限流（同一账户下所有密钥共享额度）：
+Limits are **per account** (all keys under one account share the quota):
 
-- **同时进行中的任务** ≤ 10 个（`pending` + `processing`）。
-- **提交速率** ≤ 60 页/分钟。
+- **Concurrent in-flight jobs** ≤ 10 (`pending` + `processing`).
+- **Submission rate** ≤ 60 pages/minute.
 
-超出时返回 `429`（`RATE_LIMITED`），并在 `Retry-After` 响应头给出建议等待的**秒数**。
+Over the limit returns `429` (`RATE_LIMITED`) with a `Retry-After` response header
+giving the suggested wait in **seconds**.
 
-**正确的应对**：读 `Retry-After`，等这么多秒再重试，别无脑立刻重试。官方 Python 客户端的 `wait()` 已经内建了这个退避；若你自己直接提交，参考下面的伪代码：
+**The right way to handle it**: read `Retry-After`, wait that many seconds, then
+retry — don't hammer immediately. The official Python client's `wait()` has this
+backoff built in. If you submit directly yourself, mirror this pseudocode:
 
 ```python
 import time, requests
@@ -235,35 +259,48 @@ while True:
     time.sleep(int(resp.headers.get("Retry-After", "5")))
 ```
 
----
-
-## 业务语义
-
-### 异步与时延预期
-
-提交后任务在后台跑。**单页典型耗时约 2 分钟，九成任务在 3 分钟内完成**。页数多的任务更久。建议轮询间隔从 5 秒起、逐步退避到 15 秒左右，不要每秒猛查。
-
-### 一个任务 = 一个 PPTX
-
-一次提交的所有文件（多张图 / 多页 PDF）会合成**同一个** deck，按上传顺序排页。想要多个独立 PPTX，就分成多次提交。
-
-### 计费与退款
-
-- **按页计费，1 页 1 积分。**
-- 提交时按总页数**锁定**相应积分（响应里的 `creditsReserved`）。
-- 完成时**结算**：实际扣除体现在 `creditsUsed`。
-- **部分成功**：如果个别页转换失败、其余成功，任务仍然是 `completed`，成品里**包含成功的页**，失败页的积分**自动退回**，体现在 `creditsRefunded`（此时 `creditsRefunded > 0`）。
-- **整体失败**：任务变成 `failed`，锁定的积分全额退回。
-
-一句话：你只为**成功产出的页**付费。
+Polling job status is **not** rate limited — only submissions are.
 
 ---
 
-## 官方 SDK
+## Semantics
 
-我们提供 Python 和 Node.js/TypeScript 两个官方客户端，都封装了提交、轮询、下载、429 退避和错误映射。源码、示例和完整说明在 GitHub：<https://github.com/shrektan/image2ppt-sdk>。
+### Async & latency expectations
 
-> SDK 只在**服务端**使用。别把 API 密钥放进浏览器或任何用户能看到的地方——谁都能读出来。
+Jobs run in the background after submission. **A single page typically takes ~2
+minutes; 90% of jobs finish within 3 minutes.** Larger jobs take longer. Poll
+starting at 5s and back off toward ~15s — don't poll every second.
+
+### One job = one PPTX
+
+All files in a single submission (multiple images / multi-page PDFs) are merged
+into **one** deck, paginated in upload order. For separate PPTX files, split into
+separate submissions.
+
+### Billing & refunds
+
+- **Billed per page — 1 page = 1 credit.**
+- On submit, credits for the total page count are **held** (`creditsReserved` in the
+  response).
+- On completion, credits are **settled**: the actual charge shows in `creditsUsed`.
+- **Partial success**: if some pages fail but others succeed, the job is still
+  `completed`, the output **includes the successful pages**, and credits for the
+  failed pages are **refunded automatically** (`creditsRefunded > 0`).
+- **Total failure**: the job becomes `failed` and all held credits are refunded in
+  full.
+
+In short: you only pay for **pages that were successfully produced**.
+
+---
+
+## Official SDKs
+
+We provide official Python and Node.js/TypeScript clients that wrap submission,
+polling, download, 429 backoff, and error mapping. Source, examples, and full docs
+are on GitHub: <https://github.com/shrektan/image2ppt-sdk>.
+
+> Use the SDK **server-side only**. Never put an API key in a browser or anywhere a
+> user can read it — anyone can extract it.
 
 ### Python
 
@@ -274,26 +311,26 @@ pip install image2ppt
 ```python
 from image2ppt import Image2PPTClient, Image2PPTError, JobFailedError
 
-client = Image2PPTClient(api_key="i2p_live_你的密钥")
+client = Image2PPTClient(api_key="i2p_live_your_key")
 
 try:
-    # 一步到位：提交 → 轮询等待 → 下载
+    # One shot: submit → poll → download
     job = client.convert(
         ["slide1.png", "slide2.png", "report.pdf"],
         dest_path="out.pptx",
-        locale="zh-CN",
+        locale="en",
         aspect_ratio="16:9",
     )
-    print("完成，用掉积分：", job.credits_used, "退回：", job.credits_refunded)
+    print("done — credits used:", job.credits_used, "refunded:", job.credits_refunded)
 except JobFailedError as e:
-    print("转换失败：", e.code, e.message)
+    print("conversion failed:", e.code, e.message)
 except Image2PPTError as e:
-    print("请求出错：", e.status_code, e.code, e.message)
+    print("request error:", e.status_code, e.code, e.message)
 ```
 
 ### Node.js / TypeScript
 
-零依赖，需要 Node 18+（用内置 `fetch`）。
+Zero dependencies, needs Node 18+ (uses the built-in `fetch`).
 
 ```bash
 npm install image2ppt
@@ -302,42 +339,43 @@ npm install image2ppt
 ```ts
 import { Image2PPTClient, Image2PPTError, JobFailedError } from "image2ppt";
 
-const client = new Image2PPTClient({ apiKey: "i2p_live_你的密钥" });
+const client = new Image2PPTClient({ apiKey: "i2p_live_your_key" });
 
 try {
   const job = await client.convert(
     ["slide1.png", "slide2.png", "report.pdf"],
     "out.pptx",
-    { locale: "zh-CN", aspectRatio: "16:9" },
+    { locale: "en", aspectRatio: "16:9" },
   );
-  console.log("完成，用掉积分：", job.creditsUsed, "退回：", job.creditsRefunded);
+  console.log("done — credits used:", job.creditsUsed, "refunded:", job.creditsRefunded);
 } catch (e) {
-  if (e instanceof JobFailedError) console.error("转换失败：", e.code, e.message);
-  else if (e instanceof Image2PPTError) console.error("请求出错：", e.statusCode, e.code, e.message);
+  if (e instanceof JobFailedError) console.error("conversion failed:", e.code, e.message);
+  else if (e instanceof Image2PPTError) console.error("request error:", e.statusCode, e.code, e.message);
   else throw e;
 }
 ```
 
-分步控制（`submit` / `wait` / `download`）、账户查询（`account`）和各异常的完整说明见 GitHub 仓库的 README 与示例。
+Step-by-step control (`submit` / `wait` / `download`), account lookup (`account`),
+and full details on each exception are in the GitHub repo's README and examples.
 
 ---
 
-## 错误码总表
+## Error code reference
 
-| HTTP | code | 出现场景 |
+| HTTP | code | When it happens |
 |---|---|---|
-| 401 | `INVALID_API_KEY` | 密钥无效或缺失（所有端点）。 |
-| 400 | `NO_FILES` | 没有带任何文件（提交）。 |
-| 400 | `INVALID_FILE` | 文件格式不支持或单文件超 35MB（提交）。 |
-| 400 | `INVALID_PDF` | PDF 无法读取或解析（提交）。 |
-| 400 | `INVALID_ASPECT_RATIO` | 画幅比例不认识，用 `auto` 或 `16:9`、`4:3`（提交）。 |
-| 400 | `TOO_MANY_SLIDES` | 总页数超过 50（提交）。 |
-| 400 | `PAGE_RATE_EXCEEDED` | 单次提交页数就超过每分钟提交上限，永远排不进窗口（提交）。 |
-| 402 | `INSUFFICIENT_CREDITS` | 可用积分不足，或余额为 0（提交）。 |
-| 403 | `API_KEY_REQUIRED` | 缺少有效的 API key（提交）。 |
-| 403 | `ACCOUNT_DELETED` | 账号已删除（提交）。 |
-| 429 | `RATE_LIMITED` | 触发限流，带 `Retry-After` 头（提交）。轮询状态不限流。 |
-| 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户（查询、下载）。 |
-| 409 | `NOT_READY` | 任务未完成就来下载（下载）。 |
-| 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理（下载）。 |
-| 5xx | `STORAGE_FAILED` 等 | 服务端处理出错，稍后重试；反复出现请联系我们。 |
+| 401 | `INVALID_API_KEY` | Key missing or invalid (all endpoints). |
+| 400 | `NO_FILES` | No files attached (submit). |
+| 400 | `INVALID_FILE` | Unsupported format or a single file over 35MB (submit). |
+| 400 | `INVALID_PDF` | PDF can't be read or parsed (submit). |
+| 400 | `INVALID_ASPECT_RATIO` | Unrecognized aspect ratio; use `auto`, `16:9`, or `4:3` (submit). |
+| 400 | `TOO_MANY_SLIDES` | Total pages over 50 (submit). |
+| 400 | `PAGE_RATE_EXCEEDED` | A single submission's page count exceeds the per-minute submission limit, so it can never fit the window (submit). |
+| 402 | `INSUFFICIENT_CREDITS` | Not enough available credits, or a zero balance (submit). |
+| 403 | `API_KEY_REQUIRED` | No valid API key present (submit). |
+| 403 | `ACCOUNT_DELETED` | Account has been deleted (submit). |
+| 429 | `RATE_LIMITED` | Rate limit hit, with a `Retry-After` header (submit). Status polling is not rate limited. |
+| 404 | `JOB_NOT_FOUND` | Job id doesn't exist or isn't owned by this account (status, download). |
+| 409 | `NOT_READY` | Download requested before the job completed (download). |
+| 410 | `OUTPUT_EXPIRED` | Result cleaned up after its retention window (download). |
+| 5xx | `STORAGE_FAILED`, etc. | Server-side error; retry later. If it persists, contact us. |

@@ -43,7 +43,7 @@ API access is available to accounts that have purchased credits (it opens automa
 
 ## API reference
 
-- Full HTTP reference: [docs/api.md](./docs/api.md)
+- Full HTTP reference: [docs/api.md](./docs/api.md) · 中文版：[docs/api.zh.md](./docs/api.zh.md)
 - Base URL: `https://image2ppt.com`
 - Auth: `Authorization: Bearer i2p_live_...`
 

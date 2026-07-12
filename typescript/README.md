@@ -112,7 +112,7 @@ try {
 
 ## Full API reference
 
-See [../docs/api.md](../docs/api.md) for the complete HTTP contract (endpoints, fields, error codes).
+See [../docs/api.md](../docs/api.md) for the complete HTTP contract (endpoints, fields, error codes). 中文版：[../docs/api.zh.md](../docs/api.zh.md)。
 
 ## Develop
 
