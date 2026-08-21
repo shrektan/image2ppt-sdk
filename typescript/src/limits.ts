@@ -8,12 +8,23 @@
  * connection die (a write timeout on a slow uplink, a broken pipe on a fast one)
  * with no error code and no explanation.
  *
- * The fix is to never send too much. These limits, the pre-flight check, and
+ * The fix is to never send too much. These limits, the pre-flight checks, and
  * `planBatches` let a client know a submission is too big *before* opening a
  * connection, and split a large pile of files into submittable batches.
+ *
+ * There are three separate caps, and they fail in different ways: one file
+ * (`MAX_FILE_BYTES`), the file content of one request (`MAX_UPLOAD_BYTES`), and
+ * pages per job (`MAX_PAGES_PER_JOB`).
  */
 
 import { InvalidFileError, TooManySlidesError } from "./errors.js";
+
+/**
+ * Server cap on **one** file. A file over this is rejected with `INVALID_FILE`
+ * however it is submitted, so no amount of batching helps. Keep in sync with the
+ * documented API contract.
+ */
+export const MAX_FILE_BYTES = 35 * 1024 * 1024;
 
 /**
  * Server cap on the file content of one request. Over this, the request is
@@ -63,6 +74,30 @@ export function formatBytes(size: number): string {
 }
 
 /**
+ * Throw if one file is over the per-file cap, whatever else it travels with.
+ *
+ * Separate from `checkSubmission` because it is a property of the file, not of
+ * the request: a 40MB PDF fits under the 45MB request cap and would sail through
+ * batch planning, then be rejected by the server every single time. Fail on it
+ * locally instead of building a batch that can never succeed.
+ *
+ * @param path The file, named in the error so the caller knows which one.
+ * @param size Its size as it will be uploaded.
+ * @throws InvalidFileError Over `MAX_FILE_BYTES` (`code: "INVALID_FILE"`, the same
+ *   code the server would answer with).
+ */
+export function checkFileSize(path: string, size: number): void {
+  if (size > MAX_FILE_BYTES) {
+    throw new InvalidFileError(
+      `"${path}" is ${formatBytes(size)}, over the ${formatBytes(MAX_FILE_BYTES)} ` +
+        "per-file limit; the server rejects it however it is submitted, so " +
+        "splitting into batches will not help",
+      { code: "INVALID_FILE" },
+    );
+  }
+}
+
+/**
  * Throw if a submission cannot succeed, before any bytes go on the wire.
  *
  * @param totalBytes Sum of the file sizes that will be sent in this request.
@@ -107,8 +142,8 @@ export function checkSubmission(totalBytes: number, imagePages: number): void {
  *   count decides;
  * - input order is preserved, so the same files always plan the same way.
  *
- * @throws InvalidFileError A single file is over `MAX_UPLOAD_BYTES`. No batching
- *   can help — it does not fit in any request on its own.
+ * @throws InvalidFileError A single file is over `MAX_FILE_BYTES`. No batching can
+ *   help — the server rejects that file however it is submitted.
  */
 export function planBatches(items: Iterable<UploadItem>): UploadItem[][] {
   const batches: UploadItem[][] = [];
@@ -124,14 +159,9 @@ export function planBatches(items: Iterable<UploadItem>): UploadItem[][] {
   };
 
   for (const item of items) {
-    if (item.size > MAX_UPLOAD_BYTES) {
-      throw new InvalidFileError(
-        `"${item.path}" is ${formatBytes(item.size)} on its own, over the ` +
-          `${formatBytes(MAX_UPLOAD_BYTES)} limit for one request; it cannot be ` +
-          "uploaded in any batch",
-        { code: "PAYLOAD_TOO_LARGE" },
-      );
-    }
+    // Stricter than the request cap and checked first: a file over the per-file
+    // limit is unsubmittable, not merely unbatchable.
+    checkFileSize(item.path, item.size);
     if (item.isPdf) {
       flush();
       batches.push([item]);

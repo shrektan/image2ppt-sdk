@@ -19,13 +19,6 @@ export interface ClientOptions {
   /** Inject a custom fetch (for testing). Defaults to the global `fetch` (Node 18+). */
   fetch?: typeof fetch;
   /**
-   * How many times to retry a submission whose connection broke mid-upload
-   * (default 2). Safe: a broken upload cannot have created a job. See `submit`.
-   */
-  maxUploadRetries?: number;
-  /** Delay before the first upload retry in ms (default 1000); doubles each attempt. */
-  uploadRetryBackoffMs?: number;
-  /**
    * Total ms `submitAll` / `convertAll` may spend waiting out rate limits across
    * the whole call (default 1_800_000 = 30 min). Submitting a large pile *will*
    * hit the per-minute page quota, so waiting is the normal path, not an error.

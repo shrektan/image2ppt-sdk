@@ -13,7 +13,7 @@ import {
   RateLimitedError,
   exceptionFor,
 } from "./errors.js";
-import { checkSubmission, planBatches } from "./limits.js";
+import { checkFileSize, checkSubmission, planBatches } from "./limits.js";
 import type { UploadItem } from "./limits.js";
 import type {
   Account,
@@ -76,8 +76,6 @@ function attachSubmittedJobs(err: unknown, jobs: Job[]): void {
 export class Image2PPTClient {
   readonly baseUrl: string;
   readonly timeoutMs: number;
-  readonly maxUploadRetries: number;
-  readonly uploadRetryBackoffMs: number;
   readonly rateLimitMaxWaitMs: number;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
@@ -88,8 +86,6 @@ export class Image2PPTClient {
     }
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = options.timeoutMs ?? 60_000;
-    this.maxUploadRetries = Math.max(0, options.maxUploadRetries ?? 2);
-    this.uploadRetryBackoffMs = Math.max(0, options.uploadRetryBackoffMs ?? 1_000);
     this.rateLimitMaxWaitMs = Math.max(0, options.rateLimitMaxWaitMs ?? 1_800_000);
     this.#apiKey = options.apiKey;
     const impl = options.fetch ?? globalThis.fetch;
@@ -107,8 +103,12 @@ export class Image2PPTClient {
    * connection — going over the size cap on the wire does not come back as a clean
    * error, it comes back as a dead connection.
    *
-   * If the connection breaks *while uploading*, the submission is retried (see
-   * `maxUploadRetries`).
+   * **A failed submission is never retried automatically.** A network error does
+   * not tell you whether the request body made it: the job may not exist, or it
+   * may exist with credits already reserved and only the response lost. Retrying
+   * the second case charges twice, and without an idempotency key there is no way
+   * to tell them apart — so the error is thrown as-is. Check `account()` or your
+   * job list before resending.
    *
    * @param paths Local file paths (one or more). png/jpeg/webp/gif/pdf, each ≤ 35MB,
    *   and ≤ 45MB of file content per request. An image is 1 page, a PDF is its page
@@ -129,12 +129,12 @@ export class Image2PPTClient {
     );
     // Pre-flight, before a single byte goes out: an oversized request is not
     // answered with an error, it is cut off — so it must never be sent.
+    for (const file of files) checkFileSize(file.name, file.buffer.byteLength);
     checkSubmission(
       files.reduce((total, file) => total + file.buffer.byteLength, 0),
       files.filter((file) => isImageMime(file.mime)).length,
     );
 
-    // Rebuilt per attempt so a retry sends a fresh body.
     const buildForm = (): FormData => {
       const form = new FormData();
       for (const file of files) {
@@ -145,7 +145,8 @@ export class Image2PPTClient {
       return form;
     };
 
-    const res = await this.#postFiles(buildForm);
+    // Sent exactly once, never auto-retried: see the note above.
+    const res = await this.#request("POST", "/api/v1/jobs", { body: buildForm() });
     return Job.fromJson(await this.#parseJson(res));
   }
 
@@ -167,6 +168,9 @@ export class Image2PPTClient {
    * `Retry-After`, and both are handled the same way: sleep that long, then try
    * the same batch again. Waiting is the normal path here. Total waiting is capped
    * by the client's `rateLimitMaxWaitMs`.
+   *
+   * **Network errors are not retried** — see `submit`. Only a 429 is, because only
+   * a 429 proves the server did not take the submission.
    *
    * **If it does give up, the jobs already created are handed back on the error**,
    * in `err.submittedJobs`. Those jobs are running on the server with credits
@@ -319,7 +323,8 @@ export class Image2PPTClient {
    *
    * Rate limits during submission are waited out — see `submitAll`.
    *
-   * @param destDir Directory for the PPTX files; created if missing.
+   * @param destDir Directory for the PPTX files; created **before anything is
+   *   submitted**, so an unusable destination costs nothing.
    * @returns The written file paths, in batch order.
    */
   async convertAll(
@@ -327,8 +332,12 @@ export class Image2PPTClient {
     destDir: string,
     options: ConvertOptions = {},
   ): Promise<string[]> {
-    const jobs = await this.submitAll(paths, options);
+    // Before anything is submitted: if the destination is unusable, fail now
+    // rather than after N jobs exist with credits reserved and nowhere to put
+    // their output. This is the one step that can fail for free.
     await mkdir(destDir, { recursive: true });
+
+    const jobs = await this.submitAll(paths, options);
 
     const written: string[] = [];
     try {
@@ -393,36 +402,6 @@ export class Image2PPTClient {
         isPdf: !isImageMime(guessMime(basename(path))),
       })),
     );
-  }
-
-  /**
-   * POST the multipart submission, retrying a connection that broke mid-upload.
-   *
-   * Only a raw network failure is retried — never anything the client already
-   * turned into an `Image2PPTError`. The difference matters because a retry can
-   * cost money:
-   *
-   * - A fetch network error (`TypeError: fetch failed`) means the request body
-   *   never arrived in full. The server cannot have parsed it, so it cannot have
-   *   created a job or reserved credits. Retrying is free.
-   * - An `AbortSignal.timeout` abort (surfaced as `Image2PPTError` with code
-   *   `REQUEST_TIMEOUT`) cannot tell us whether the body finished going out. The
-   *   job may well exist, with credits already reserved, and retrying would submit
-   *   the same files a second time and charge twice. So it is thrown as-is —
-   *   check `account()` or your job list before resending.
-   * - HTTP-level errors are answers, not lost connections; they are never retried.
-   */
-  async #postFiles(buildForm: () => FormData): Promise<Response> {
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return await this.#request("POST", "/api/v1/jobs", { body: buildForm() });
-      } catch (err) {
-        if (err instanceof Image2PPTError || attempt >= this.maxUploadRetries) {
-          throw err;
-        }
-        await sleep(this.uploadRetryBackoffMs * 2 ** attempt);
-      }
-    }
   }
 
   async #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {

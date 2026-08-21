@@ -30,8 +30,10 @@ export {
 } from "./errors.js";
 export {
   BATCH_TARGET_BYTES,
+  MAX_FILE_BYTES,
   MAX_PAGES_PER_JOB,
   MAX_UPLOAD_BYTES,
+  checkFileSize,
   checkSubmission,
   formatBytes,
   planBatches,

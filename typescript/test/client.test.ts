@@ -22,6 +22,7 @@ import {
   Job,
   JobNotFoundError,
   MAX_PAGES_PER_JOB,
+  MAX_FILE_BYTES,
   MAX_UPLOAD_BYTES,
   NotReadyError,
   RateLimitedError,
@@ -408,67 +409,62 @@ describe("convertAll", () => {
 });
 
 // --------------------------------------------------------------------------- //
-// upload retry — safe only for a connection that died mid-upload
+// a failed submission is NOT retried
+//
+// This looks like a missing feature; it is a deliberate one. A network error
+// proves only that the exchange broke — the server may have received the whole
+// body, created the job and reserved credits, and then lost the connection while
+// answering. Retrying that case charges the user twice. Nothing here can tell the
+// two apart without an idempotency key the API does not offer, so the error goes
+// to the caller untouched. These tests exist so nobody quietly adds the retry back.
 // --------------------------------------------------------------------------- //
-describe("upload retry", () => {
-  function retryClient(fetchImpl: typeof fetch, maxUploadRetries = 2): Image2PPTClient {
-    return new Image2PPTClient({
-      apiKey: "i2p_live_test",
-      fetch: fetchImpl,
-      maxUploadRetries,
-      uploadRetryBackoffMs: 0, // no real sleeping in tests
-    });
-  }
-
-  it("retries a connection dropped mid-upload", async () => {
-    // The body never arrived, so no job was created and nothing was charged.
-    const file = await tempFile();
-    const f = fetchScript((n) => {
-      if (n === 1) throw new TypeError("fetch failed");
-      return json(201, { jobId: "job_retry", status: "pending" });
-    });
-
-    const job = await retryClient(f).submit([file]);
-
-    expect(job.jobId).toBe("job_retry");
-    expect(postedFilenames(f)).toHaveLength(2);
-  });
-
-  it("never retries a request the client timed out", async () => {
-    // The body may well have been sent, so the job may exist with credits
-    // reserved. Retrying would submit the same files twice and charge twice.
-    const file = await tempFile();
-    const f = fetchScript(() => {
-      throw new DOMException("The operation was aborted", "TimeoutError");
-    });
-
-    await expect(retryClient(f).submit([file])).rejects.toMatchObject({
-      code: "REQUEST_TIMEOUT",
-    });
-    await expect(retryClient(fetchScript(() => {
-      throw new DOMException("The operation was aborted", "TimeoutError");
-    })).submit([file])).rejects.toBeInstanceOf(Image2PPTError);
-    expect(f.calls).toHaveLength(1); // exactly one attempt
-  });
-
-  it("never retries an HTTP error answer", async () => {
-    const file = await tempFile();
-    const f = fetchSequence(json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no" } }));
-
-    await expect(retryClient(f).submit([file])).rejects.toBeInstanceOf(
-      InsufficientCreditsError,
-    );
-    expect(f.calls).toHaveLength(1);
-  });
-
-  it("gives up after maxUploadRetries", async () => {
+describe("no automatic submit retry", () => {
+  it("does not retry a broken connection", async () => {
     const file = await tempFile();
     const f = fetchScript(() => {
       throw new TypeError("fetch failed");
     });
 
-    await expect(retryClient(f, 1).submit([file])).rejects.toBeInstanceOf(TypeError);
-    expect(f.calls).toHaveLength(2); // first attempt + 1 retry
+    await expect(client(f).submit([file])).rejects.toBeInstanceOf(TypeError);
+    expect(f.calls).toHaveLength(1); // tried exactly once
+  });
+
+  it("does not retry a request it timed out", async () => {
+    const file = await tempFile();
+    const f = fetchScript(() => {
+      throw new DOMException("The operation was aborted", "TimeoutError");
+    });
+
+    await expect(client(f).submit([file])).rejects.toMatchObject({
+      code: "REQUEST_TIMEOUT",
+    });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("does not retry an HTTP error answer", async () => {
+    const file = await tempFile();
+    const f = fetchSequence(
+      json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no" } }),
+    );
+
+    await expect(client(f).submit([file])).rejects.toBeInstanceOf(InsufficientCreditsError);
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("does not retry inside submitAll either, and still hands back the jobs", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    let n = 0;
+    const f = fetchScript(() => {
+      n += 1;
+      if (n === 1) return json(201, { jobId: "job_a", status: "pending" });
+      throw new TypeError("fetch failed");
+    });
+
+    const err = await client(f).submitAll(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TypeError);
+    expect(f.calls).toHaveLength(2); // batch 1, then batch 2 once
+    expect(submittedIds(err)).toEqual(["job_a"]);
   });
 });
 
@@ -591,5 +587,52 @@ describe("submitAll rate limiting", () => {
     expect((err as Error).name).toBe("JobFailedError");
     expect(submittedIds(err)).toEqual(["job_a", "job_b"]);
     expect((await readFile(join(outDir, "part-01.pptx"))).toString()).toBe("DECK-A");
+  });
+});
+
+
+// --------------------------------------------------------------------------- //
+// per-file limit and destination checks — both must fail before spending money
+// --------------------------------------------------------------------------- //
+describe("per-file limit", () => {
+  it("refuses a single file over the per-file limit", async () => {
+    // It fits the 45MB request cap, but the server rejects it every time.
+    const big = await sparseFile("big.pdf", MAX_FILE_BYTES + 1);
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    const err = await client(f).submit([big]).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(InvalidFileError);
+    expect((err as InvalidFileError).code).toBe("INVALID_FILE");
+    expect((err as Error).message).toContain("big.pdf");
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("refuses it in submitAll too, instead of planning a doomed batch", async () => {
+    const big = await sparseFile("big.pdf", MAX_FILE_BYTES + 1);
+    const img = await tempFile("a.png");
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submitAll([img, big])).rejects.toBeInstanceOf(InvalidFileError);
+    expect(f.calls).toHaveLength(0); // the good file isn't submitted either
+  });
+});
+
+describe("convertAll destination", () => {
+  it("checks the destination before submitting anything", async () => {
+    // An unusable destDir must not cost credits: no job may exist afterwards.
+    const files = await manyImages(2);
+    const notADir = join(dir, "decks");
+    await writeFile(notADir, "I am a regular file");
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).convertAll(files, notADir)).rejects.toThrow();
+    expect(f.calls).toHaveLength(0);
   });
 });

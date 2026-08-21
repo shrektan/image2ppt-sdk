@@ -10,10 +10,12 @@ import { describe, expect, it } from "vitest";
 import {
   BATCH_TARGET_BYTES,
   InvalidFileError,
+  MAX_FILE_BYTES,
   MAX_PAGES_PER_JOB,
   MAX_UPLOAD_BYTES,
   TooManySlidesError,
   type UploadItem,
+  checkFileSize,
   checkSubmission,
   planBatches,
 } from "../src/index.js";
@@ -24,6 +26,37 @@ const pdf = (path: string, size = 1): UploadItem => ({ path, size, isPdf: true }
 /** Batches as lists of file names, so assertions read like the input. */
 const names = (batches: UploadItem[][]): string[][] =>
   batches.map((batch) => batch.map((item) => item.path));
+
+// --------------------------------------------------------------------------- //
+// checkFileSize — a property of the file, not of the request
+//
+// The per-file cap is STRICTER than the request cap (35MB vs 45MB), so a file can
+// sit comfortably inside a request and still be rejected by the server every time.
+// --------------------------------------------------------------------------- //
+describe("checkFileSize", () => {
+  it("accepts a file sitting exactly on the per-file cap", () => {
+    expect(() => checkFileSize("ok.pdf", MAX_FILE_BYTES)).not.toThrow();
+  });
+
+  it("refuses a file one byte over, naming it", () => {
+    expect(() => checkFileSize("big.pdf", MAX_FILE_BYTES + 1)).toThrow(InvalidFileError);
+    try {
+      checkFileSize("big.pdf", MAX_FILE_BYTES + 1);
+    } catch (err) {
+      expect((err as InvalidFileError).code).toBe("INVALID_FILE");
+      expect((err as Error).message).toContain("big.pdf");
+    }
+  });
+
+  it("is stricter than the request cap", () => {
+    // Guards the reason this check exists: without it, a file between the two
+    // caps looks submittable to the batch planner and never is.
+    expect(MAX_FILE_BYTES).toBeLessThan(MAX_UPLOAD_BYTES);
+    const between = Math.floor((MAX_FILE_BYTES + MAX_UPLOAD_BYTES) / 2);
+    expect(() => checkSubmission(between, 1)).not.toThrow(); // request cap is happy
+    expect(() => checkFileSize("between.pdf", between)).toThrow(InvalidFileError);
+  });
+});
 
 // --------------------------------------------------------------------------- //
 // checkSubmission — the pre-flight gate
@@ -55,16 +88,24 @@ describe("planBatches size splitting", () => {
     expect(planBatches([])).toEqual([]);
   });
 
-  it("refuses a single file over the hard cap — no split can help", () => {
-    expect(() => planBatches([img("huge.png", MAX_UPLOAD_BYTES + 1)])).toThrow(
+  it("refuses a single oversized file — no split can help", () => {
+    // The planner applies the per-file cap, so it stops at 35MB not 45MB.
+    expect(() => planBatches([img("huge.png", MAX_FILE_BYTES + 1)])).toThrow(
       InvalidFileError,
     );
     try {
-      planBatches([img("huge.png", MAX_UPLOAD_BYTES + 1)]);
+      planBatches([img("huge.png", MAX_FILE_BYTES + 1)]);
     } catch (err) {
-      expect((err as InvalidFileError).code).toBe("PAYLOAD_TOO_LARGE");
+      expect((err as InvalidFileError).code).toBe("INVALID_FILE");
       expect((err as Error).message).toContain("huge.png");
     }
+  });
+
+  it("refuses a file between the two caps", () => {
+    // The regression this guards: it fits the request cap, so the planner used to
+    // build a batch for it that the server would reject every single time.
+    const between = Math.floor((MAX_FILE_BYTES + MAX_UPLOAD_BYTES) / 2);
+    expect(() => planBatches([img("doomed.pdf", between)])).toThrow(InvalidFileError);
   });
 
   it("keeps a batch filled exactly to the target as one batch", () => {
@@ -79,10 +120,11 @@ describe("planBatches size splitting", () => {
     expect(names(batches)).toEqual([["a"], ["b"]]);
   });
 
-  it("still places a file between the target and the hard cap — alone", () => {
-    const big = Math.floor((BATCH_TARGET_BYTES + MAX_UPLOAD_BYTES) / 2);
-    const batches = planBatches([img("small", 10), img("big", big), img("tail", 10)]);
-    expect(names(batches)).toEqual([["small"], ["big"], ["tail"]]);
+  it("gives two max-size files a batch each", () => {
+    // The largest legal file is 35MB, so two of them blow the 40MB batch target
+    // and must be split — neither is refused.
+    const batches = planBatches([img("a", MAX_FILE_BYTES), img("b", MAX_FILE_BYTES)]);
+    expect(names(batches)).toEqual([["a"], ["b"]]);
   });
 });
 
