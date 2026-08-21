@@ -580,3 +580,114 @@ def test_submit_gives_up_after_max_upload_retries(tmp_path):
         client.submit([str(img)])
 
     assert len(posted_filenames(session)) == 2  # first attempt + 1 retry
+
+
+# --------------------------------------------------------------------------- #
+# submit_all rate limiting
+#
+# A pile big enough to need batching is a pile big enough to hit the per-minute
+# page quota, so a 429 mid-pile is the normal case, not an exception. If it were
+# raised, batching would only trade one failure for another. Retry-After is 0 in
+# these tests so nothing actually sleeps.
+# --------------------------------------------------------------------------- #
+def rate_limited_response():
+    return FakeResponse(
+        429,
+        {"error": {"code": "RATE_LIMITED", "message": "slow down"}},
+        headers={"Retry-After": "0"},
+    )
+
+
+def test_submit_all_waits_out_a_rate_limit_and_retries_the_same_batch(tmp_path):
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+        rate_limited_response(),  # second batch bounces off the per-minute quota
+        FakeResponse(201, {"jobId": "job_b", "status": "pending"}),
+    ])
+    handler = lambda *a, **k: next(responses)
+    client, session = client_and_session(handler)
+
+    jobs = client.submit_all(paths)
+
+    assert [job.job_id for job in jobs] == ["job_a", "job_b"]
+    sent = posted_filenames(session)
+    assert len(sent) == 3  # batch 1, the rejected batch 2, then batch 2 again
+    assert sent[1] == sent[2]  # the retry carried exactly the same files
+
+
+def test_submit_all_hands_back_created_jobs_when_it_gives_up(tmp_path):
+    """Giving up must not strand the jobs already created — they are running and
+    their credits are already reserved."""
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+        rate_limited_response(),
+    ])
+    handler = lambda *a, **k: next(responses)
+    # No waiting budget at all: the first 429 ends it.
+    client, session = client_and_session(handler, rate_limit_max_wait=0)
+
+    with pytest.raises(RateLimitedError) as exc:
+        client.submit_all(paths)
+
+    assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a"]
+    assert len(posted_filenames(session)) == 2  # no pointless extra attempt
+
+
+def test_submit_all_uses_a_default_wait_when_the_server_sends_no_retry_after(
+    tmp_path, monkeypatch
+):
+    """Without a Retry-After header the client still waits rather than failing."""
+    paths = make_images(tmp_path, 2)
+    responses = iter([
+        FakeResponse(429, {"error": {"code": "RATE_LIMITED", "message": "slow"}}),
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    client, _session = client_and_session(lambda *a, **k: next(responses))
+
+    jobs = client.submit_all(paths)
+
+    assert [job.job_id for job in jobs] == ["job_a"]
+    assert slept == [5.0]  # the documented fallback, not zero
+
+
+def test_submitted_jobs_also_survives_a_non_rate_limit_failure(tmp_path):
+    """Any failure mid-pile strands paid-for jobs, not just a rate limit."""
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+        FakeResponse(402, {"error": {"code": "INSUFFICIENT_CREDITS", "message": "no"}}),
+    ])
+    client, _session = client_and_session(lambda *a, **k: next(responses))
+
+    with pytest.raises(InsufficientCreditsError) as exc:
+        client.submit_all(paths)
+
+    assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a"]
+
+
+def test_convert_all_hands_back_jobs_when_a_later_one_fails(tmp_path):
+    """The first deck is on disk, the second job failed — but jobs 1..N are all
+    still identified on the exception."""
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    out_dir = tmp_path / "decks"
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+        FakeResponse(201, {"jobId": "job_b", "status": "pending"}),
+        FakeResponse(200, {"jobId": "job_a", "status": "completed"}),
+        FakeResponse(200, content=b"DECK-A"),
+        FakeResponse(200, {
+            "jobId": "job_b", "status": "failed",
+            "error": {"code": "CONVERSION_FAILED", "message": "boom"},
+        }),
+    ])
+    client = make_client(lambda *a, **k: next(responses))
+
+    with pytest.raises(JobFailedError) as exc:
+        client.convert_all(paths, str(out_dir), poll_interval=0)
+
+    assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a", "job_b"]
+    assert (out_dir / "part-01.pptx").read_bytes() == b"DECK-A"  # already delivered

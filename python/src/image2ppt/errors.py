@@ -7,7 +7,7 @@ Branch on ``code``, not ``message`` — messages may be reworded.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class Image2PPTError(Exception):
@@ -24,6 +24,12 @@ class Image2PPTError(Exception):
         self.message = message
         self.status_code = status_code
         self.code = code
+        #: Jobs already created when this error was raised out of ``submit_all`` /
+        #: ``convert_all``. They are **running on the server with credits already
+        #: reserved** — they are not lost and not refunded by the failure. Wait on
+        #: them (``wait``/``download``) or come back to them later. Empty for any
+        #: error not raised out of a batch call.
+        self.submitted_jobs: List[Any] = []
 
     def __str__(self) -> str:
         parts = []
@@ -62,6 +68,11 @@ class RateLimitedError(Image2PPTError):
 
     ``retry_after`` is the server-suggested wait in seconds (from the
     ``Retry-After`` header); retry after that long.
+
+    Both kinds of 429 land here — the per-minute page quota and the cap on
+    concurrently active jobs — and both are handled the same way: wait, then try
+    the same submission again. ``submit_all`` / ``convert_all`` do that for you;
+    if one of them gives up, ``submitted_jobs`` holds the jobs already created.
     """
 
     def __init__(

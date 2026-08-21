@@ -25,6 +25,22 @@ from .models import Job
 
 DEFAULT_BASE_URL = "https://image2ppt.com"
 
+#: Wait between rate-limited retries when the server sends no ``Retry-After``.
+_RATE_LIMIT_FALLBACK_WAIT = 5.0
+
+
+def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
+    """Record the jobs created so far on an exception escaping a batch call.
+
+    Every ``Image2PPTError`` declares ``submitted_jobs``; this also reaches the
+    rarer non-SDK escape (an exhausted connection error), so the caller never has
+    to know which kind they caught to find out what they already paid for.
+    """
+    try:
+        exc.submitted_jobs = list(jobs)  # type: ignore[attr-defined]
+    except AttributeError:
+        pass  # exotic exception type with no __dict__: nothing we can do
+
 
 @dataclass(frozen=True)
 class _PreparedFile:
@@ -57,6 +73,10 @@ class Image2PPTClient:
         max_upload_retries: How many times to retry a submission whose connection
             broke mid-upload (default 2). See ``submit`` for why that is safe and
             why a read timeout is never retried.
+        rate_limit_max_wait: Total seconds ``submit_all`` / ``convert_all`` may
+            spend waiting out rate limits across the whole call (default 1800 =
+            30 min). Submitting a large pile *will* hit the per-minute page quota,
+            so waiting is the normal path, not an error.
     """
 
     #: Supported input extensions -> MIME type (for labeling multipart uploads).
@@ -77,12 +97,14 @@ class Image2PPTClient:
         timeout: float = 60.0,
         session: Optional[requests.Session] = None,
         max_upload_retries: int = 2,
+        rate_limit_max_wait: float = 1800.0,
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_upload_retries = max(0, max_upload_retries)
+        self.rate_limit_max_wait = max(0.0, rate_limit_max_wait)
         #: Seconds before the first upload retry; doubles on each further attempt.
         #: Internal knob — tests set it to 0 to run without real sleeps.
         self._upload_retry_backoff = 1.0
@@ -164,9 +186,17 @@ class Image2PPTClient:
         — N batches means N decks. If you need exactly one deck, keep the
         submission inside one request's limits and use ``convert``.
 
-        Batches are submitted back to back. A very large pile can trip the
-        account's submission rate limit; that surfaces as ``RateLimitedError``
-        with ``retry_after``, and any jobs already created stay created.
+        **Rate limits are waited out, not raised.** A pile big enough to need
+        batching is a pile big enough to hit the account's per-minute page quota
+        (and its cap on concurrently active jobs). Both arrive as a 429 with a
+        ``Retry-After``, and both are handled the same way: sleep that long, then
+        try the same batch again. Waiting is the normal path here. Total waiting is
+        capped by the client's ``rate_limit_max_wait``.
+
+        **If it does give up, the jobs already created are handed back on the
+        exception**, in ``exc.submitted_jobs``. Those jobs are running on the
+        server with credits already reserved — they are not lost and not refunded.
+        Wait on them or fetch them later; do not resubmit those files.
 
         Args:
             paths: Local file paths.
@@ -180,20 +210,33 @@ class Image2PPTClient:
             InvalidFileError: A single file is over the per-request limit on its
                 own, so no batching can carry it. Plus the same errors as
                 ``submit`` for each batch.
+            RateLimitedError: Still rate limited after ``rate_limit_max_wait``
+                seconds of waiting.
         """
         paths = list(paths)
         if not paths:
             raise ValueError("at least one file is required")
 
         batches = plan_batches(self._upload_items(paths))
-        return [
-            self.submit(
-                [item.path for item in batch],
-                locale=locale,
-                aspect_ratio=aspect_ratio,
-            )
-            for batch in batches
-        ]
+        deadline = time.monotonic() + self.rate_limit_max_wait
+        jobs: List[Job] = []
+        for batch in batches:
+            try:
+                jobs.append(
+                    self._submit_batch(
+                        [item.path for item in batch],
+                        locale=locale,
+                        aspect_ratio=aspect_ratio,
+                        deadline=deadline,
+                    )
+                )
+            except Exception as exc:
+                # Whatever went wrong, the earlier batches are already jobs on the
+                # server with credits reserved. Losing the ids would mean the caller
+                # paid for work they can never collect.
+                _attach_submitted_jobs(exc, jobs)
+                raise
+        return jobs
 
     def get_job(self, job_id: str) -> Job:
         """Fetch the current job state as a ``Job`` snapshot. Raises JobNotFoundError."""
@@ -335,21 +378,31 @@ class Image2PPTClient:
         Returns:
             The written file paths, in batch order.
 
+        Rate limits during submission are waited out — see ``submit_all``.
+
         Raises:
-            JobFailedError, Image2PPTTimeoutError: A job failed or ran past its
-                wait cap. Earlier batches that already downloaded stay on disk;
-                later ones are not waited on. Their ids are in ``submit_all``'s
-                return value if you want to drive the waiting yourself.
+            JobFailedError, Image2PPTTimeoutError, RateLimitedError: A job failed,
+                ran past its wait cap, or the pile stayed rate limited too long.
+                Earlier batches that already downloaded stay on disk, and every job
+                created so far is on the exception as ``exc.submitted_jobs`` —
+                those are still running with credits reserved, so wait on them
+                rather than resubmitting.
         """
         jobs = self.submit_all(paths, locale=locale, aspect_ratio=aspect_ratio)
         os.makedirs(dest_dir, exist_ok=True)
 
         written: List[str] = []
-        for index, job in enumerate(jobs, start=1):
-            completed = self.wait(job.job_id, poll_interval=poll_interval, timeout=timeout)
-            dest_path = os.path.join(dest_dir, f"part-{index:02d}.pptx")
-            self.download(completed.job_id, dest_path)
-            written.append(dest_path)
+        try:
+            for index, job in enumerate(jobs, start=1):
+                completed = self.wait(job.job_id, poll_interval=poll_interval, timeout=timeout)
+                dest_path = os.path.join(dest_dir, f"part-{index:02d}.pptx")
+                self.download(completed.job_id, dest_path)
+                written.append(dest_path)
+        except Exception as exc:
+            # Same contract as submit_all: the jobs are already paid for, so the
+            # caller gets their ids back instead of having to guess.
+            _attach_submitted_jobs(exc, jobs)
+            raise
         return written
 
     def account(self) -> Dict[str, Any]:
@@ -361,6 +414,38 @@ class Image2PPTClient:
         return self._parse_json(resp)
 
     # ----- internal helpers -------------------------------------------- #
+    def _submit_batch(
+        self,
+        paths: Sequence[str],
+        *,
+        locale: Optional[str],
+        aspect_ratio: Optional[str],
+        deadline: float,
+    ) -> Job:
+        """Submit one batch, waiting out rate limits until ``deadline``.
+
+        Retrying a 429 is not the same gamble as retrying a broken upload: a 429 is
+        the server saying it did *not* take the submission. Nothing was created and
+        nothing was charged, so trying the same batch again is free.
+
+        Both flavors of 429 (per-minute page quota, concurrent-job cap) carry a
+        ``Retry-After`` and are handled identically. When the header is missing we
+        fall back to a fixed wait.
+        """
+        while True:
+            try:
+                return self.submit(paths, locale=locale, aspect_ratio=aspect_ratio)
+            except RateLimitedError as exc:
+                delay = (
+                    exc.retry_after
+                    if exc.retry_after is not None
+                    else _RATE_LIMIT_FALLBACK_WAIT
+                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or delay > remaining:
+                    raise
+                time.sleep(delay)
+
     def _prepare_file(self, path: str) -> _PreparedFile:
         """Resolve one path to its multipart part and its exact size on the wire."""
         filename = os.path.basename(path)
