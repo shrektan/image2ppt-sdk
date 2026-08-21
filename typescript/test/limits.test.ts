@@ -16,6 +16,7 @@ import {
   TooManySlidesError,
   type UploadItem,
   checkFileSize,
+  formatBytes,
   checkSubmission,
   planBatches,
 } from "../src/index.js";
@@ -172,5 +173,26 @@ describe("planBatches PDFs and ordering", () => {
     const first = names(planBatches(items));
     expect(first).toEqual([["a", "b"], ["c.pdf"], ["d"]]);
     expect(names(planBatches(items))).toEqual(first);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// formatBytes — mirrors the Python test of the same name
+// --------------------------------------------------------------------------- //
+describe("formatBytes", () => {
+  it("does not round a small overage down to zero", () => {
+    // Otherwise the error reads "45.0MB, over the 45.0MB limit (0.0MB too much)" —
+    // self-contradictory, and it looks like the check itself is broken. That is
+    // exactly how it printed against the real server.
+    expect(formatBytes(1)).toBe("1B");
+    expect(formatBytes(32 * 1024)).toBe("32.0KB");
+    expect(formatBytes(5 * 1024 * 1024)).toBe("5.0MB");
+
+    expect(() => checkSubmission(MAX_UPLOAD_BYTES + 1, 1)).toThrow(InvalidFileError);
+    try {
+      checkSubmission(MAX_UPLOAD_BYTES + 1, 1);
+    } catch (err) {
+      expect((err as Error).message).not.toContain("0.0MB too much");
+    }
   });
 });
