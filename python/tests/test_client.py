@@ -15,6 +15,7 @@ import requests
 from PIL import Image
 
 from image2ppt import (
+    MAX_FILE_BYTES,
     MAX_PAGES_PER_JOB,
     MAX_UPLOAD_BYTES,
     AuthenticationError,
@@ -523,34 +524,37 @@ def test_convert_all_writes_one_numbered_pptx_per_batch(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# upload retry — safe only for a connection that died mid-upload
+# a failed submission is NOT retried
+#
+# This looks like a missing feature; it is a deliberate one. A ConnectionError
+# proves only that the exchange broke — the server may have received the whole
+# body, created the job and reserved credits, and then lost the connection while
+# answering. Retrying that case charges the user twice. Nothing here can tell the
+# two apart without an idempotency key the API does not offer, so the error goes
+# to the caller untouched. These tests exist so nobody quietly adds the retry back.
 # --------------------------------------------------------------------------- #
-def test_submit_retries_a_connection_dropped_mid_upload(tmp_path):
-    """The body never arrived, so no job was created and nothing was charged."""
+def test_submit_does_not_retry_a_broken_connection(tmp_path):
     img = tmp_path / "a.png"
     img.write_bytes(png_bytes())
     attempts = {"n": 0}
 
     def handler(*_args, **_kwargs):
         attempts["n"] += 1
-        if attempts["n"] == 1:
-            raise requests.exceptions.ConnectionError(
-                "('Connection aborted.', TimeoutError('The write operation timed out'))"
-            )
-        return FakeResponse(201, {"jobId": "job_retry", "status": "pending"})
+        raise requests.exceptions.ConnectionError(
+            "('Connection aborted.', TimeoutError('The write operation timed out'))"
+        )
 
     client, session = client_and_session(handler)
-    client._upload_retry_backoff = 0  # no real sleeping in tests
 
-    job = client.submit([str(img)])
+    with pytest.raises(requests.exceptions.ConnectionError):
+        client.submit([str(img)])
 
-    assert job.job_id == "job_retry"
-    assert len(posted_filenames(session)) == 2
+    assert attempts["n"] == 1  # tried exactly once
+    assert len(posted_filenames(session)) == 1
 
 
-def test_submit_never_retries_a_read_timeout(tmp_path):
-    """The body WAS sent, so the job may exist with credits reserved. Retrying
-    would submit the same files twice and charge twice."""
+def test_submit_does_not_retry_a_read_timeout(tmp_path):
+    """The body was sent, so the job may exist with credits reserved."""
     img = tmp_path / "a.png"
     img.write_bytes(png_bytes())
 
@@ -558,28 +562,31 @@ def test_submit_never_retries_a_read_timeout(tmp_path):
         raise requests.exceptions.ReadTimeout("timed out waiting for the response")
 
     client, session = client_and_session(handler)
-    client._upload_retry_backoff = 0
 
     with pytest.raises(requests.exceptions.ReadTimeout):
         client.submit([str(img)])
 
-    assert len(posted_filenames(session)) == 1  # exactly one attempt
+    assert len(posted_filenames(session)) == 1
 
 
-def test_submit_gives_up_after_max_upload_retries(tmp_path):
-    img = tmp_path / "a.png"
-    img.write_bytes(png_bytes())
+def test_submit_all_does_not_retry_a_broken_connection_either(tmp_path):
+    """And the jobs already created still come back on the exception."""
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    state = {"n": 0}
 
     def handler(*_args, **_kwargs):
+        state["n"] += 1
+        if state["n"] == 1:
+            return FakeResponse(201, {"jobId": "job_a", "status": "pending"})
         raise requests.exceptions.ConnectionError("connection reset")
 
-    client, session = client_and_session(handler, max_upload_retries=1)
-    client._upload_retry_backoff = 0
+    client, session = client_and_session(handler)
 
-    with pytest.raises(requests.exceptions.ConnectionError):
-        client.submit([str(img)])
+    with pytest.raises(requests.exceptions.ConnectionError) as exc:
+        client.submit_all(paths)
 
-    assert len(posted_filenames(session)) == 2  # first attempt + 1 retry
+    assert len(posted_filenames(session)) == 2  # batch 1, then batch 2 once
+    assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a"]
 
 
 # --------------------------------------------------------------------------- #
@@ -691,3 +698,44 @@ def test_convert_all_hands_back_jobs_when_a_later_one_fails(tmp_path):
 
     assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a", "job_b"]
     assert (out_dir / "part-01.pptx").read_bytes() == b"DECK-A"  # already delivered
+
+
+# --------------------------------------------------------------------------- #
+# per-file limit and destination checks — both must fail before spending money
+# --------------------------------------------------------------------------- #
+def test_submit_refuses_a_single_file_over_the_per_file_limit(tmp_path):
+    """It fits the 45MB request cap, but the server rejects it every time."""
+    big = sparse_file(tmp_path, "big.pdf", MAX_FILE_BYTES + 1)
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(InvalidFileError) as exc:
+        client.submit([big])
+
+    assert exc.value.code == "INVALID_FILE"
+    assert "big.pdf" in exc.value.message
+    assert len(session.calls) == 0
+
+
+def test_submit_all_refuses_it_too_instead_of_planning_a_doomed_batch(tmp_path):
+    big = sparse_file(tmp_path, "big.pdf", MAX_FILE_BYTES + 1)
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(InvalidFileError):
+        client.submit_all([str(img), big])
+
+    assert len(session.calls) == 0  # the good file isn't submitted either
+
+
+def test_convert_all_checks_the_destination_before_submitting_anything(tmp_path):
+    """An unusable dest_dir must not cost credits: no job may exist afterwards."""
+    paths = make_images(tmp_path, 2)
+    not_a_dir = tmp_path / "decks"
+    not_a_dir.write_text("I am a regular file")
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(OSError):
+        client.convert_all(paths, str(not_a_dir))
+
+    assert len(session.calls) == 0

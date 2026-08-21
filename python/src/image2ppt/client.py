@@ -12,7 +12,7 @@ import requests
 from PIL import Image, UnidentifiedImageError
 
 from ._compress import IMAGE_MIMES, compress_image_for_upload
-from ._limits import UploadItem, check_submission, plan_batches
+from ._limits import UploadItem, check_file_size, check_submission, plan_batches
 from .errors import (
     Image2PPTError,
     Image2PPTTimeoutError,
@@ -70,9 +70,6 @@ class Image2PPTClient:
         base_url: Service base URL, defaults to ``https://image2ppt.com``.
         timeout: Per-HTTP-request timeout in seconds (not the whole-job wait).
         session: Optional ``requests.Session`` to inject (for testing or pooling).
-        max_upload_retries: How many times to retry a submission whose connection
-            broke mid-upload (default 2). See ``submit`` for why that is safe and
-            why a read timeout is never retried.
         rate_limit_max_wait: Total seconds ``submit_all`` / ``convert_all`` may
             spend waiting out rate limits across the whole call (default 1800 =
             30 min). Submitting a large pile *will* hit the per-minute page quota,
@@ -96,18 +93,13 @@ class Image2PPTClient:
         *,
         timeout: float = 60.0,
         session: Optional[requests.Session] = None,
-        max_upload_retries: int = 2,
         rate_limit_max_wait: float = 1800.0,
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.max_upload_retries = max(0, max_upload_retries)
         self.rate_limit_max_wait = max(0.0, rate_limit_max_wait)
-        #: Seconds before the first upload retry; doubles on each further attempt.
-        #: Internal knob — tests set it to 0 to run without real sleeps.
-        self._upload_retry_backoff = 1.0
         self._session = session or requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {api_key}"})
 
@@ -126,8 +118,12 @@ class Image2PPTClient:
         opening a connection — going over the size cap on the wire does not come
         back as a clean error, it comes back as a dead connection.
 
-        If the connection breaks *while uploading*, the submission is retried
-        (see ``max_upload_retries``).
+        **A failed submission is never retried automatically.** A connection error
+        does not tell you whether the request body made it: the job may not exist,
+        or it may exist with credits already reserved and only the response lost.
+        Retrying the second case charges twice, and without an idempotency key
+        there is no way to tell them apart — so the error is raised as-is. Check
+        ``account()`` or your job list before resending.
 
         Args:
             paths: Local file paths (one or more). Supports png/jpeg/webp/gif/pdf,
@@ -143,9 +139,11 @@ class Image2PPTClient:
             ``credits_reserved`` (credits locked at submit time).
 
         Raises:
-            AuthenticationError, InvalidFileError (including the local
-            ``PAYLOAD_TOO_LARGE`` pre-flight failure), TooManySlidesError,
+            AuthenticationError, InvalidFileError (including the local per-file
+            and ``PAYLOAD_TOO_LARGE`` pre-flight failures), TooManySlidesError,
             InsufficientCreditsError, RateLimitedError.
+            ``requests.RequestException`` propagates unchanged for a transport
+            failure — see above on why it is not retried.
         """
         paths = list(paths)
         if not paths:
@@ -160,6 +158,8 @@ class Image2PPTClient:
         prepared = [self._prepare_file(path) for path in paths]
         # Pre-flight, before a single byte goes out: an oversized request is not
         # answered with an error, it is cut off — so it must never be sent.
+        for item in prepared:
+            check_file_size(item.path, item.size)
         check_submission(
             total_bytes=sum(item.size for item in prepared),
             image_pages=sum(1 for item in prepared if item.is_image),
@@ -192,6 +192,9 @@ class Image2PPTClient:
         ``Retry-After``, and both are handled the same way: sleep that long, then
         try the same batch again. Waiting is the normal path here. Total waiting is
         capped by the client's ``rate_limit_max_wait``.
+
+        **Connection errors are not retried** — see ``submit``. Only a 429 is,
+        because only a 429 proves the server did not take the submission.
 
         **If it does give up, the jobs already created are handed back on the
         exception**, in ``exc.submitted_jobs``. Those jobs are running on the
@@ -369,7 +372,8 @@ class Image2PPTClient:
 
         Args:
             paths: Local file paths.
-            dest_dir: Directory for the PPTX files; created if missing.
+            dest_dir: Directory for the PPTX files; created **before anything is
+                submitted**, so an unusable destination costs nothing.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
             poll_interval: Initial poll interval in seconds.
@@ -388,8 +392,12 @@ class Image2PPTClient:
                 those are still running with credits reserved, so wait on them
                 rather than resubmitting.
         """
-        jobs = self.submit_all(paths, locale=locale, aspect_ratio=aspect_ratio)
+        # Before anything is submitted: if the destination is unusable, fail now
+        # rather than after N jobs exist with credits reserved and nowhere to put
+        # their output. This is the one step that can fail for free.
         os.makedirs(dest_dir, exist_ok=True)
+
+        jobs = self.submit_all(paths, locale=locale, aspect_ratio=aspect_ratio)
 
         written: List[str] = []
         try:
@@ -497,45 +505,42 @@ class Image2PPTClient:
     def _post_files(
         self, prepared: Sequence[_PreparedFile], data: Dict[str, str]
     ) -> requests.Response:
-        """POST the multipart submission, retrying a connection that broke mid-upload.
+        """POST the multipart submission exactly once.
 
-        Only ``ConnectionError`` is retried, and never ``ReadTimeout``. The
-        difference matters because a retry can cost money:
+        **A failed submission is never retried automatically**, and that is
+        deliberate. When ``requests`` raises ``ConnectionError`` the only thing it
+        proves is that this exchange broke; it does *not* prove the request body
+        was incomplete. The server may have received the whole body, created the
+        job and reserved the credits, and then lost the connection on the way back
+        with the response. Those two cases are indistinguishable from here, and
+        retrying the second one submits the same files twice and charges twice.
 
-        - ``ConnectionError`` means the request body never arrived in full. The
-          server cannot have parsed it, so it cannot have created a job or
-          reserved credits. Retrying is free.
-        - ``ReadTimeout`` means the body *was* sent and we simply gave up waiting
-          for the response. The job may well exist, with credits already reserved.
-          Retrying would submit the same files a second time and charge twice, so
-          it is raised as-is — check ``account()`` or your job list before resending.
+        Telling them apart needs an idempotency key the API does not offer, so the
+        error goes straight to the caller: check ``account()`` or your job list to
+        see whether the job exists, then decide whether to resend.
+
+        (Rate limiting is a different animal — a 429 is the server explicitly
+        saying it did *not* take the submission, so ``submit_all`` does retry that.)
         """
-        attempt = 0
-        while True:
-            opened = []
-            multipart = []
-            try:
-                for item in prepared:
-                    if item.payload is not None:
-                        multipart.append(("files", (item.filename, item.payload, item.mime)))
-                    else:
-                        handle = open(item.path, "rb")
-                        opened.append(handle)
-                        multipart.append(("files", (item.filename, handle, item.mime)))
-                return self._session.post(
-                    f"{self.base_url}/api/v1/jobs",
-                    files=multipart,
-                    data=data,
-                    timeout=self.timeout,
-                )
-            except requests.exceptions.ConnectionError:
-                if attempt >= self.max_upload_retries:
-                    raise
-                time.sleep(self._upload_retry_backoff * (2**attempt))
-                attempt += 1
-            finally:
-                for handle in opened:
-                    handle.close()
+        opened = []
+        multipart = []
+        try:
+            for item in prepared:
+                if item.payload is not None:
+                    multipart.append(("files", (item.filename, item.payload, item.mime)))
+                else:
+                    handle = open(item.path, "rb")
+                    opened.append(handle)
+                    multipart.append(("files", (item.filename, handle, item.mime)))
+            return self._session.post(
+                f"{self.base_url}/api/v1/jobs",
+                files=multipart,
+                data=data,
+                timeout=self.timeout,
+            )
+        finally:
+            for handle in opened:
+                handle.close()
 
     def _guess_mime(self, filename: str) -> str:
         ext = os.path.splitext(filename)[1].lower()

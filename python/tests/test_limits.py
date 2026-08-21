@@ -10,11 +10,13 @@ import pytest
 
 from image2ppt import (
     BATCH_TARGET_BYTES,
+    MAX_FILE_BYTES,
     MAX_PAGES_PER_JOB,
     MAX_UPLOAD_BYTES,
     InvalidFileError,
     TooManySlidesError,
     UploadItem,
+    check_file_size,
     check_submission,
     plan_batches,
 )
@@ -31,6 +33,33 @@ def pdf(name: str, size: int = 1) -> UploadItem:
 def names(batches):
     """Batches as lists of file names, so assertions read like the input."""
     return [[item.path for item in batch] for batch in batches]
+
+
+# --------------------------------------------------------------------------- #
+# check_file_size — a property of the file, not of the request
+#
+# The per-file cap is STRICTER than the request cap (35MB vs 45MB), so a file can
+# sit comfortably inside a request and still be rejected by the server every time.
+# --------------------------------------------------------------------------- #
+def test_a_file_exactly_on_the_per_file_cap_is_fine():
+    check_file_size("ok.pdf", MAX_FILE_BYTES)
+
+
+def test_a_file_one_byte_over_the_per_file_cap_is_refused():
+    with pytest.raises(InvalidFileError) as exc:
+        check_file_size("big.pdf", MAX_FILE_BYTES + 1)
+    assert exc.value.code == "INVALID_FILE"
+    assert "big.pdf" in exc.value.message
+
+
+def test_the_per_file_cap_is_stricter_than_the_request_cap():
+    """Guards the reason this check exists: without it, a file between the two
+    caps looks submittable to the batch planner and never is."""
+    assert MAX_FILE_BYTES < MAX_UPLOAD_BYTES
+    between = (MAX_FILE_BYTES + MAX_UPLOAD_BYTES) // 2
+    check_submission(between, 1)  # the request cap is happy with it
+    with pytest.raises(InvalidFileError):
+        check_file_size("between.pdf", between)  # the file cap is not
 
 
 # --------------------------------------------------------------------------- #
@@ -59,12 +88,21 @@ def test_empty_input_plans_nothing():
     assert plan_batches([]) == []
 
 
-def test_single_file_over_the_hard_cap_is_unbatchable():
-    """No split can help a file that doesn't fit in a request on its own."""
+def test_single_oversized_file_is_unbatchable():
+    """No split can help a file the server rejects on its own. The planner applies
+    the per-file cap, so it stops at 35MB rather than waiting for 45MB."""
     with pytest.raises(InvalidFileError) as exc:
-        plan_batches([img("huge.png", MAX_UPLOAD_BYTES + 1)])
-    assert exc.value.code == "PAYLOAD_TOO_LARGE"
+        plan_batches([img("huge.png", MAX_FILE_BYTES + 1)])
+    assert exc.value.code == "INVALID_FILE"
     assert "huge.png" in exc.value.message
+
+
+def test_a_file_between_the_two_caps_is_refused_by_the_planner():
+    """The regression this guards: it fits the request cap, so the planner used to
+    build a batch for it that the server would reject every single time."""
+    between = (MAX_FILE_BYTES + MAX_UPLOAD_BYTES) // 2
+    with pytest.raises(InvalidFileError):
+        plan_batches([img("doomed.pdf", between)])
 
 
 def test_batch_filled_exactly_to_the_target_stays_one_batch():
@@ -79,12 +117,11 @@ def test_one_byte_past_the_target_starts_a_second_batch():
     assert names(batches) == [["a"], ["b"]]
 
 
-def test_file_between_the_target_and_the_hard_cap_is_still_placed_alone():
-    """Over the batch target but under the request cap: it gets its own batch
-    rather than being refused."""
-    big = (BATCH_TARGET_BYTES + MAX_UPLOAD_BYTES) // 2
-    batches = plan_batches([img("small", 10), img("big", big), img("tail", 10)])
-    assert names(batches) == [["small"], ["big"], ["tail"]]
+def test_two_max_size_files_get_a_batch_each():
+    """The largest legal file is 35MB, so two of them blow the 40MB batch target
+    and must be split — neither is refused."""
+    batches = plan_batches([img("a", MAX_FILE_BYTES), img("b", MAX_FILE_BYTES)])
+    assert names(batches) == [["a"], ["b"]]
 
 
 # --------------------------------------------------------------------------- #

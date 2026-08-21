@@ -15,9 +15,11 @@ from __future__ import annotations
 
 from ._limits import (
     BATCH_TARGET_BYTES,
+    MAX_FILE_BYTES,
     MAX_PAGES_PER_JOB,
     MAX_UPLOAD_BYTES,
     UploadItem,
+    check_file_size,
     check_submission,
     plan_batches,
 )
@@ -43,10 +45,12 @@ __all__ = [
     "Image2PPTClient",
     "Job",
     "DEFAULT_BASE_URL",
+    "MAX_FILE_BYTES",
     "MAX_UPLOAD_BYTES",
     "BATCH_TARGET_BYTES",
     "MAX_PAGES_PER_JOB",
     "UploadItem",
+    "check_file_size",
     "check_submission",
     "plan_batches",
     "Image2PPTError",
