@@ -29,6 +29,15 @@ on the wire, and can split a large pile of files into batches on their own.
   This is safe because a request body that never arrived cannot have created a job
   or reserved credits. A read timeout is deliberately **not** retried — the job may
   already exist, and a retry would charge twice.
+- **Both clients** — the batch calls **wait out rate limits instead of failing**.
+  A pile big enough to need batching is a pile big enough to hit the per-minute
+  page quota, so a 429 mid-pile is normal; each one is retried after its
+  `Retry-After` (5s if the header is absent), capped by `rate_limit_max_wait` /
+  `rateLimitMaxWaitMs` (default 30 min). Retrying a 429 is free — the server is
+  saying it did not take the submission.
+- **Both clients** — when a batch call fails partway, the jobs it already created
+  come back on the exception as `submitted_jobs` / `submittedJobs`. Those jobs are
+  running with credits already reserved; collect them instead of resubmitting.
 - **Both clients** — `PAYLOAD_TOO_LARGE` and HTTP 413 map to `InvalidFileError`.
 
 ### Fixed

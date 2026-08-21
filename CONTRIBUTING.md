@@ -20,8 +20,8 @@ engine is a hosted service — SDK changes here are about the client experience
 
 ## Local development
 
-- **Python** — see [python/README.md](./python/README.md). Tests: `cd python && uv run pytest`.
-- **TypeScript** — see [typescript/README.md](./typescript/README.md). Tests: `cd typescript && npm test`.
+- **Python** — see [python/README.md](./python/README.md). Tests: `cd python && uv sync && uv run pytest`.
+- **TypeScript** — see [typescript/README.md](./typescript/README.md). Tests: `cd typescript && npm install && npm test`.
 
 Keep the two SDKs behaviorally in sync: same methods, same error semantics, same
 retry/backoff behavior. If you change one, mirror it in the other.

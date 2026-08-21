@@ -71,6 +71,22 @@ print(paths)  # ['decks/part-01.pptx', 'decks/part-02.pptx']
 
 Batches hold at most 40MB of file content and at most 50 images; every PDF goes in a batch of its own, because the client does not parse PDFs and only the server knows their page count. `submit_all()` does the same splitting and hands back the jobs if you want to drive polling yourself. To see the plan without uploading anything, use `plan_batches()`.
 
+**Rate limits are waited out, not raised.** A pile big enough to need batching will hit the account's per-minute page quota (and its cap on concurrently active jobs). Both arrive as a `429` with a `Retry-After`; both are handled the same way — sleep that long, retry the same batch. Retrying a 429 is free: the server is saying it did *not* take the submission, so nothing was created and nothing was charged. Total waiting is capped by `rate_limit_max_wait` (default 30 min).
+
+If a batch call does fail partway, **the jobs it already created come back on the exception**:
+
+```python
+from image2ppt import Image2PPTError
+
+try:
+    paths = client.convert_all(image_paths, dest_dir="decks/")
+except Image2PPTError as e:
+    # These are already running with credits reserved — collect them, don't resubmit.
+    for job in e.submitted_jobs:
+        print("still running:", job.job_id)
+    raise
+```
+
 ## Rate limits
 
 Per account (all keys share the budget): ≤ 10 concurrent jobs, ≤ 60 pages/minute submitted. Over the limit returns `429` with a `Retry-After` hint. `wait()` handles 429 backoff for you automatically. If you call `submit()` directly, catch `RateLimitedError` and honor `retry_after`:
