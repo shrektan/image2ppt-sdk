@@ -54,6 +54,11 @@ export interface UploadItem {
 
 /** Format a byte count as MB, for human-readable error messages. */
 export function formatBytes(size: number): string {
+  // Stays honest below a megabyte. Rounding everything to MB makes a submission one
+  // byte over the cap read as "45.0MB, over the 45.0MB limit (0.0MB too much)" — a
+  // message that contradicts itself and looks like the check is broken.
+  if (size < 1024) return `${size}B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)}KB`;
   return `${(size / (1024 * 1024)).toFixed(1)}MB`;
 }
 

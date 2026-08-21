@@ -121,3 +121,24 @@ def test_order_is_preserved_and_planning_is_deterministic():
     first = names(plan_batches(items))
     assert first == [["a", "b"], ["c.pdf"], ["d"]]
     assert names(plan_batches(items)) == first  # same input, same plan
+
+
+def test_format_bytes_does_not_round_small_overages_to_zero():
+    """一个字节的超出不能被印成 0.0MB。
+
+    否则错误消息会变成「45.0MB 超过 45.0MB（超了 0.0MB）」——自相矛盾，
+    读起来像是这道检查本身坏了。真实联调时就是这么显示的。
+    """
+    from image2ppt._limits import MAX_UPLOAD_BYTES, check_submission, format_bytes
+    from image2ppt.errors import InvalidFileError
+
+    assert format_bytes(1) == "1B"
+    assert format_bytes(32 * 1024) == "32.0KB"
+    assert format_bytes(5 * 1024 * 1024) == "5.0MB"
+
+    try:
+        check_submission(total_bytes=MAX_UPLOAD_BYTES + 1, image_pages=1)
+    except InvalidFileError as exc:
+        assert "0.0MB too much" not in str(exc)
+    else:
+        raise AssertionError("超限没有被拦下")

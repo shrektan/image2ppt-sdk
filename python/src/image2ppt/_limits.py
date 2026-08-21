@@ -54,7 +54,16 @@ class UploadItem:
 
 
 def format_bytes(size: int) -> str:
-    """Format a byte count as MB, for human-readable error messages."""
+    """Format a byte count for human-readable error messages.
+
+    Stays honest below a megabyte. Rounding everything to MB makes a submission one
+    byte over the cap read as "45.0MB, over the 45.0MB limit (0.0MB too much)" — a
+    message that contradicts itself and looks like the check is broken.
+    """
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f}KB"
     return f"{size / (1024 * 1024):.1f}MB"
 
 
