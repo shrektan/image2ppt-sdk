@@ -6,7 +6,7 @@
  * pollIntervalMs=0 / Retry-After: 0 to run instantly.
  */
 
-import { mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,8 +21,8 @@ import {
   InvalidFileError,
   Job,
   JobNotFoundError,
-  MAX_PAGES_PER_JOB,
   MAX_FILE_BYTES,
+  MAX_PAGES_PER_JOB,
   MAX_UPLOAD_BYTES,
   NotReadyError,
   RateLimitedError,
@@ -634,5 +634,74 @@ describe("convertAll destination", () => {
 
     await expect(client(f).convertAll(files, notADir)).rejects.toThrow();
     expect(f.calls).toHaveLength(0);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// PDF pages, and a destination that only *looks* usable
+// --------------------------------------------------------------------------- //
+describe("PDF pages in submit", () => {
+  it("counts a PDF as a page, so 50 images plus one is refused", async () => {
+    // 50 images is exactly the limit; any PDF alongside makes it at least 51, so
+    // the server would reject it every time. Refuse locally, send nothing.
+    const files = await manyImages(MAX_PAGES_PER_JOB);
+    files.push(await tempFile("doc.pdf"));
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    const err = await client(f).submit(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TooManySlidesError);
+    expect((err as Error).message).toContain("at least 51");
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("still accepts 49 images plus one PDF", async () => {
+    // The guard must not over-reach: 49 + 1 is exactly 50 at the lower bound.
+    const files = await manyImages(MAX_PAGES_PER_JOB - 1);
+    files.push(await tempFile("doc.pdf"));
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit(files);
+
+    expect(postedFilenames(f)).toHaveLength(1);
+  });
+});
+
+describe("convertAll destination writability", () => {
+  it("refuses a destDir that exists but cannot be written", async () => {
+    // The bug this catches: a recursive mkdir SUCCEEDS on a read-only directory,
+    // so creating the directory early proved nothing — the submissions still went
+    // out and only writing the first deck failed, after the credits were spent.
+    const files = await manyImages(2);
+    const readOnly = join(dir, "decks");
+    await mkdir(readOnly);
+    await chmod(readOnly, 0o555);
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    try {
+      const err = await client(f).convertAll(files, readOnly).catch((e: unknown) => e);
+      expect((err as Error).message).toContain("cannot write");
+      expect(f.calls).toHaveLength(0); // nothing submitted, nothing charged
+    } finally {
+      await chmod(readOnly, 0o755); // let the temp-dir cleanup remove it
+    }
+  });
+
+  it("leaves no probe file behind", async () => {
+    const files = await manyImages(1);
+    const outDir = join(dir, "decks");
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(200, { jobId: "job_a", status: "completed" }),
+      new Response(Buffer.from("DECK-A"), { status: 200 }),
+    );
+
+    await client(f).convertAll(files, outDir, { pollIntervalMs: 0 });
+
+    expect((await readdir(outDir)).sort()).toEqual(["part-01.pptx"]);
   });
 });

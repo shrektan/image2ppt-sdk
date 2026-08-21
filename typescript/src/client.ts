@@ -1,7 +1,7 @@
 /** The image2ppt API client. */
 
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -50,6 +50,37 @@ function guessMime(name: string): string {
 
 function isImageMime(mime: string): boolean {
   return IMAGE_MIMES.has(mime);
+}
+
+/**
+ * Create `destDir` if needed and prove a file can actually be written in it.
+ *
+ * Creating the directory is not enough on its own: when it already exists, a
+ * recursive `mkdir` succeeds no matter what the permissions are, so a read-only
+ * destination sails through and only fails later — after the jobs exist and the
+ * credits are spent.
+ *
+ * The proof is an actual file rather than a permission-bit check. Permission bits
+ * get it wrong in exactly the environments that need the answer: they ignore
+ * read-only mounts and ACLs, and running as root they report writable for
+ * directories nothing can be written to. Creating a real file is the same
+ * operation `download` will do a few seconds later, so it is the same answer.
+ */
+async function ensureWritableDir(destDir: string): Promise<void> {
+  await mkdir(destDir, { recursive: true });
+  const probe = join(destDir, `.image2ppt-write-test-${process.pid}`);
+  try {
+    await writeFile(probe, "");
+  } catch (err) {
+    throw new Error(
+      `cannot write to destDir "${destDir}" (${(err as NodeJS.ErrnoException).code ?? err}); ` +
+        "nothing was submitted",
+      { cause: err },
+    );
+  } finally {
+    // Never created, or already gone: nothing to clean up either way.
+    await rm(probe, { force: true }).catch(() => undefined);
+  }
 }
 
 /**
@@ -133,6 +164,10 @@ export class Image2PPTClient {
     checkSubmission(
       files.reduce((total, file) => total + file.buffer.byteLength, 0),
       files.filter((file) => isImageMime(file.mime)).length,
+      // A PDF's real page count is only known server-side; counting it as at least
+      // 1 is what stops "50 images + a PDF" from being sent as a submission that is
+      // certain to come back over the page limit.
+      files.filter((file) => !isImageMime(file.mime)).length,
     );
 
     const buildForm = (): FormData => {
@@ -323,8 +358,8 @@ export class Image2PPTClient {
    *
    * Rate limits during submission are waited out — see `submitAll`.
    *
-   * @param destDir Directory for the PPTX files; created **before anything is
-   *   submitted**, so an unusable destination costs nothing.
+   * @param destDir Directory for the PPTX files. Created **and proven writable
+   *   before anything is submitted**, so an unusable destination costs nothing.
    * @returns The written file paths, in batch order.
    */
   async convertAll(
@@ -335,7 +370,7 @@ export class Image2PPTClient {
     // Before anything is submitted: if the destination is unusable, fail now
     // rather than after N jobs exist with credits reserved and nowhere to put
     // their output. This is the one step that can fail for free.
-    await mkdir(destDir, { recursive: true });
+    await ensureWritableDir(destDir);
 
     const jobs = await this.submitAll(paths, options);
 

@@ -100,17 +100,37 @@ export function checkFileSize(path: string, size: number): void {
 /**
  * Throw if a submission cannot succeed, before any bytes go on the wire.
  *
+ * **The page check is a lower bound, not the server's verdict.** An image is
+ * exactly 1 page, but a PDF is however many pages it holds and the SDK does not
+ * parse PDFs (zero dependencies), so each one can only be counted as *at least* 1.
+ * That is enough to catch the combinations that are certain to fail — 50 images
+ * plus any PDF is at least 51 pages, so it never had a chance — but a submission
+ * that passes here can still come back `TOO_MANY_SLIDES` from the server, because
+ * a 30-page PDF counted as 1 here and as 30 there. Passing this check means "not
+ * obviously doomed", not "will be accepted".
+ *
  * @param totalBytes Sum of the file sizes that will be sent in this request.
- * @param imagePages Number of image files (each is exactly 1 page). PDFs are
- *   excluded — their page count is only known server-side.
- * @throws TooManySlidesError More images than one job can hold.
+ * @param imagePages Number of image files. Each is exactly 1 page.
+ * @param pdfFiles Number of PDFs (or other files whose page count is unknown to
+ *   the client). Each counts as at least 1 page.
+ * @throws TooManySlidesError The minimum page count already exceeds what one job
+ *   can hold.
  * @throws InvalidFileError File content over the per-request cap
  *   (`code = "PAYLOAD_TOO_LARGE"`).
  */
-export function checkSubmission(totalBytes: number, imagePages: number): void {
-  if (imagePages > MAX_PAGES_PER_JOB) {
+export function checkSubmission(
+  totalBytes: number,
+  imagePages: number,
+  pdfFiles = 0,
+): void {
+  const minPages = imagePages + pdfFiles;
+  if (minPages > MAX_PAGES_PER_JOB) {
+    const counted = pdfFiles
+      ? `${imagePages} images plus ${pdfFiles} ${pdfFiles === 1 ? "PDF" : "PDFs"} ` +
+        `(at least 1 page each) is at least ${minPages} pages`
+      : `${imagePages} images is ${minPages} pages`;
     throw new TooManySlidesError(
-      `${imagePages} images in one submission, over the ${MAX_PAGES_PER_JOB}-page-per-job ` +
+      `${counted} in one submission, over the ${MAX_PAGES_PER_JOB}-page-per-job ` +
         "limit; use submitAll() or convertAll() to split them into jobs automatically",
       { code: "TOO_MANY_SLIDES" },
     );
@@ -134,7 +154,10 @@ export function checkSubmission(totalBytes: number, imagePages: number): void {
  *
  * Rules:
  * - a batch holds at most `BATCH_TARGET_BYTES` of file content;
- * - a batch holds at most `MAX_PAGES_PER_JOB` images;
+ * - a batch holds at most `MAX_PAGES_PER_JOB` images. That count is exact, not a
+ *   lower bound like `checkSubmission`'s: a PDF always flushes the current batch
+ *   and takes one of its own, so a batch being filled here only ever holds images,
+ *   and an image is always exactly 1 page;
  * - **every PDF gets a batch to itself.** The SDK does not parse PDFs (zero
  *   dependencies), so the client cannot know how many pages one holds. Mixed into
  *   a batch, an unknown page count could push the job over the page limit with no

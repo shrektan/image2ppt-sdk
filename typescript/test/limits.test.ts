@@ -196,3 +196,54 @@ describe("formatBytes", () => {
     }
   });
 });
+
+// --------------------------------------------------------------------------- //
+// PDFs in the page pre-check
+//
+// An image is exactly 1 page; a PDF is however many it holds, and the SDK does not
+// parse PDFs. Counting each PDF as *at least* 1 is a lower bound, but the lower
+// bound is what catches the combinations that can never succeed.
+// --------------------------------------------------------------------------- //
+describe("PDFs in the page pre-check", () => {
+  it("refuses a full page of images plus one PDF", () => {
+    // The regression: 50 images passed the check, and the PDF made it 51+.
+    expect(() => checkSubmission(1, MAX_PAGES_PER_JOB, 1)).toThrow(TooManySlidesError);
+    try {
+      checkSubmission(1, MAX_PAGES_PER_JOB, 1);
+    } catch (err) {
+      expect((err as TooManySlidesError).code).toBe("TOO_MANY_SLIDES");
+      expect((err as Error).message).toContain("at least 51");
+    }
+  });
+
+  it("lets PDFs alone blow the page limit too", () => {
+    expect(() => checkSubmission(1, 0, MAX_PAGES_PER_JOB + 1)).toThrow(TooManySlidesError);
+  });
+
+  it("passes images plus PDFs sitting exactly on the limit", () => {
+    expect(() => checkSubmission(1, MAX_PAGES_PER_JOB - 1, 1)).not.toThrow();
+  });
+
+  it("defaults the PDF count to zero for an all-image submission", () => {
+    expect(() => checkSubmission(1, MAX_PAGES_PER_JOB)).not.toThrow();
+  });
+
+  it("is a lower bound, not the server's verdict", () => {
+    // One PDF counts as 1 page here even if it holds 500. This test exists to make
+    // that limitation explicit rather than a surprise: passing locally does not
+    // promise the server will accept it.
+    expect(() => checkSubmission(1, 0, 1)).not.toThrow();
+  });
+
+  it("counts pages exactly in image batches, because PDFs never join them", () => {
+    // planBatches does NOT need the lower-bound treatment: a PDF always takes a
+    // batch of its own, so a batch being filled holds only images.
+    const items = [
+      ...Array.from({ length: MAX_PAGES_PER_JOB }, (_v, i) => img(`p${i}`)),
+      pdf("doc.pdf"),
+    ];
+    const batches = planBatches(items);
+    expect(batches.map((b) => b.length)).toEqual([MAX_PAGES_PER_JOB, 1]);
+    expect(batches[0]!.every((item) => !item.isPdf)).toBe(true);
+  });
+});
