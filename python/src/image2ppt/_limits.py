@@ -101,24 +101,44 @@ def check_file_size(path: str, size: int) -> None:
         )
 
 
-def check_submission(total_bytes: int, image_pages: int) -> None:
+def check_submission(total_bytes: int, image_pages: int, pdf_files: int = 0) -> None:
     """Raise if a submission cannot succeed, before any bytes go on the wire.
+
+    **The page check is a lower bound, not the server's verdict.** An image is
+    exactly 1 page, but a PDF is however many pages it holds and the SDK does not
+    parse PDFs (zero extra dependencies), so each one can only be counted as *at
+    least* 1. That is enough to catch the combinations that are certain to fail —
+    50 images plus any PDF is at least 51 pages, so it never had a chance — but a
+    submission that passes here can still come back ``TOO_MANY_SLIDES`` from the
+    server, because a 30-page PDF counted as 1 here and as 30 there. Passing this
+    check means "not obviously doomed", not "will be accepted".
 
     Args:
         total_bytes: Sum of the file sizes that will be sent in this request.
-        image_pages: Number of image files (each is exactly 1 page). PDFs are
-            excluded — their page count is only known server-side.
+        image_pages: Number of image files. Each is exactly 1 page.
+        pdf_files: Number of PDFs (or other files whose page count is unknown to
+            the client). Each counts as at least 1 page.
 
     Raises:
-        TooManySlidesError: More images than one job can hold.
+        TooManySlidesError: The minimum page count already exceeds what one job
+            can hold.
         InvalidFileError: File content over the per-request cap
             (``code="PAYLOAD_TOO_LARGE"``).
     """
-    if image_pages > MAX_PAGES_PER_JOB:
+    min_pages = image_pages + pdf_files
+    if min_pages > MAX_PAGES_PER_JOB:
+        if pdf_files:
+            counted = (
+                f"{image_pages} images plus {pdf_files} "
+                f"{'PDF' if pdf_files == 1 else 'PDFs'} (at least 1 page each) "
+                f"is at least {min_pages} pages"
+            )
+        else:
+            counted = f"{image_pages} images is {min_pages} pages"
         raise TooManySlidesError(
-            f"{image_pages} images in one submission, over the "
-            f"{MAX_PAGES_PER_JOB}-page-per-job limit; use submit_all() or "
-            "convert_all() to split them into jobs automatically",
+            f"{counted} in one submission, over the {MAX_PAGES_PER_JOB}-page-per-job "
+            "limit; use submit_all() or convert_all() to split them into jobs "
+            "automatically",
             code="TOO_MANY_SLIDES",
         )
     if total_bytes > MAX_UPLOAD_BYTES:
@@ -139,7 +159,10 @@ def plan_batches(items: Iterable[UploadItem]) -> List[List[UploadItem]]:
 
     Rules:
       - a batch holds at most ``BATCH_TARGET_BYTES`` of file content;
-      - a batch holds at most ``MAX_PAGES_PER_JOB`` images;
+      - a batch holds at most ``MAX_PAGES_PER_JOB`` images. That count is exact,
+        not a lower bound like ``check_submission``'s: a PDF always flushes the
+        current batch and takes one of its own, so a batch being filled here only
+        ever holds images, and an image is always exactly 1 page;
       - **every PDF gets a batch to itself.** The SDK does not parse PDFs (zero
         extra dependencies), so the client cannot know how many pages one holds.
         Mixed into a batch, an unknown page count could push the job over the

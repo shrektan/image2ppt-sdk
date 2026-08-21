@@ -179,3 +179,48 @@ def test_format_bytes_does_not_round_small_overages_to_zero():
         assert "0.0MB too much" not in str(exc)
     else:
         raise AssertionError("超限没有被拦下")
+
+
+# --------------------------------------------------------------------------- #
+# PDFs in the page pre-check
+#
+# An image is exactly 1 page; a PDF is however many it holds, and the SDK does not
+# parse PDFs. Counting each PDF as *at least* 1 is a lower bound, but the lower
+# bound is what catches the combinations that can never succeed.
+# --------------------------------------------------------------------------- #
+def test_a_full_page_of_images_plus_one_pdf_is_already_over():
+    """The regression: 50 images passed the check, and the PDF made it 51+."""
+    with pytest.raises(TooManySlidesError) as exc:
+        check_submission(1, MAX_PAGES_PER_JOB, pdf_files=1)
+    assert exc.value.code == "TOO_MANY_SLIDES"
+    assert "at least 51" in exc.value.message
+
+
+def test_pdfs_alone_can_also_blow_the_page_limit():
+    with pytest.raises(TooManySlidesError):
+        check_submission(1, 0, pdf_files=MAX_PAGES_PER_JOB + 1)
+
+
+def test_images_plus_pdfs_exactly_on_the_limit_pass():
+    check_submission(1, MAX_PAGES_PER_JOB - 1, pdf_files=1)
+
+
+def test_pdf_count_defaults_to_zero_for_an_all_image_submission():
+    check_submission(1, MAX_PAGES_PER_JOB)
+
+
+def test_the_page_check_is_a_lower_bound_not_the_servers_verdict():
+    """One PDF counts as 1 page here even if it holds 500. This test exists to
+    make that limitation explicit rather than a surprise: passing locally does
+    not promise the server will accept it."""
+    check_submission(1, 0, pdf_files=1)  # a 500-page PDF looks fine from here
+
+
+def test_image_batches_count_pages_exactly_because_pdfs_never_join_them():
+    """plan_batches does NOT need the lower-bound treatment: a PDF always takes a
+    batch of its own, so a batch being filled holds only images, and an image is
+    always exactly 1 page."""
+    items = [img(f"p{i}") for i in range(MAX_PAGES_PER_JOB)] + [pdf("doc.pdf")]
+    batches = plan_batches(items)
+    assert [len(b) for b in batches] == [MAX_PAGES_PER_JOB, 1]
+    assert all(not item.is_pdf for item in batches[0])  # no PDF snuck into the image batch

@@ -29,6 +29,38 @@ DEFAULT_BASE_URL = "https://image2ppt.com"
 _RATE_LIMIT_FALLBACK_WAIT = 5.0
 
 
+def _ensure_writable_dir(dest_dir: str) -> None:
+    """Create ``dest_dir`` if needed and prove a file can actually be written in it.
+
+    Creating the directory is not enough on its own: when it already exists,
+    ``os.makedirs(..., exist_ok=True)`` succeeds no matter what the permissions
+    are, so a read-only destination sails through and only fails later — after the
+    jobs exist and the credits are spent.
+
+    The proof is an actual file, not ``os.access``. ``os.access`` answers from the
+    permission bits alone and gets it wrong in exactly the environments that need
+    the answer: it ignores read-only mounts and ACLs, and running as root it
+    reports writable for directories nothing can be written to. Creating a real
+    file is the same operation ``download`` will do a few seconds later, so it is
+    the same answer.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    probe = os.path.join(dest_dir, f".image2ppt-write-test-{os.getpid()}")
+    try:
+        with open(probe, "wb"):
+            pass
+    except OSError as exc:
+        raise OSError(
+            f"cannot write to dest_dir {dest_dir!r} ({exc.strerror or exc}); "
+            "nothing was submitted"
+        ) from exc
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass  # never created, or already gone: nothing to clean up
+
+
 def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
     """Record the jobs created so far on an exception escaping a batch call.
 
@@ -163,6 +195,10 @@ class Image2PPTClient:
         check_submission(
             total_bytes=sum(item.size for item in prepared),
             image_pages=sum(1 for item in prepared if item.is_image),
+            # A PDF's real page count is only known server-side; counting it as at
+            # least 1 is what stops "50 images + a PDF" from being sent as a
+            # submission that is certain to come back over the page limit.
+            pdf_files=sum(1 for item in prepared if not item.is_image),
         )
         resp = self._post_files(prepared, data)
         return Job.from_dict(self._parse_json(resp))
@@ -372,8 +408,9 @@ class Image2PPTClient:
 
         Args:
             paths: Local file paths.
-            dest_dir: Directory for the PPTX files; created **before anything is
-                submitted**, so an unusable destination costs nothing.
+            dest_dir: Directory for the PPTX files. Created **and proven writable
+                before anything is submitted**, so an unusable destination costs
+                nothing.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
             poll_interval: Initial poll interval in seconds.
@@ -395,7 +432,7 @@ class Image2PPTClient:
         # Before anything is submitted: if the destination is unusable, fail now
         # rather than after N jobs exist with credits reserved and nowhere to put
         # their output. This is the one step that can fail for free.
-        os.makedirs(dest_dir, exist_ok=True)
+        _ensure_writable_dir(dest_dir)
 
         jobs = self.submit_all(paths, locale=locale, aspect_ratio=aspect_ratio)
 

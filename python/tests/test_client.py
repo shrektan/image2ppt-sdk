@@ -739,3 +739,77 @@ def test_convert_all_checks_the_destination_before_submitting_anything(tmp_path)
         client.convert_all(paths, str(not_a_dir))
 
     assert len(session.calls) == 0
+
+
+# --------------------------------------------------------------------------- #
+# PDF pages, and a destination that only *looks* usable
+# --------------------------------------------------------------------------- #
+def test_submit_counts_a_pdf_as_a_page_so_50_images_plus_one_is_refused(tmp_path):
+    """50 images is exactly the limit; any PDF alongside makes it at least 51, so
+    the server would reject it every time. Refuse locally, send nothing."""
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB)
+    doc = tmp_path / "doc.pdf"
+    doc.write_bytes(b"%PDF-1.4 tiny")
+    paths.append(str(doc))
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(TooManySlidesError) as exc:
+        client.submit(paths)
+
+    assert "at least 51" in exc.value.message
+    assert len(session.calls) == 0
+
+
+def test_submit_still_accepts_49_images_plus_one_pdf(tmp_path):
+    """The guard must not over-reach: 49 + 1 is exactly 50 at the lower bound."""
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB - 1)
+    doc = tmp_path / "doc.pdf"
+    doc.write_bytes(b"%PDF-1.4 tiny")
+    paths.append(str(doc))
+    client, session = client_and_session(
+        lambda *a, **k: FakeResponse(201, {"jobId": "j", "status": "pending"})
+    )
+
+    client.submit(paths)
+
+    assert len(posted_filenames(session)) == 1
+
+
+def test_convert_all_refuses_a_dest_dir_that_exists_but_cannot_be_written(tmp_path):
+    """The bug this catches: os.makedirs(exist_ok=True) SUCCEEDS on a read-only
+    directory, so creating the directory early proved nothing — the submissions
+    still went out and only writing the first deck failed, after the credits were
+    spent. Only actually writing a file answers the question.
+    """
+    paths = make_images(tmp_path, 2)
+    read_only = tmp_path / "decks"
+    read_only.mkdir()
+    os.chmod(read_only, 0o555)
+    client, session = client_and_session(exploding_handler)
+    try:
+        assert os.path.isdir(read_only)  # it exists, so makedirs alone is happy
+
+        with pytest.raises(OSError) as exc:
+            client.convert_all(paths, str(read_only))
+
+        assert "cannot write" in str(exc.value)
+        assert len(session.calls) == 0  # nothing was submitted, nothing was charged
+    finally:
+        os.chmod(read_only, 0o755)  # let tmp_path cleanup remove it
+
+
+def test_convert_all_leaves_no_probe_file_behind(tmp_path):
+    """The writability probe must not litter the user's output directory."""
+    paths = make_images(tmp_path, 1)
+    out_dir = tmp_path / "decks"
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+        FakeResponse(200, {"jobId": "job_a", "status": "completed"}),
+        FakeResponse(200, content=b"DECK-A"),
+    ])
+
+    make_client(lambda *a, **k: next(responses)).convert_all(
+        paths, str(out_dir), poll_interval=0
+    )
+
+    assert sorted(p.name for p in out_dir.iterdir()) == ["part-01.pptx"]
