@@ -18,6 +18,13 @@ export interface ClientOptions {
   timeoutMs?: number;
   /** Inject a custom fetch (for testing). Defaults to the global `fetch` (Node 18+). */
   fetch?: typeof fetch;
+  /**
+   * How many times to retry a submission whose connection broke mid-upload
+   * (default 2). Safe: a broken upload cannot have created a job. See `submit`.
+   */
+  maxUploadRetries?: number;
+  /** Delay before the first upload retry in ms (default 1000); doubles each attempt. */
+  uploadRetryBackoffMs?: number;
 }
 
 export interface SubmitOptions {

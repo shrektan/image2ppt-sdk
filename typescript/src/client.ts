@@ -1,8 +1,8 @@
 /** The image2ppt API client. */
 
 import { createWriteStream } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
-import { basename, extname } from "node:path";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { basename, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -13,6 +13,8 @@ import {
   RateLimitedError,
   exceptionFor,
 } from "./errors.js";
+import { checkSubmission, planBatches } from "./limits.js";
+import type { UploadItem } from "./limits.js";
 import type {
   Account,
   ClientOptions,
@@ -33,11 +35,18 @@ const MIME_BY_EXT: Record<string, string> = {
   ".pdf": "application/pdf",
 };
 
+/** Formats that count as exactly one page each. Anything else (PDF) is unknown. */
+const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 function guessMime(name: string): string {
   return MIME_BY_EXT[extname(name).toLowerCase()] ?? "application/octet-stream";
+}
+
+function isImageMime(mime: string): boolean {
+  return IMAGE_MIMES.has(mime);
 }
 
 /**
@@ -51,6 +60,8 @@ function guessMime(name: string): string {
 export class Image2PPTClient {
   readonly baseUrl: string;
   readonly timeoutMs: number;
+  readonly maxUploadRetries: number;
+  readonly uploadRetryBackoffMs: number;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
 
@@ -60,6 +71,8 @@ export class Image2PPTClient {
     }
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = options.timeoutMs ?? 60_000;
+    this.maxUploadRetries = Math.max(0, options.maxUploadRetries ?? 2);
+    this.uploadRetryBackoffMs = Math.max(0, options.uploadRetryBackoffMs ?? 1_000);
     this.#apiKey = options.apiKey;
     const impl = options.fetch ?? globalThis.fetch;
     if (!impl) {
@@ -71,25 +84,83 @@ export class Image2PPTClient {
   /**
    * Submit a batch of files and create a conversion job.
    *
-   * @param paths Local file paths (one or more). png/jpeg/webp/gif/pdf, each ≤ 35MB.
-   *   An image is 1 page, a PDF is its page count; the total must be ≤ 50 pages.
+   * Checked locally before anything is uploaded: the files must add up to at most
+   * 45MB and at most 50 pages. Over either limit this throws without opening a
+   * connection — going over the size cap on the wire does not come back as a clean
+   * error, it comes back as a dead connection.
+   *
+   * If the connection breaks *while uploading*, the submission is retried (see
+   * `maxUploadRetries`).
+   *
+   * @param paths Local file paths (one or more). png/jpeg/webp/gif/pdf, each ≤ 35MB,
+   *   and ≤ 45MB of file content per request. An image is 1 page, a PDF is its page
+   *   count; the total must be ≤ 50 pages. For more files than one request can hold,
+   *   use `submitAll` / `convertAll`.
    * @returns A `Job` with status `pending`, plus `slideCount` and `creditsReserved`.
+   * @throws InvalidFileError Including the local `PAYLOAD_TOO_LARGE` pre-flight failure.
    */
   async submit(paths: string[], options: SubmitOptions = {}): Promise<Job> {
     if (!paths.length) {
       throw new Error("at least one file is required");
     }
-    const form = new FormData();
-    for (const path of paths) {
-      const buffer = await readFile(path);
-      const name = basename(path);
-      form.append("files", new Blob([buffer], { type: guessMime(name) }), name);
-    }
-    if (options.locale) form.append("locale", options.locale);
-    if (options.aspectRatio) form.append("aspectRatio", options.aspectRatio);
+    const files = await Promise.all(
+      paths.map(async (path) => {
+        const name = basename(path);
+        return { name, mime: guessMime(name), buffer: await readFile(path) };
+      }),
+    );
+    // Pre-flight, before a single byte goes out: an oversized request is not
+    // answered with an error, it is cut off — so it must never be sent.
+    checkSubmission(
+      files.reduce((total, file) => total + file.buffer.byteLength, 0),
+      files.filter((file) => isImageMime(file.mime)).length,
+    );
 
-    const res = await this.#request("POST", "/api/v1/jobs", { body: form });
+    // Rebuilt per attempt so a retry sends a fresh body.
+    const buildForm = (): FormData => {
+      const form = new FormData();
+      for (const file of files) {
+        form.append("files", new Blob([file.buffer], { type: file.mime }), file.name);
+      }
+      if (options.locale) form.append("locale", options.locale);
+      if (options.aspectRatio) form.append("aspectRatio", options.aspectRatio);
+      return form;
+    };
+
+    const res = await this.#postFiles(buildForm);
     return Job.fromJson(await this.#parseJson(res));
+  }
+
+  /**
+   * Split files into submittable batches and create **one job per batch**.
+   *
+   * For a pile of files too big or too numerous for a single request. Batching
+   * rules live in `planBatches`: at most 40MB of file content and at most 50
+   * images per batch, and every PDF in a batch of its own (the SDK does not parse
+   * PDFs, so only the server knows their page count). Input order is preserved.
+   *
+   * **Each returned job produces its own PPTX.** There is no server-side merge —
+   * N batches means N decks. If you need exactly one deck, keep the submission
+   * inside one request's limits and use `convert`.
+   *
+   * Batches are submitted back to back. A very large pile can trip the account's
+   * submission rate limit; that surfaces as `RateLimitedError` with `retryAfter`,
+   * and any jobs already created stay created.
+   *
+   * @returns One pending `Job` per batch, in batch order.
+   * @throws InvalidFileError A single file is over the per-request limit on its
+   *   own, so no batching can carry it.
+   */
+  async submitAll(paths: string[], options: SubmitOptions = {}): Promise<Job[]> {
+    if (!paths.length) {
+      throw new Error("at least one file is required");
+    }
+    const batches = planBatches(await this.#uploadItems(paths));
+    const jobs: Job[] = [];
+    for (const batch of batches) {
+      jobs.push(await this.submit(batch.map((item) => item.path), options));
+    }
+    return jobs;
   }
 
   /** Fetch the current job state as a `Job` snapshot. Throws JobNotFoundError. */
@@ -172,7 +243,13 @@ export class Image2PPTClient {
     return destPath;
   }
 
-  /** One-shot: submit → wait for completion → download to `destPath`. */
+  /**
+   * One-shot: submit → wait for completion → download to `destPath`.
+   *
+   * One job, one PPTX — the files must fit in a single submission (45MB, 50
+   * pages). For more than that, `convertAll` splits the pile and writes one PPTX
+   * per batch.
+   */
   async convert(
     paths: string[],
     destPath: string,
@@ -184,6 +261,43 @@ export class Image2PPTClient {
     return completed;
   }
 
+  /**
+   * Batch version of `convert`: submit everything, wait, download each deck.
+   *
+   * Files are split with `submitAll`, every batch is submitted first (so the
+   * server works on them in parallel), then each job is waited on and downloaded
+   * in order.
+   *
+   * **This writes one PPTX per batch, not one merged deck.** Output files are
+   * named `part-01.pptx`, `part-02.pptx`, ... inside `destDir` — stable for the
+   * same input, and never overwriting each other. Existing files with those names
+   * are overwritten. `convert` is unchanged: one job, one PPTX.
+   *
+   * `timeoutMs` is the wait cap **per job**, not for the whole pile. If a job
+   * fails or runs past it, earlier batches that already downloaded stay on disk
+   * and later ones are not waited on.
+   *
+   * @param destDir Directory for the PPTX files; created if missing.
+   * @returns The written file paths, in batch order.
+   */
+  async convertAll(
+    paths: string[],
+    destDir: string,
+    options: ConvertOptions = {},
+  ): Promise<string[]> {
+    const jobs = await this.submitAll(paths, options);
+    await mkdir(destDir, { recursive: true });
+
+    const written: string[] = [];
+    for (const [index, job] of jobs.entries()) {
+      const completed = await this.wait(job.jobId, options);
+      const destPath = join(destDir, `part-${String(index + 1).padStart(2, "0")}.pptx`);
+      await this.download(completed.jobId, destPath);
+      written.push(destPath);
+    }
+    return written;
+  }
+
   /** Return account info: `{ email, credits }` (available credits). */
   async account(): Promise<Account> {
     const res = await this.#request("GET", "/api/v1/account");
@@ -191,6 +305,47 @@ export class Image2PPTClient {
   }
 
   // ----- internals --------------------------------------------------- //
+  /** Measure files for batch planning, using the size they will occupy on the wire. */
+  async #uploadItems(paths: string[]): Promise<UploadItem[]> {
+    return Promise.all(
+      paths.map(async (path) => ({
+        path,
+        size: (await stat(path)).size,
+        isPdf: !isImageMime(guessMime(basename(path))),
+      })),
+    );
+  }
+
+  /**
+   * POST the multipart submission, retrying a connection that broke mid-upload.
+   *
+   * Only a raw network failure is retried — never anything the client already
+   * turned into an `Image2PPTError`. The difference matters because a retry can
+   * cost money:
+   *
+   * - A fetch network error (`TypeError: fetch failed`) means the request body
+   *   never arrived in full. The server cannot have parsed it, so it cannot have
+   *   created a job or reserved credits. Retrying is free.
+   * - An `AbortSignal.timeout` abort (surfaced as `Image2PPTError` with code
+   *   `REQUEST_TIMEOUT`) cannot tell us whether the body finished going out. The
+   *   job may well exist, with credits already reserved, and retrying would submit
+   *   the same files a second time and charge twice. So it is thrown as-is —
+   *   check `account()` or your job list before resending.
+   * - HTTP-level errors are answers, not lost connections; they are never retried.
+   */
+  async #postFiles(buildForm: () => FormData): Promise<Response> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.#request("POST", "/api/v1/jobs", { body: buildForm() });
+      } catch (err) {
+        if (err instanceof Image2PPTError || attempt >= this.maxUploadRetries) {
+          throw err;
+        }
+        await sleep(this.uploadRetryBackoffMs * 2 ** attempt);
+      }
+    }
+  }
+
   async #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {
     try {
       return await this.#fetch(`${this.baseUrl}${path}`, {

@@ -31,7 +31,14 @@ export class Image2PPTError extends Error {
 /** API key is missing, invalid, or the account is gone (401 / 403). */
 export class AuthenticationError extends Image2PPTError {}
 
-/** A file was rejected: unsupported format or over the 35MB per-file limit (400). */
+/**
+ * A file was rejected (400), or the request carried too much file content.
+ *
+ * Raised for an unsupported format, a single file over the 35MB per-file limit, or
+ * a request whose files add up to more than the 45MB per-request limit
+ * (413 `PAYLOAD_TOO_LARGE`). The client raises the `PAYLOAD_TOO_LARGE` case
+ * locally, before uploading anything.
+ */
 export class InvalidFileError extends Image2PPTError {}
 
 /** The submission exceeds the 50-page-per-job limit (400 TOO_MANY_SLIDES). */
@@ -96,6 +103,7 @@ const CODE_TO_CLASS: Record<string, new (m: string, i?: ErrorInit) => Image2PPTE
   ACCOUNT_DELETED: AuthenticationError,
   INVALID_FILE: InvalidFileError,
   INVALID_PDF: InvalidFileError,
+  PAYLOAD_TOO_LARGE: InvalidFileError,
   TOO_MANY_SLIDES: TooManySlidesError,
   INSUFFICIENT_CREDITS: InsufficientCreditsError,
   RATE_LIMITED: RateLimitedError,
@@ -110,6 +118,7 @@ const STATUS_TO_CLASS: Record<number, new (m: string, i?: ErrorInit) => Image2PP
   404: JobNotFoundError,
   409: NotReadyError,
   410: OutputExpiredError,
+  413: InvalidFileError,
   429: RateLimitedError,
 };
 
