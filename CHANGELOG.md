@@ -21,14 +21,23 @@ on the wire, and can split a large pile of files into batches on their own.
   batch. **These produce one PPTX per batch, not one merged deck**; `convert()` is
   unchanged (one job, one PPTX). `convert_all()` / `convertAll()` write
   `part-01.pptx`, `part-02.pptx`, ... into a destination directory.
-- **Both clients** — the limits and the batch planner are public:
+- **Both clients** — the per-file 35MB limit is now enforced locally too, by both
+  `submit()` and batch planning. It is *stricter* than the per-request limit, so a
+  40MB PDF used to pass the size check and get planned into a batch that the
+  server would reject with `INVALID_FILE` every single time. The error names the
+  file and its size.
+- **Both clients** — the limits and the batch planner are public: `MAX_FILE_BYTES`,
   `MAX_UPLOAD_BYTES`, `BATCH_TARGET_BYTES`, `MAX_PAGES_PER_JOB`, `UploadItem`,
-  `check_submission()` / `checkSubmission()`, `plan_batches()` / `planBatches()`.
-- **Both clients** — a submission whose connection breaks mid-upload is retried
-  (twice by default, configurable via `max_upload_retries` / `maxUploadRetries`).
-  This is safe because a request body that never arrived cannot have created a job
-  or reserved credits. A read timeout is deliberately **not** retried — the job may
-  already exist, and a retry would charge twice.
+  `check_file_size()` / `checkFileSize()`, `check_submission()` /
+  `checkSubmission()`, `plan_batches()` / `planBatches()`.
+- **Both clients** — **submissions are never retried automatically**, and the
+  docs now say so. A connection error proves only that the exchange broke, not
+  that the request body was incomplete: the server may have received all of it,
+  created the job and reserved credits, and lost the connection while answering.
+  Retrying that charges twice, and telling the two apart needs an idempotency key
+  the API does not offer. Transport errors are raised as-is — check `account()` or
+  your job list before resending. (Rate limiting is different and *is* retried: a
+  429 is the server explicitly saying it did not take the submission.)
 - **Both clients** — the batch calls **wait out rate limits instead of failing**.
   A pile big enough to need batching is a pile big enough to hit the per-minute
   page quota, so a 429 mid-pile is normal; each one is retried after its
@@ -41,6 +50,10 @@ on the wire, and can split a large pile of files into batches on their own.
 - **Both clients** — `PAYLOAD_TOO_LARGE` and HTTP 413 map to `InvalidFileError`.
 
 ### Fixed
+- **Both clients** — `convert_all()` / `convertAll()` create the destination
+  directory **before** submitting anything. Creating it afterwards meant an
+  unusable destination (a plain file of that name, an unwritable parent) failed
+  only once every job existed with credits reserved and nowhere to put the output.
 - **Python** — `__version__` said `0.1.0` while the package was `0.1.1`. Both now
   come from the same release number, with a test guarding against the drift.
 
