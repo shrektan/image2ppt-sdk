@@ -6,7 +6,7 @@
  * pollIntervalMs=0 / Retry-After: 0 to run instantly.
  */
 
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,12 +15,17 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AuthenticationError,
   Image2PPTClient,
+  Image2PPTError,
   Image2PPTTimeoutError,
   InsufficientCreditsError,
+  InvalidFileError,
   Job,
   JobNotFoundError,
+  MAX_PAGES_PER_JOB,
+  MAX_UPLOAD_BYTES,
   NotReadyError,
   RateLimitedError,
+  TooManySlidesError,
 } from "../src/index.js";
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
@@ -30,14 +35,35 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
   });
 }
 
+/** A fake fetch that also records every call, so tests can assert on what was sent. */
+type RecordingFetch = typeof fetch & {
+  calls: Array<{ url: string; init: RequestInit }>;
+};
+
+/** A fake fetch driven by a per-call script; the handler may throw to simulate
+ * a network failure. `n` is the 1-based call number. */
+function fetchScript(handler: (n: number) => Response | Promise<Response>): RecordingFetch {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const impl = (async (url: unknown, init: RequestInit = {}) => {
+    calls.push({ url: String(url), init });
+    return handler(calls.length);
+  }) as unknown as RecordingFetch;
+  impl.calls = calls;
+  return impl;
+}
+
 /** A fake fetch that returns the given responses in sequence. */
-function fetchSequence(...responses: Response[]): typeof fetch {
-  let i = 0;
-  return (async () => {
-    const res = responses[Math.min(i, responses.length - 1)];
-    i += 1;
-    return res;
-  }) as unknown as typeof fetch;
+function fetchSequence(...responses: Response[]): RecordingFetch {
+  return fetchScript((n) => responses[Math.min(n - 1, responses.length - 1)]);
+}
+
+/** Filenames carried by each POST, in order: [[batch1...], [batch2...]]. */
+function postedFilenames(fetchImpl: RecordingFetch): string[][] {
+  return fetchImpl.calls
+    .filter((call) => call.init.method === "POST")
+    .map((call) =>
+      (call.init.body as FormData).getAll("files").map((part) => (part as File).name),
+    );
 }
 
 function client(fetchImpl: typeof fetch): Image2PPTClient {
@@ -253,5 +279,194 @@ describe("Job", () => {
     expect(job.isCompleted).toBe(true);
     expect(job.isTerminal).toBe(true);
     expect(job.creditsUsed).toBe(5);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// upload size guard — the regression this whole feature exists for
+//
+// A submission over the per-request size cap does not come back as an error: the
+// network layer in front of the API drops the connection mid-upload, and the
+// caller sees a bare write timeout. So the only acceptable behavior is to refuse
+// locally, having sent nothing. Every test here asserts on the recorded calls.
+// --------------------------------------------------------------------------- //
+
+/** A file of exactly `size` bytes, allocated sparsely (instant, no real I/O). */
+async function sparseFile(name: string, size: number): Promise<string> {
+  const path = join(dir, name);
+  await writeFile(path, "");
+  await truncate(path, size);
+  return path;
+}
+
+async function manyImages(count: number): Promise<string[]> {
+  const paths: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    paths.push(await tempFile(`p${String(i).padStart(3, "0")}.png`));
+  }
+  return paths;
+}
+
+describe("upload size guard", () => {
+  it("refuses an oversized batch without sending anything", async () => {
+    // Two individually-legal files that add up past the request cap.
+    const half = Math.floor(MAX_UPLOAD_BYTES / 2);
+    const files = [
+      await sparseFile("a.png", half),
+      await sparseFile("b.png", half + 1),
+    ];
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submit(files)).rejects.toBeInstanceOf(InvalidFileError);
+    await expect(client(f).submit(files)).rejects.toMatchObject({
+      code: "PAYLOAD_TOO_LARGE",
+    });
+    expect(f.calls).toHaveLength(0); // nothing went on the wire
+  });
+
+  it("refuses too many pages without sending anything", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submit(files)).rejects.toBeInstanceOf(TooManySlidesError);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("still sends exactly one request for a submission within the limits", async () => {
+    const file = await tempFile();
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    expect(postedFilenames(f)).toEqual([["a.png"]]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// submitAll / convertAll — automatic batching
+// --------------------------------------------------------------------------- //
+describe("submitAll", () => {
+  it("splits past the page limit into two jobs", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const ids = ["job_a", "job_b"];
+    const f = fetchScript((n) => json(201, { jobId: ids[n - 1], status: "pending" }));
+
+    const jobs = await client(f).submitAll(files);
+
+    expect(jobs.map((job) => job.jobId)).toEqual(ids);
+    const sent = postedFilenames(f);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toHaveLength(MAX_PAGES_PER_JOB);
+    expect(sent[1]).toEqual([`p${String(MAX_PAGES_PER_JOB).padStart(3, "0")}.png`]);
+  });
+
+  it("gives a PDF its own job", async () => {
+    const img = await tempFile("a.png");
+    const doc = await tempFile("doc.pdf");
+    const f = fetchScript(() => json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submitAll([img, doc]);
+
+    expect(postedFilenames(f)).toEqual([["a.png"], ["doc.pdf"]]);
+  });
+
+  it("behaves like submit for a single batch", async () => {
+    const files = await manyImages(3);
+    const f = fetchScript(() => json(201, { jobId: "j", status: "pending" }));
+
+    const jobs = await client(f).submitAll(files);
+
+    expect(jobs).toHaveLength(1);
+    expect(postedFilenames(f)).toHaveLength(1);
+  });
+});
+
+describe("convertAll", () => {
+  it("writes one numbered PPTX per batch", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const outDir = join(dir, "decks");
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(201, { jobId: "job_b", status: "pending" }),
+      json(200, { jobId: "job_a", status: "completed" }),
+      new Response(Buffer.from("DECK-A"), { status: 200 }),
+      json(200, { jobId: "job_b", status: "completed" }),
+      new Response(Buffer.from("DECK-B"), { status: 200 }),
+    );
+
+    const written = await client(f).convertAll(files, outDir, { pollIntervalMs: 0 });
+
+    expect(written).toEqual([join(outDir, "part-01.pptx"), join(outDir, "part-02.pptx")]);
+    expect((await readFile(written[0])).toString()).toBe("DECK-A");
+    expect((await readFile(written[1])).toString()).toBe("DECK-B");
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// upload retry — safe only for a connection that died mid-upload
+// --------------------------------------------------------------------------- //
+describe("upload retry", () => {
+  function retryClient(fetchImpl: typeof fetch, maxUploadRetries = 2): Image2PPTClient {
+    return new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: fetchImpl,
+      maxUploadRetries,
+      uploadRetryBackoffMs: 0, // no real sleeping in tests
+    });
+  }
+
+  it("retries a connection dropped mid-upload", async () => {
+    // The body never arrived, so no job was created and nothing was charged.
+    const file = await tempFile();
+    const f = fetchScript((n) => {
+      if (n === 1) throw new TypeError("fetch failed");
+      return json(201, { jobId: "job_retry", status: "pending" });
+    });
+
+    const job = await retryClient(f).submit([file]);
+
+    expect(job.jobId).toBe("job_retry");
+    expect(postedFilenames(f)).toHaveLength(2);
+  });
+
+  it("never retries a request the client timed out", async () => {
+    // The body may well have been sent, so the job may exist with credits
+    // reserved. Retrying would submit the same files twice and charge twice.
+    const file = await tempFile();
+    const f = fetchScript(() => {
+      throw new DOMException("The operation was aborted", "TimeoutError");
+    });
+
+    await expect(retryClient(f).submit([file])).rejects.toMatchObject({
+      code: "REQUEST_TIMEOUT",
+    });
+    await expect(retryClient(fetchScript(() => {
+      throw new DOMException("The operation was aborted", "TimeoutError");
+    })).submit([file])).rejects.toBeInstanceOf(Image2PPTError);
+    expect(f.calls).toHaveLength(1); // exactly one attempt
+  });
+
+  it("never retries an HTTP error answer", async () => {
+    const file = await tempFile();
+    const f = fetchSequence(json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no" } }));
+
+    await expect(retryClient(f).submit([file])).rejects.toBeInstanceOf(
+      InsufficientCreditsError,
+    );
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("gives up after maxUploadRetries", async () => {
+    const file = await tempFile();
+    const f = fetchScript(() => {
+      throw new TypeError("fetch failed");
+    });
+
+    await expect(retryClient(f, 1).submit([file])).rejects.toBeInstanceOf(TypeError);
+    expect(f.calls).toHaveLength(2); // first attempt + 1 retry
   });
 });
