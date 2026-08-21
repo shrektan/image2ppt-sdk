@@ -26,6 +26,10 @@ on the wire, and can split a large pile of files into batches on their own.
   40MB PDF used to pass the size check and get planned into a batch that the
   server would reject with `INVALID_FILE` every single time. The error names the
   file and its size.
+- **Both clients** — the page pre-check counts each PDF as **at least 1 page**.
+  It used to ignore PDFs entirely, so "50 images plus any PDF" passed locally and
+  was certain to be rejected server-side. The check is a lower bound, not the
+  server's verdict — the SDKs do not parse PDFs — and the docs now say so.
 - **Both clients** — the limits and the batch planner are public: `MAX_FILE_BYTES`,
   `MAX_UPLOAD_BYTES`, `BATCH_TARGET_BYTES`, `MAX_PAGES_PER_JOB`, `UploadItem`,
   `check_file_size()` / `checkFileSize()`, `check_submission()` /
@@ -51,9 +55,11 @@ on the wire, and can split a large pile of files into batches on their own.
 
 ### Fixed
 - **Both clients** — `convert_all()` / `convertAll()` create the destination
-  directory **before** submitting anything. Creating it afterwards meant an
-  unusable destination (a plain file of that name, an unwritable parent) failed
-  only once every job existed with credits reserved and nowhere to put the output.
+  directory **and prove it writable** before submitting anything, by writing and
+  removing a probe file. Doing this afterwards — or only creating the directory,
+  which silently succeeds on an existing read-only one — meant an unusable
+  destination failed only once every job existed with credits reserved and nowhere
+  to put the output.
 - **Python** — `__version__` said `0.1.0` while the package was `0.1.1`. Both now
   come from the same release number, with a test guarding against the drift.
 
