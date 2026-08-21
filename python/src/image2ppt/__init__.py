@@ -13,6 +13,14 @@ See https://github.com/shrektan/image2ppt-sdk for docs and examples.
 
 from __future__ import annotations
 
+from ._limits import (
+    BATCH_TARGET_BYTES,
+    MAX_PAGES_PER_JOB,
+    MAX_UPLOAD_BYTES,
+    UploadItem,
+    check_submission,
+    plan_batches,
+)
 from .client import DEFAULT_BASE_URL, Image2PPTClient
 from .errors import (
     AuthenticationError,
@@ -35,6 +43,12 @@ __all__ = [
     "Image2PPTClient",
     "Job",
     "DEFAULT_BASE_URL",
+    "MAX_UPLOAD_BYTES",
+    "BATCH_TARGET_BYTES",
+    "MAX_PAGES_PER_JOB",
+    "UploadItem",
+    "check_submission",
+    "plan_batches",
     "Image2PPTError",
     "AuthenticationError",
     "InvalidFileError",
