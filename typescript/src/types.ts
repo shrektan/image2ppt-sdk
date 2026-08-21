@@ -25,6 +25,12 @@ export interface ClientOptions {
   maxUploadRetries?: number;
   /** Delay before the first upload retry in ms (default 1000); doubles each attempt. */
   uploadRetryBackoffMs?: number;
+  /**
+   * Total ms `submitAll` / `convertAll` may spend waiting out rate limits across
+   * the whole call (default 1_800_000 = 30 min). Submitting a large pile *will*
+   * hit the per-minute page quota, so waiting is the normal path, not an error.
+   */
+  rateLimitMaxWaitMs?: number;
 }
 
 export interface SubmitOptions {

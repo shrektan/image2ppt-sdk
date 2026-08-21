@@ -17,6 +17,14 @@ export interface ErrorInit {
 export class Image2PPTError extends Error {
   readonly statusCode?: number;
   readonly code?: string;
+  /**
+   * Jobs already created when this error was thrown out of `submitAll` /
+   * `convertAll`. They are **running on the server with credits already
+   * reserved** — not lost, not refunded by the failure. Wait on them
+   * (`wait`/`download`) or come back to them later. Empty for any error not
+   * thrown out of a batch call.
+   */
+  submittedJobs: Job[] = [];
 
   constructor(message: string, init: ErrorInit = {}) {
     super(message);
@@ -59,6 +67,11 @@ export class OutputExpiredError extends Image2PPTError {}
 /**
  * Rate limited (429 RATE_LIMITED). `retryAfter` is the server-suggested wait in
  * seconds (from the `Retry-After` header); retry after that long.
+ *
+ * Both kinds of 429 land here — the per-minute page quota and the cap on
+ * concurrently active jobs — and both are handled the same way: wait, then try the
+ * same submission again. `submitAll` / `convertAll` do that for you; if one of
+ * them gives up, `submittedJobs` holds the jobs already created.
  */
 export class RateLimitedError extends Image2PPTError {
   readonly retryAfter?: number;

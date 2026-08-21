@@ -26,6 +26,9 @@ import { Job } from "./types.js";
 
 export const DEFAULT_BASE_URL = "https://image2ppt.com";
 
+/** Wait between rate-limited retries when the server sends no `Retry-After`. */
+const RATE_LIMIT_FALLBACK_WAIT_MS = 5_000;
+
 const MIME_BY_EXT: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -50,6 +53,19 @@ function isImageMime(mime: string): boolean {
 }
 
 /**
+ * Record the jobs created so far on an error escaping a batch call.
+ *
+ * Every `Image2PPTError` declares `submittedJobs`; this also reaches the rarer
+ * non-SDK escape (an exhausted network error), so the caller never has to know
+ * which kind they caught to find out what they already paid for.
+ */
+function attachSubmittedJobs(err: unknown, jobs: Job[]): void {
+  if (typeof err === "object" && err !== null) {
+    (err as { submittedJobs?: Job[] }).submittedJobs = [...jobs];
+  }
+}
+
+/**
  * Client for the image2ppt API. Server-side only — keep your key off the browser.
  *
  * ```ts
@@ -62,6 +78,7 @@ export class Image2PPTClient {
   readonly timeoutMs: number;
   readonly maxUploadRetries: number;
   readonly uploadRetryBackoffMs: number;
+  readonly rateLimitMaxWaitMs: number;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
 
@@ -73,6 +90,7 @@ export class Image2PPTClient {
     this.timeoutMs = options.timeoutMs ?? 60_000;
     this.maxUploadRetries = Math.max(0, options.maxUploadRetries ?? 2);
     this.uploadRetryBackoffMs = Math.max(0, options.uploadRetryBackoffMs ?? 1_000);
+    this.rateLimitMaxWaitMs = Math.max(0, options.rateLimitMaxWaitMs ?? 1_800_000);
     this.#apiKey = options.apiKey;
     const impl = options.fetch ?? globalThis.fetch;
     if (!impl) {
@@ -143,22 +161,42 @@ export class Image2PPTClient {
    * N batches means N decks. If you need exactly one deck, keep the submission
    * inside one request's limits and use `convert`.
    *
-   * Batches are submitted back to back. A very large pile can trip the account's
-   * submission rate limit; that surfaces as `RateLimitedError` with `retryAfter`,
-   * and any jobs already created stay created.
+   * **Rate limits are waited out, not thrown.** A pile big enough to need
+   * batching is a pile big enough to hit the account's per-minute page quota (and
+   * its cap on concurrently active jobs). Both arrive as a 429 with a
+   * `Retry-After`, and both are handled the same way: sleep that long, then try
+   * the same batch again. Waiting is the normal path here. Total waiting is capped
+   * by the client's `rateLimitMaxWaitMs`.
+   *
+   * **If it does give up, the jobs already created are handed back on the error**,
+   * in `err.submittedJobs`. Those jobs are running on the server with credits
+   * already reserved — they are not lost and not refunded. Wait on them or fetch
+   * them later; do not resubmit those files.
    *
    * @returns One pending `Job` per batch, in batch order.
    * @throws InvalidFileError A single file is over the per-request limit on its
    *   own, so no batching can carry it.
+   * @throws RateLimitedError Still rate limited after `rateLimitMaxWaitMs`.
    */
   async submitAll(paths: string[], options: SubmitOptions = {}): Promise<Job[]> {
     if (!paths.length) {
       throw new Error("at least one file is required");
     }
     const batches = planBatches(await this.#uploadItems(paths));
+    const deadline = performance.now() + this.rateLimitMaxWaitMs;
     const jobs: Job[] = [];
     for (const batch of batches) {
-      jobs.push(await this.submit(batch.map((item) => item.path), options));
+      try {
+        jobs.push(
+          await this.#submitBatch(batch.map((item) => item.path), options, deadline),
+        );
+      } catch (err) {
+        // Whatever went wrong, the earlier batches are already jobs on the server
+        // with credits reserved. Losing the ids would mean the caller paid for
+        // work they can never collect.
+        attachSubmittedJobs(err, jobs);
+        throw err;
+      }
     }
     return jobs;
   }
@@ -275,7 +313,11 @@ export class Image2PPTClient {
    *
    * `timeoutMs` is the wait cap **per job**, not for the whole pile. If a job
    * fails or runs past it, earlier batches that already downloaded stay on disk
-   * and later ones are not waited on.
+   * and later ones are not waited on. Every job created so far is on the thrown
+   * error as `err.submittedJobs` — those are still running with credits reserved,
+   * so wait on them rather than resubmitting.
+   *
+   * Rate limits during submission are waited out — see `submitAll`.
    *
    * @param destDir Directory for the PPTX files; created if missing.
    * @returns The written file paths, in batch order.
@@ -289,11 +331,18 @@ export class Image2PPTClient {
     await mkdir(destDir, { recursive: true });
 
     const written: string[] = [];
-    for (const [index, job] of jobs.entries()) {
-      const completed = await this.wait(job.jobId, options);
-      const destPath = join(destDir, `part-${String(index + 1).padStart(2, "0")}.pptx`);
-      await this.download(completed.jobId, destPath);
-      written.push(destPath);
+    try {
+      for (const [index, job] of jobs.entries()) {
+        const completed = await this.wait(job.jobId, options);
+        const destPath = join(destDir, `part-${String(index + 1).padStart(2, "0")}.pptx`);
+        await this.download(completed.jobId, destPath);
+        written.push(destPath);
+      }
+    } catch (err) {
+      // Same contract as submitAll: the jobs are already paid for, so the caller
+      // gets their ids back instead of having to guess.
+      attachSubmittedJobs(err, jobs);
+      throw err;
     }
     return written;
   }
@@ -305,6 +354,36 @@ export class Image2PPTClient {
   }
 
   // ----- internals --------------------------------------------------- //
+  /**
+   * Submit one batch, waiting out rate limits until `deadline`.
+   *
+   * Retrying a 429 is not the same gamble as retrying a broken upload: a 429 is
+   * the server saying it did *not* take the submission. Nothing was created and
+   * nothing was charged, so trying the same batch again is free.
+   *
+   * Both flavors of 429 (per-minute page quota, concurrent-job cap) carry a
+   * `Retry-After` and are handled identically. When the header is missing we fall
+   * back to a fixed wait.
+   */
+  async #submitBatch(
+    paths: string[],
+    options: SubmitOptions,
+    deadline: number,
+  ): Promise<Job> {
+    for (;;) {
+      try {
+        return await this.submit(paths, options);
+      } catch (err) {
+        if (!(err instanceof RateLimitedError)) throw err;
+        const delay =
+          err.retryAfter != null ? err.retryAfter * 1000 : RATE_LIMIT_FALLBACK_WAIT_MS;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0 || delay > remaining) throw err;
+        await sleep(delay);
+      }
+    }
+  }
+
   /** Measure files for batch planning, using the size they will occupy on the wire. */
   async #uploadItems(paths: string[]): Promise<UploadItem[]> {
     return Promise.all(

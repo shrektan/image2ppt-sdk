@@ -10,7 +10,7 @@ import { mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   AuthenticationError,
@@ -25,6 +25,7 @@ import {
   MAX_UPLOAD_BYTES,
   NotReadyError,
   RateLimitedError,
+  type Job as JobType,
   TooManySlidesError,
 } from "../src/index.js";
 
@@ -468,5 +469,127 @@ describe("upload retry", () => {
 
     await expect(retryClient(f, 1).submit([file])).rejects.toBeInstanceOf(TypeError);
     expect(f.calls).toHaveLength(2); // first attempt + 1 retry
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// submitAll rate limiting
+//
+// A pile big enough to need batching is a pile big enough to hit the per-minute
+// page quota, so a 429 mid-pile is the normal case, not an exception. If it were
+// thrown, batching would only trade one failure for another. Retry-After is 0 in
+// these tests so nothing actually sleeps.
+// --------------------------------------------------------------------------- //
+function rateLimited(retryAfter?: string): Response {
+  return json(
+    429,
+    { error: { code: "RATE_LIMITED", message: "slow down" } },
+    retryAfter === undefined ? {} : { "Retry-After": retryAfter },
+  );
+}
+
+/** Job ids off an error's `submittedJobs`, whatever error type it is. */
+function submittedIds(err: unknown): string[] {
+  return ((err as { submittedJobs?: JobType[] }).submittedJobs ?? []).map((j) => j.jobId);
+}
+
+describe("submitAll rate limiting", () => {
+  it("waits out a rate limit and retries the same batch", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      rateLimited("0"), // second batch bounces off the per-minute quota
+      json(201, { jobId: "job_b", status: "pending" }),
+    );
+
+    const jobs = await client(f).submitAll(files);
+
+    expect(jobs.map((job) => job.jobId)).toEqual(["job_a", "job_b"]);
+    const sent = postedFilenames(f);
+    expect(sent).toHaveLength(3); // batch 1, the rejected batch 2, then batch 2 again
+    expect(sent[1]).toEqual(sent[2]); // the retry carried exactly the same files
+  });
+
+  it("hands back created jobs when it gives up", async () => {
+    // Giving up must not strand the jobs already created — they are running and
+    // their credits are already reserved.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchSequence(json(201, { jobId: "job_a", status: "pending" }), rateLimited("0"));
+    // No waiting budget at all: the first 429 ends it.
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 0,
+    });
+
+    const err = await c.submitAll(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect(submittedIds(err)).toEqual(["job_a"]);
+    expect(postedFilenames(f)).toHaveLength(2); // no pointless extra attempt
+  });
+
+  it("uses a default wait when the server sends no Retry-After", async () => {
+    // The delay is captured off setTimeout rather than actually slept through, so
+    // the test pins the documented 5s fallback without taking 5s.
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited(), json(201, { jobId: "job_a", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((fn: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(fn, 0);
+      }) as unknown as typeof setTimeout);
+
+    try {
+      const jobs = await client(f).submitAll(files);
+      expect(jobs.map((job) => job.jobId)).toEqual(["job_a"]);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(delays).toEqual([5_000]); // the documented fallback, not zero
+  });
+
+  it("keeps submittedJobs on a non-rate-limit failure too", async () => {
+    // Any failure mid-pile strands paid-for jobs, not just a rate limit.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no" } }),
+    );
+
+    const err = await client(f).submitAll(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(InsufficientCreditsError);
+    expect(submittedIds(err)).toEqual(["job_a"]);
+  });
+
+  it("convertAll hands back jobs when a later one fails", async () => {
+    // The first deck is on disk, the second job failed — but jobs 1..N are all
+    // still identified on the error.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const outDir = join(dir, "decks");
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(201, { jobId: "job_b", status: "pending" }),
+      json(200, { jobId: "job_a", status: "completed" }),
+      new Response(Buffer.from("DECK-A"), { status: 200 }),
+      json(200, {
+        jobId: "job_b",
+        status: "failed",
+        error: { code: "CONVERSION_FAILED", message: "boom" },
+      }),
+    );
+
+    const err = await client(f)
+      .convertAll(files, outDir, { pollIntervalMs: 0 })
+      .catch((e: unknown) => e);
+
+    expect((err as Error).name).toBe("JobFailedError");
+    expect(submittedIds(err)).toEqual(["job_a", "job_b"]);
+    expect((await readFile(join(outDir, "part-01.pptx"))).toString()).toBe("DECK-A");
   });
 });
