@@ -57,10 +57,22 @@ console.log(email, "credits:", credits);
 - **Async.** `submit` resolves with a job id immediately; conversion runs in the background. A single page typically takes ~2 minutes; 90% of jobs finish within 3.
 - **One job = one PPTX.** All files in a submission are merged into a single deck, in upload order.
 - **Billed per page.** 1 page = 1 credit, reserved at submit and settled on completion. If some pages fail but others succeed, the job still completes with the good pages and the failed pages' credits are refunded (`creditsRefunded`).
-- **Limits.** Each file ≤ 35MB; total ≤ 50 pages per job (images count as 1, PDFs as their page count).
+- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count).
+- **Going over the request limit is not a polite error.** Past 45MB the connection is cut before the API can answer, so the caller sees a write timeout or a broken pipe instead of a status code. The client therefore checks locally *before* uploading and throws `InvalidFileError` (`code: "PAYLOAD_TOO_LARGE"`) without sending a byte. If the connection does break mid-upload, `submit()` retries — safe, because a request body that never arrived cannot have created a job or reserved credits. A request the client timed out is never retried: the job may already exist, and a retry would charge twice.
 - **Time units.** `pollIntervalMs` and `timeoutMs` are in **milliseconds** (idiomatic for Node's timers).
 
 > The Node SDK uploads files as-is; the server compresses them. (The Python SDK additionally pre-compresses images client-side to save bandwidth — a future addition here.)
+
+## More files than one request can hold
+
+`convert()` is one job, one PPTX. For a pile too big for a single request, `convertAll()` splits it and writes **one PPTX per batch** (no server-side merge — N batches means N decks):
+
+```ts
+const files = await client.convertAll(imagePaths, "decks/");
+console.log(files); // ['decks/part-01.pptx', 'decks/part-02.pptx']
+```
+
+Batches hold at most 40MB of file content and at most 50 images; every PDF goes in a batch of its own, because the client does not parse PDFs and only the server knows their page count. `submitAll()` does the same splitting and hands back the jobs if you want to drive polling yourself. To see the plan without uploading anything, use `planBatches()`.
 
 ## Rate limits
 
@@ -88,7 +100,7 @@ Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `m
 | Class | HTTP | code |
 |---|---|---|
 | `AuthenticationError` | 401 / 403 | `INVALID_API_KEY`, `API_KEY_REQUIRED`, `ACCOUNT_DELETED` |
-| `InvalidFileError` | 400 | `INVALID_FILE` |
+| `InvalidFileError` | 400 / 413 | `INVALID_FILE`, `PAYLOAD_TOO_LARGE` (the size check also fires locally, before upload) |
 | `TooManySlidesError` | 400 | `TOO_MANY_SLIDES` |
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retryAfter`) |

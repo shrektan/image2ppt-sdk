@@ -90,12 +90,20 @@ Upload a batch of files and create a conversion job. The request body is
 
 | Field | Required | Description |
 |---|---|---|
-| `files` | Yes | One or more files. `png` / `jpeg` / `webp` / `gif` / `pdf`, **each ≤ 35MB**. Repeat the `files` field name to send multiple files. |
+| `files` | Yes | One or more files. `png` / `jpeg` / `webp` / `gif` / `pdf`, **each ≤ 35MB**, and **≤ 45MB of file content per request**. Repeat the `files` field name to send multiple files. |
 | `locale` | No | Output locale: `zh-CN` (default) or `en`. |
 | `aspectRatio` | No | Slide ratio: `auto` (default, follows the source) / `16:9` / `4:3`. |
 
 **How pages are counted**: an image is 1 page; a PDF counts as its actual page
 count. The **total per submission must be ≤ 50 pages**.
+
+**Request size**: the files in one request must add up to **≤ 45MB**. Over that
+the request is rejected with `413 PAYLOAD_TOO_LARGE` — and be aware that a
+sufficiently oversized request may be cut off by the network before the API can
+answer at all, in which case the client sees the connection drop (a write timeout
+on a slow uplink, a broken pipe on a fast one) rather than a status code. Check
+the total on your side before sending, and split large piles across several
+submissions. The official SDKs do both for you.
 
 **Success** — `201 Created`
 
@@ -130,6 +138,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 |---|---|---|
 | 401 | `INVALID_API_KEY` | Key missing or invalid. |
 | 400 | `INVALID_FILE` | Unsupported format, or a single file over 35MB. |
+| 413 | `PAYLOAD_TOO_LARGE` | The request's files add up to more than 45MB. |
 | 400 | `TOO_MANY_SLIDES` | Total pages over 50. |
 | 402 | `INSUFFICIENT_CREDITS` | Not enough credits to cover this submission. |
 | 429 | `RATE_LIMITED` | Rate limit hit — see [Rate limits](#rate-limits). |
@@ -367,6 +376,7 @@ and full details on each exception are in the GitHub repo's README and examples.
 | 401 | `INVALID_API_KEY` | Key missing or invalid (all endpoints). |
 | 400 | `NO_FILES` | No files attached (submit). |
 | 400 | `INVALID_FILE` | Unsupported format or a single file over 35MB (submit). |
+| 413 | `PAYLOAD_TOO_LARGE` | The request's files add up to more than 45MB (submit). |
 | 400 | `INVALID_PDF` | PDF can't be read or parsed (submit). |
 | 400 | `INVALID_ASPECT_RATIO` | Unrecognized aspect ratio; use `auto`, `16:9`, or `4:3` (submit). |
 | 400 | `TOO_MANY_SLIDES` | Total pages over 50 (submit). |
