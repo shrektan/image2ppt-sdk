@@ -11,9 +11,12 @@ import io
 import os
 
 import pytest
+import requests
 from PIL import Image
 
 from image2ppt import (
+    MAX_PAGES_PER_JOB,
+    MAX_UPLOAD_BYTES,
     AuthenticationError,
     Image2PPTClient,
     Image2PPTError,
@@ -25,6 +28,7 @@ from image2ppt import (
     JobNotFoundError,
     NotReadyError,
     RateLimitedError,
+    TooManySlidesError,
 )
 from image2ppt._compress import compress_image_for_upload
 
@@ -70,6 +74,21 @@ class FakeSession:
 
 def make_client(handler):
     return Image2PPTClient("i2p_live_test", session=FakeSession(handler))
+
+
+def client_and_session(handler, **kwargs):
+    """Client plus the fake session, for asserting on what actually got sent."""
+    session = FakeSession(handler)
+    return Image2PPTClient("i2p_live_test", session=session, **kwargs), session
+
+
+def posted_filenames(session):
+    """Filenames carried by each POST, in order: [[batch1...], [batch2...]]."""
+    return [
+        [entry[1][0] for entry in call[2]["files"]]
+        for call in session.calls
+        if call[0] == "POST"
+    ]
 
 
 def png_bytes(size=(8, 8), color=(120, 30, 200)):
@@ -362,3 +381,202 @@ def test_compress_oversized_incompressible_still_shrinks():
     out, _mime = compress_image_for_upload(raw, "image/png")
     with Image.open(io.BytesIO(out)) as img:
         assert max(img.size) <= 2000
+
+
+# --------------------------------------------------------------------------- #
+# upload size guard — the regression this whole feature exists for
+#
+# A submission over the per-request size cap does not come back as an error: the
+# network layer in front of the API drops the connection mid-upload, and the
+# caller sees a bare write timeout. So the only acceptable behavior is to refuse
+# locally, having sent nothing. Every test here asserts on session.calls.
+# --------------------------------------------------------------------------- #
+def sparse_file(tmp_path, name, size):
+    """A file of exactly ``size`` bytes, allocated sparsely (instant, no real I/O).
+
+    Used with a .pdf name so the client measures it with os.path.getsize and never
+    reads or compresses it.
+    """
+    path = tmp_path / name
+    with open(path, "wb") as fh:
+        fh.truncate(size)
+    return str(path)
+
+
+def exploding_handler(*_args, **_kwargs):
+    raise AssertionError("no HTTP request should have been made")
+
+
+def test_submit_refuses_oversized_batch_without_sending_anything(tmp_path):
+    """Two individually-legal files that add up past the request cap: rejected
+    before a connection is opened."""
+    half = MAX_UPLOAD_BYTES // 2
+    files = [
+        sparse_file(tmp_path, "a.pdf", half),
+        sparse_file(tmp_path, "b.pdf", half + 1),
+    ]
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(InvalidFileError) as exc:
+        client.submit(files)
+
+    assert exc.value.code == "PAYLOAD_TOO_LARGE"
+    assert len(session.calls) == 0  # nothing went on the wire
+
+
+def test_submit_refuses_too_many_pages_without_sending_anything(tmp_path):
+    paths = []
+    for i in range(MAX_PAGES_PER_JOB + 1):
+        img = tmp_path / f"p{i:03d}.png"
+        img.write_bytes(png_bytes())
+        paths.append(str(img))
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(TooManySlidesError):
+        client.submit(paths)
+
+    assert len(session.calls) == 0
+
+
+def test_submit_within_limits_still_sends_exactly_one_request(tmp_path):
+    """The guard must not get in the way of a normal submission."""
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    client, session = client_and_session(
+        lambda *a, **k: FakeResponse(201, {"jobId": "j", "status": "pending"})
+    )
+
+    client.submit([str(img)])
+
+    assert posted_filenames(session) == [["a.png"]]
+
+
+# --------------------------------------------------------------------------- #
+# submit_all / convert_all — automatic batching
+# --------------------------------------------------------------------------- #
+def make_images(tmp_path, count):
+    paths = []
+    for i in range(count):
+        img = tmp_path / f"p{i:03d}.png"
+        img.write_bytes(png_bytes())
+        paths.append(str(img))
+    return paths
+
+
+def test_submit_all_splits_past_the_page_limit_into_two_jobs(tmp_path):
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    jobs_seq = iter(["job_a", "job_b"])
+    handler = lambda *a, **k: FakeResponse(201, {"jobId": next(jobs_seq), "status": "pending"})
+    client, session = client_and_session(handler)
+
+    jobs = client.submit_all(paths)
+
+    assert [job.job_id for job in jobs] == ["job_a", "job_b"]
+    sent = posted_filenames(session)
+    assert len(sent) == 2
+    assert sent[0] == [f"p{i:03d}.png" for i in range(MAX_PAGES_PER_JOB)]
+    assert sent[1] == [f"p{MAX_PAGES_PER_JOB:03d}.png"]
+
+
+def test_submit_all_gives_a_pdf_its_own_job(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    doc = tmp_path / "doc.pdf"
+    doc.write_bytes(b"%PDF-1.4 tiny")
+    handler = lambda *a, **k: FakeResponse(201, {"jobId": "j", "status": "pending"})
+    client, session = client_and_session(handler)
+
+    client.submit_all([str(img), str(doc)])
+
+    assert posted_filenames(session) == [["a.png"], ["doc.pdf"]]
+
+
+def test_submit_all_single_batch_behaves_like_submit(tmp_path):
+    paths = make_images(tmp_path, 3)
+    handler = lambda *a, **k: FakeResponse(201, {"jobId": "j", "status": "pending"})
+    client, session = client_and_session(handler)
+
+    jobs = client.submit_all(paths)
+
+    assert len(jobs) == 1
+    assert len(posted_filenames(session)) == 1
+
+
+def test_convert_all_writes_one_numbered_pptx_per_batch(tmp_path):
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    out_dir = tmp_path / "decks"
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+        FakeResponse(201, {"jobId": "job_b", "status": "pending"}),
+        FakeResponse(200, {"jobId": "job_a", "status": "completed"}),
+        FakeResponse(200, content=b"DECK-A"),
+        FakeResponse(200, {"jobId": "job_b", "status": "completed"}),
+        FakeResponse(200, content=b"DECK-B"),
+    ])
+    handler = lambda *a, **k: next(responses)
+
+    written = make_client(handler).convert_all(paths, str(out_dir), poll_interval=0)
+
+    assert written == [str(out_dir / "part-01.pptx"), str(out_dir / "part-02.pptx")]
+    assert (out_dir / "part-01.pptx").read_bytes() == b"DECK-A"
+    assert (out_dir / "part-02.pptx").read_bytes() == b"DECK-B"
+
+
+# --------------------------------------------------------------------------- #
+# upload retry — safe only for a connection that died mid-upload
+# --------------------------------------------------------------------------- #
+def test_submit_retries_a_connection_dropped_mid_upload(tmp_path):
+    """The body never arrived, so no job was created and nothing was charged."""
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    attempts = {"n": 0}
+
+    def handler(*_args, **_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise requests.exceptions.ConnectionError(
+                "('Connection aborted.', TimeoutError('The write operation timed out'))"
+            )
+        return FakeResponse(201, {"jobId": "job_retry", "status": "pending"})
+
+    client, session = client_and_session(handler)
+    client._upload_retry_backoff = 0  # no real sleeping in tests
+
+    job = client.submit([str(img)])
+
+    assert job.job_id == "job_retry"
+    assert len(posted_filenames(session)) == 2
+
+
+def test_submit_never_retries_a_read_timeout(tmp_path):
+    """The body WAS sent, so the job may exist with credits reserved. Retrying
+    would submit the same files twice and charge twice."""
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+
+    def handler(*_args, **_kwargs):
+        raise requests.exceptions.ReadTimeout("timed out waiting for the response")
+
+    client, session = client_and_session(handler)
+    client._upload_retry_backoff = 0
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        client.submit([str(img)])
+
+    assert len(posted_filenames(session)) == 1  # exactly one attempt
+
+
+def test_submit_gives_up_after_max_upload_retries(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+
+    def handler(*_args, **_kwargs):
+        raise requests.exceptions.ConnectionError("connection reset")
+
+    client, session = client_and_session(handler, max_upload_retries=1)
+    client._upload_retry_backoff = 0
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        client.submit([str(img)])
+
+    assert len(posted_filenames(session)) == 2  # first attempt + 1 retry
