@@ -1251,3 +1251,30 @@ def test_a_huge_poll_interval_is_still_bounded_by_the_deadline(monkeypatch):
     assert job.is_completed
     assert len(slept) == 1
     assert 0 < slept[0] <= 30  # the deadline, not the clamp
+
+
+def test_an_out_of_range_retry_after_cannot_reach_the_batch_sleep(tmp_path, monkeypatch):
+    """The batch path waits through the budget, which sleeps without the clamp.
+
+    That is safe only because the value it gets has already been through
+    ``_parse_retry_after`` — a guarantee three call levels away. The TypeScript suite
+    covers this end to end; this is its mirror, so neither side rests on reading the
+    code and concluding the path is unreachable.
+    """
+    paths = make_images(tmp_path, 2)
+    responses = iter([
+        rate_limited_response("99999999999999999999"),
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    # A budget far too large to be what rejects it, so the test cannot pass for the
+    # wrong reason.
+    client, _session = client_and_session(
+        lambda *a, **k: next(responses), rate_limit_max_wait=1e18
+    )
+
+    jobs = client.submit_all(paths)
+
+    assert [job.job_id for job in jobs] == ["job_a"]
+    assert slept == [5.0]  # the documented fallback, not an out-of-range wait
