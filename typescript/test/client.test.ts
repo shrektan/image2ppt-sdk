@@ -1246,3 +1246,51 @@ describe("attempt cap and submittedJobs", () => {
     expect(f.calls).toHaveLength(1 + 10); // first batch, then MAX_BATCH_ATTEMPTS
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Retry-After beyond what a timer can represent
+//
+// A delay past 2**31-1 ms is not representable here: `setTimeout` silently clamps it
+// to *1 millisecond*, so an absurd header would turn "wait" into "retry immediately,
+// at full speed" for every permitted attempt. Python fails differently on the same
+// input (`time.sleep` raises OverflowError), so the two clients would also stop
+// agreeing. Both draw the line at the same number. Mirrors the Python cases.
+// --------------------------------------------------------------------------- //
+describe("Retry-After beyond the timer range", () => {
+  async function delaysFor(header: string, budgetMs: number): Promise<number[]> {
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited(header), json(201, { jobId: "j", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await new Image2PPTClient({
+        apiKey: "i2p_live_test",
+        fetch: f,
+        rateLimitMaxWaitMs: budgetMs,
+      }).submitAll(files);
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  // A budget generous enough that it cannot be what rejects these.
+  const HUGE_BUDGET = Number.MAX_SAFE_INTEGER;
+
+  it.each([["99999999999999999999"], ["2147484"]])(
+    "treats %s as a header the server never sent",
+    async (header) => {
+      expect(await delaysFor(header, HUGE_BUDGET)).toEqual([5_000]);
+    },
+  );
+
+  it("still honours a value just inside the line", async () => {
+    expect(await delaysFor("2147483", HUGE_BUDGET)).toEqual([2_147_483_000]);
+  });
+});

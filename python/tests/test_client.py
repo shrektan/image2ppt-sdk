@@ -893,6 +893,13 @@ def test_convert_all_leaves_no_probe_file_behind(tmp_path):
         ("５", None),
         ("١٢", None),  # Arabic-Indic digits: also Unicode decimals
         ("\u00a05", None),  # non-breaking space is not HTTP whitespace
+        # Past the timer range both platforms can represent. Node clamps such a
+        # delay to *1ms* and would retry at full speed; Python raises
+        # OverflowError. Neither is a wait, and the two disagree — so it is
+        # treated as a header the server never sent.
+        ("99999999999999999999", None),
+        ("2147484", None),  # one second past the line
+        ("2147483", 2147483.0),  # just inside it: still honoured
     ],
 )
 def test_retry_after_is_sanitised(header, expected):

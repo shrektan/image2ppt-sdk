@@ -143,7 +143,10 @@ on the wire, and can split a large pile of files into batches on their own.
   handed to each language's number parser. The parsers are lenient in different ways —
   JavaScript's `Number` reads `0x10` as 16, Python's `float` takes `1e3` and `nan` — so
   the same header could mean different things to the two clients. Anything that is not
-  plain seconds falls back to the documented 5s wait. The pattern spells out `[0-9]`
+  plain seconds falls back to the documented 5s wait — as does anything past ~24.8
+  days, the point where a delay stops being representable as a timer: Node clamps such
+  a value to *1 millisecond* (turning "wait" into "retry at once, at full speed") while
+  Python raises `OverflowError`. The pattern spells out `[0-9]`
   and space-or-tab rather than using `\d` and `strip()`/`trim()`, for the same reason:
   Python's `\d` matches every Unicode decimal digit and JavaScript's matches only
   ASCII, so `Retry-After: ５` would otherwise be five seconds to one client and

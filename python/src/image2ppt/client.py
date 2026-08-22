@@ -57,6 +57,17 @@ _MIN_RETRY_AFTER = 1.0
 #: value; ``.strip()`` would also eat Unicode spaces that never belong there.
 _RETRY_AFTER_SECONDS = re.compile(r"[ \t]*([0-9]+(?:\.[0-9]+)?)[ \t]*")
 
+#: Largest ``Retry-After`` this client will act on, in seconds (~24.8 days).
+#:
+#: The line is Node's timer range — a delay past 2**31-1 milliseconds is not
+#: representable there, and ``setTimeout`` silently clamps it to *1 millisecond*, so an
+#: absurd header would turn "wait" into "retry immediately, at full speed". Python
+#: fails differently on the same input (``time.sleep`` raises ``OverflowError``), which
+#: is the other half of the problem: the two clients would stop agreeing. Drawing the
+#: line at the same number in both, and treating anything past it as a header the
+#: server never sent, keeps them in step. Nothing legitimate lives out here.
+_MAX_RETRY_AFTER = (2**31 - 1) / 1000
+
 #: How many times one batch may be re-sent after a 429 before giving up.
 #:
 #: The waiting budget alone does not bound the work: a server answering
@@ -743,8 +754,8 @@ class Image2PPTClient:
 
         Anything unusable comes back as ``None`` so the caller falls back to its own
         wait: a missing header, an HTTP-date, a negative value (which additionally
-        made ``time.sleep`` raise ``ValueError`` out of ``submit_all``), or any
-        spelling that is not plain decimal seconds.
+        made ``time.sleep`` raise ``ValueError`` out of ``submit_all``), a value past
+        ``_MAX_RETRY_AFTER``, or any spelling that is not plain decimal seconds.
 
         The syntax is matched explicitly rather than handed to the language's number
         parser. Both parsers are lenient in their own way — ``float`` takes ``"1e3"``
@@ -760,4 +771,7 @@ class Image2PPTClient:
         match = _RETRY_AFTER_SECONDS.fullmatch(value)
         if match is None:
             return None
-        return max(float(match.group(1)), _MIN_RETRY_AFTER)
+        seconds = float(match.group(1))
+        if seconds > _MAX_RETRY_AFTER:
+            return None
+        return max(seconds, _MIN_RETRY_AFTER)

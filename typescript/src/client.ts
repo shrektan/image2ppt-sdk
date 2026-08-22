@@ -614,6 +614,19 @@ export class Image2PPTClient {
 const RETRY_AFTER_SECONDS = /^[ \t]*([0-9]+(?:\.[0-9]+)?)[ \t]*$/;
 
 /**
+ * Largest `Retry-After` this client will act on, in seconds (~24.8 days).
+ *
+ * The line is this platform's timer range: a delay past 2**31-1 milliseconds is not
+ * representable, and `setTimeout` silently clamps it to *1 millisecond* — so an absurd
+ * header would turn "wait" into "retry immediately, at full speed", ten times over.
+ * Python fails differently on the same input (`time.sleep` raises `OverflowError`),
+ * which is the other half of the problem: the two clients would stop agreeing. Drawing
+ * the line at the same number in both, and treating anything past it as a header the
+ * server never sent, keeps them in step. Nothing legitimate lives out here.
+ */
+const MAX_RETRY_AFTER_SECONDS = (2 ** 31 - 1) / 1000;
+
+/**
  * How many times one batch may be re-sent after a 429 before giving up.
  *
  * The waiting budget alone does not bound the work: a server answering
@@ -628,8 +641,8 @@ const MAX_BATCH_ATTEMPTS = 10;
  * Parse the `Retry-After` header as seconds (contract: integer seconds).
  *
  * Anything unusable comes back as `undefined` so the caller falls back to its own
- * wait: a missing header, an HTTP-date, a negative value, or any spelling that is not
- * plain decimal seconds.
+ * wait: a missing header, an HTTP-date, a negative value, a value past
+ * `MAX_RETRY_AFTER_SECONDS`, or any spelling that is not plain decimal seconds.
  *
  * The syntax is matched explicitly rather than handed to `Number`. Both languages'
  * parsers are lenient in their own way — `Number` takes `"0x10"` as 16, Python's
@@ -643,5 +656,7 @@ function parseRetryAfter(value: string | null): number | undefined {
   if (!value) return undefined;
   const match = RETRY_AFTER_SECONDS.exec(value);
   if (match === null) return undefined;
-  return Math.max(Number(match[1]), MIN_RETRY_AFTER_SECONDS);
+  const seconds = Number(match[1]);
+  if (seconds > MAX_RETRY_AFTER_SECONDS) return undefined;
+  return Math.max(seconds, MIN_RETRY_AFTER_SECONDS);
 }
