@@ -1210,3 +1210,39 @@ describe("batch retry cap", () => {
     expect(f.calls).toHaveLength(10); // MAX_BATCH_ATTEMPTS, not ~1800
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Running out of attempts strands paid-for jobs too
+// --------------------------------------------------------------------------- //
+describe("attempt cap and submittedJobs", () => {
+  it("hands back the jobs already created when attempts run out", async () => {
+    // There are two ways to give up mid-pile — out of waiting budget, and out of
+    // attempts. Both strand paid-for jobs, so both must hand back their ids. The
+    // budget path has its own test; this one covers the attempt cap.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1); // two batches
+    const f = fetchScript((n) =>
+      n === 1 ? json(201, { jobId: "job_a", status: "pending" }) : rateLimited("1"),
+    );
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 1_800_000,
+    });
+
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void) =>
+        realSetTimeout(cb, 0)) as unknown as typeof setTimeout);
+    let err: unknown;
+    try {
+      err = await c.submitAll(files).catch((e: unknown) => e);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect(submittedIds(err)).toEqual(["job_a"]);
+    expect(f.calls).toHaveLength(1 + 10); // first batch, then MAX_BATCH_ATTEMPTS
+  });
+});

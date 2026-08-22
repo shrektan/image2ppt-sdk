@@ -1178,3 +1178,26 @@ def test_a_batch_is_not_retried_forever_on_a_cheap_retry_after(tmp_path, monkeyp
     assert len(session.calls) == _MAX_BATCH_ATTEMPTS  # not ~1800
     # One wait between attempts, and none after the last: nothing would follow it.
     assert len(slept) == _MAX_BATCH_ATTEMPTS - 1
+
+
+def test_running_out_of_attempts_still_hands_back_the_jobs_already_created(
+    tmp_path, monkeypatch
+):
+    """There are two ways to give up mid-pile — out of waiting budget, and out of
+    attempts. Both strand paid-for jobs, so both must hand back their ids. The budget
+    path has its own test; this one covers the attempt cap."""
+    from image2ppt.client import _MAX_BATCH_ATTEMPTS
+
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)  # two batches
+    first = iter([FakeResponse(201, {"jobId": "job_a", "status": "pending"})])
+    monkeypatch.setattr("image2ppt.client.time.sleep", lambda _s: None)
+    client, session = client_and_session(
+        lambda *a, **k: next(first, rate_limited_response("1")),
+        rate_limit_max_wait=1800,
+    )
+
+    with pytest.raises(RateLimitedError) as exc:
+        client.submit_all(paths)
+
+    assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a"]
+    assert len(session.calls) == 1 + _MAX_BATCH_ATTEMPTS
