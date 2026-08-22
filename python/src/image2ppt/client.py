@@ -785,19 +785,23 @@ class Image2PPTClient:
         if _response_header(resp.headers, "Deprecation") is None:
             return
         self._deprecation_warned = True
-        parts = [
-            f"This image2ppt Python SDK ({__version__}) has been marked deprecated."
-        ]
-        url = _link_url(_response_header(resp.headers, "Link"))
-        if url:
-            parts.append(f"See {url} for what changed.")
-        sunset = _response_header(resp.headers, "Sunset")
-        if sunset:
-            parts.append(f"Support is planned to end {sunset}.")
-        parts.append(
-            "Pass warn_on_deprecated=False to Image2PPTClient(...) to silence this warning."
-        )
-        _LOG.warning(" ".join(parts))
+        try:
+            parts = [
+                f"This image2ppt Python SDK ({__version__}) has been marked deprecated."
+            ]
+            url = _link_url(_response_header(resp.headers, "Link"))
+            if url:
+                parts.append(f"See {url} for what changed.")
+            sunset = _response_header(resp.headers, "Sunset")
+            if sunset:
+                parts.append(f"Support is planned to end {sunset}.")
+            parts.append(
+                "Pass warn_on_deprecated=False to Image2PPTClient(...) to silence this warning."
+            )
+            _LOG.warning(" ".join(parts))
+        except Exception:
+            # Advisory only: a throwing logging handler must not fail the request.
+            pass
 
     def _raise_for_error(self, resp: requests.Response) -> None:
         """Parse the ``{"error": {code, message}}`` envelope and raise the mapped error."""

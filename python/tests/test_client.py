@@ -1141,6 +1141,19 @@ def test_deprecation_warning_can_be_switched_off(caplog):
     assert [r for r in caplog.records if r.name == "image2ppt"] == []
 
 
+def test_deprecation_warning_failure_does_not_fail_the_request(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("logger exploded")
+
+    monkeypatch.setattr("image2ppt.client._LOG.warning", boom)
+    info = make_client(
+        lambda *a, **k: FakeResponse(
+            200, {"email": "e", "credits": 1}, headers=_DEPRECATION_HEADERS
+        )
+    ).account()
+    assert info["email"] == "e"
+
+
 def test_no_warning_without_deprecation_header(caplog):
     def handler(*a, **k):
         return FakeResponse(

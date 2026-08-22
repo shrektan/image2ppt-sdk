@@ -1040,6 +1040,19 @@ describe("deprecation warning", () => {
     }
   });
 
+  it("does not fail the request if console.warn throws", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {
+      throw new DOMException("boom", "AbortError");
+    });
+    try {
+      const f = fetchScript(() => json(200, { email: "e", credits: 1 }, DEPRECATION_HEADERS));
+      const info = await client(f).account();
+      expect(info.email).toBe("e");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("does not warn without a Deprecation header", async () => {
     const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {

@@ -540,15 +540,14 @@ export class Image2PPTClient {
   }
 
   async #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {
+    let res: Response;
     try {
-      const res = await this.#fetch(`${this.baseUrl}${path}`, {
+      res = await this.#fetch(`${this.baseUrl}${path}`, {
         method,
         headers: { Authorization: `Bearer ${this.#apiKey}`, "User-Agent": USER_AGENT },
         body: init.body,
         signal: AbortSignal.timeout(this.timeoutMs),
       });
-      this.#warnIfDeprecated(res);
-      return res;
     } catch (err) {
       // AbortSignal.timeout aborts the whole request (including a slow large
       // upload/download body) with a native DOMException, which is NOT an
@@ -566,6 +565,8 @@ export class Image2PPTClient {
       }
       throw err;
     }
+    this.#warnIfDeprecated(res);
+    return res;
   }
 
   /**
@@ -580,17 +581,21 @@ export class Image2PPTClient {
     if (!this.warnOnDeprecated || this.#deprecationWarned) return;
     if (!res.headers.has("Deprecation")) return;
     this.#deprecationWarned = true;
-    const parts = [
-      `This image2ppt Node SDK (${VERSION}) has been marked deprecated.`,
-    ];
-    const url = linkUrl(res.headers.get("Link"));
-    if (url) parts.push(`See ${url} for what changed.`);
-    const sunset = res.headers.get("Sunset");
-    if (sunset) parts.push(`Support is planned to end ${sunset}.`);
-    parts.push(
-      "Pass warnOnDeprecated: false to Image2PPTClient() to silence this warning.",
-    );
-    console.warn(parts.join(" "));
+    try {
+      const parts = [
+        `This image2ppt Node SDK (${VERSION}) has been marked deprecated.`,
+      ];
+      const url = linkUrl(res.headers.get("Link"));
+      if (url) parts.push(`See ${url} for what changed.`);
+      const sunset = res.headers.get("Sunset");
+      if (sunset) parts.push(`Support is planned to end ${sunset}.`);
+      parts.push(
+        "Pass warnOnDeprecated: false to Image2PPTClient() to silence this warning.",
+      );
+      console.warn(parts.join(" "));
+    } catch {
+      // Advisory only: a throwing console.warn must not fail the request.
+    }
   }
 
   async #parseJson(res: Response): Promise<Record<string, unknown>> {
