@@ -884,7 +884,15 @@ def test_convert_all_leaves_no_probe_file_behind(tmp_path):
         ("+5", None),
         (".5", None),
         ("5s", None),
-        ("  12  ", 12.0),  # surrounding whitespace is the transport's, not the value's
+        ("  12  ", 12.0),  # space/tab around a field value is the transport's
+        ("\t12\t", 12.0),
+        # Python's \d matches every Unicode decimal digit and JavaScript's matches
+        # only ASCII. Left to \d, a full-width 5 would be five seconds here and
+        # unparseable in the Node client — the same two-client disagreement this
+        # parsing exists to remove.
+        ("５", None),
+        ("١٢", None),  # Arabic-Indic digits: also Unicode decimals
+        ("\u00a05", None),  # non-breaking space is not HTTP whitespace
     ],
 )
 def test_retry_after_is_sanitised(header, expected):
@@ -1146,3 +1154,26 @@ def test_the_budget_is_spent_by_waiting_and_then_gives_up(tmp_path, monkeypatch)
         client.submit_all(paths)
 
     assert slept == [4.0, 4.0]  # 8s spent, the third 4s would not fit
+
+
+def test_a_batch_is_not_retried_forever_on_a_cheap_retry_after(tmp_path, monkeypatch):
+    """The waiting budget cannot see the uploads, and every retry re-sends them.
+
+    A server answering ``Retry-After: 1`` costs a second of budget per round, so a
+    30-minute budget alone would buy ~1800 rounds — 1800 re-uploads of the same
+    files. The attempt cap is what bounds the work rather than the waiting.
+    """
+    from image2ppt.client import _MAX_BATCH_ATTEMPTS
+
+    paths = make_images(tmp_path, 2)
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    client, session = client_and_session(
+        lambda *a, **k: rate_limited_response("1"), rate_limit_max_wait=1800
+    )
+
+    with pytest.raises(RateLimitedError):
+        client.submit_all(paths)
+
+    assert len(session.calls) == _MAX_BATCH_ATTEMPTS  # not ~1800
+    assert len(slept) == _MAX_BATCH_ATTEMPTS

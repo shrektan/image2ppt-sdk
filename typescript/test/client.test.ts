@@ -1136,3 +1136,77 @@ describe("Retry-After spellings", () => {
     expect(await delaysFor("  12  ")).toEqual([12_000]);
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Retry-After: digits and whitespace must mean the same thing in both clients
+//
+// The parser matches `[0-9]` and an explicit space-or-tab rather than `\d` and
+// `trim()`, because Python's `\d` matches every Unicode decimal digit while
+// JavaScript's matches only ASCII — left to the defaults, `Retry-After: ５` would be
+// five seconds to the Python client and unparseable here.
+//
+// That case cannot be written as a test on this side: `Headers` is specified over
+// ByteStrings and refuses a non-ASCII value outright, so no `Response` can carry one.
+// The test below pins that refusal — it is the reason the disagreement can only ever
+// originate on the Python side, and it is what makes the ASCII-only pattern here belt
+// and braces rather than dead weight. The Python suite carries the mirrored cases.
+// --------------------------------------------------------------------------- //
+describe("Retry-After digits and whitespace", () => {
+  it.each([["５"], ["١٢"]])(
+    "cannot even be delivered as a header value in Node (%s)",
+    (value) => {
+      expect(() => new Headers({ "Retry-After": value })).toThrow();
+    },
+  );
+
+  it("still parses a plain value delivered through real headers", async () => {
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited("12"), json(201, { jobId: "j", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await client(f).submitAll(files);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(delays).toEqual([12_000]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// A batch is not retried forever on a cheap Retry-After
+// --------------------------------------------------------------------------- //
+describe("batch retry cap", () => {
+  it("stops re-uploading long before the waiting budget runs out", async () => {
+    // The waiting budget cannot see the uploads, and every retry re-sends them. A
+    // server answering `Retry-After: 1` costs a second of budget per round, so a
+    // 30-minute budget alone would buy ~1800 rounds — 1800 re-uploads of the same
+    // files. The attempt cap is what bounds the work rather than the waiting.
+    const files = await manyImages(2);
+    const f = fetchScript(() => rateLimited("1"));
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 1_800_000,
+    });
+
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void) =>
+        realSetTimeout(cb, 0)) as unknown as typeof setTimeout);
+    try {
+      await expect(c.submitAll(files)).rejects.toBeInstanceOf(RateLimitedError);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(f.calls).toHaveLength(10); // MAX_BATCH_ATTEMPTS, not ~1800
+  });
+});

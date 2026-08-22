@@ -48,7 +48,23 @@ _MIN_RETRY_AFTER = 1.0
 
 #: ``Retry-After`` as plain decimal seconds — the only spelling this client accepts.
 #: The other legal form is an HTTP-date, which does not match and falls back.
-_RETRY_AFTER_SECONDS = re.compile(r"\d+(?:\.\d+)?")
+#:
+#: Written with ``[0-9]`` and an explicit leading/trailing space-or-tab rather than
+#: ``\d`` and ``.strip()``. Python's ``\d`` matches every Unicode decimal digit and
+#: JavaScript's matches only ASCII, so ``Retry-After: ５`` would be five seconds to one
+#: client and unparseable to the other — the exact two-client disagreement this pattern
+#: exists to remove. Space and tab are the only whitespace HTTP allows around a field
+#: value; ``.strip()`` would also eat Unicode spaces that never belong there.
+_RETRY_AFTER_SECONDS = re.compile(r"[ \t]*([0-9]+(?:\.[0-9]+)?)[ \t]*")
+
+#: How many times one batch may be re-sent after a 429 before giving up.
+#:
+#: The waiting budget alone does not bound the work: a server answering
+#: ``Retry-After: 1`` indefinitely costs only a second per round, so a 30-minute
+#: budget would buy ~1800 rounds — and every round re-uploads the whole batch, tens
+#: of megabytes at a time. A server still refusing after this many tries is not going
+#: to be talked round by more of them.
+_MAX_BATCH_ATTEMPTS = 10
 
 
 def _ensure_writable_dir(dest_dir: str) -> None:
@@ -554,8 +570,14 @@ class Image2PPTClient:
         Both flavors of 429 (per-minute page quota, concurrent-job cap) carry a
         ``Retry-After`` and are handled identically. When the header is missing we
         fall back to a fixed wait.
+
+        Two things stop this: the shared waiting ``budget``, and
+        ``_MAX_BATCH_ATTEMPTS``. The budget bounds time spent waiting; the attempt
+        count bounds the uploads, which the budget cannot see — a server answering
+        ``Retry-After: 1`` forever costs almost no budget per round while re-sending
+        the whole batch every time.
         """
-        while True:
+        for _attempt in range(_MAX_BATCH_ATTEMPTS):
             try:
                 return self.submit(paths, locale=locale, aspect_ratio=aspect_ratio)
             except RateLimitedError as exc:
@@ -566,6 +588,8 @@ class Image2PPTClient:
                 )
                 if not budget.spend(delay):
                     raise
+                last = exc
+        raise last
 
     def _prepare_file(self, path: str) -> _PreparedFile:
         """Resolve one path to its multipart part and its exact size on the wire."""
@@ -729,6 +753,9 @@ class Image2PPTClient:
         A usable value is floored at ``_MIN_RETRY_AFTER`` — see that constant for why
         zero cannot be taken literally.
         """
-        if not value or not _RETRY_AFTER_SECONDS.fullmatch(value.strip()):
+        if not value:
             return None
-        return max(float(value.strip()), _MIN_RETRY_AFTER)
+        match = _RETRY_AFTER_SECONDS.fullmatch(value)
+        if match is None:
+            return None
+        return max(float(match.group(1)), _MIN_RETRY_AFTER)

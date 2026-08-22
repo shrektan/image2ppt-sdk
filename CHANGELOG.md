@@ -143,7 +143,15 @@ on the wire, and can split a large pile of files into batches on their own.
   handed to each language's number parser. The parsers are lenient in different ways —
   JavaScript's `Number` reads `0x10` as 16, Python's `float` takes `1e3` and `nan` — so
   the same header could mean different things to the two clients. Anything that is not
-  plain seconds falls back to the documented 5s wait.
+  plain seconds falls back to the documented 5s wait. The pattern spells out `[0-9]`
+  and space-or-tab rather than using `\d` and `strip()`/`trim()`, for the same reason:
+  Python's `\d` matches every Unicode decimal digit and JavaScript's matches only
+  ASCII, so `Retry-After: ５` would otherwise be five seconds to one client and
+  unparseable to the other.
+- **Both clients** — one batch is retried at most 10 times after a 429, whatever the
+  waiting budget allows. The budget bounds time spent *waiting*, which a service
+  answering `Retry-After: 1` barely touches — a 30-minute budget would buy ~1800
+  rounds, and every round re-uploads the whole batch.
 - **TypeScript** — `formatBytes` is no longer exported from the package root. It is an
   error-message helper, not part of the contract, and Python keeps `format_bytes`
   private; the two SDKs must present the same public surface.

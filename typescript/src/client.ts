@@ -507,7 +507,12 @@ export class Image2PPTClient {
     options: SubmitOptions,
     budget: WaitBudget,
   ): Promise<Job> {
-    for (;;) {
+    // Two things stop this: the shared waiting `budget`, and MAX_BATCH_ATTEMPTS. The
+    // budget bounds time spent waiting; the attempt count bounds the uploads, which
+    // the budget cannot see — a server answering `Retry-After: 1` forever costs almost
+    // no budget per round while re-sending the whole batch every time.
+    let last: RateLimitedError | undefined;
+    for (let attempt = 0; attempt < MAX_BATCH_ATTEMPTS; attempt += 1) {
       try {
         return await this.submit(paths, options);
       } catch (err) {
@@ -515,8 +520,10 @@ export class Image2PPTClient {
         const delay =
           err.retryAfter != null ? err.retryAfter * 1000 : RATE_LIMIT_FALLBACK_WAIT_MS;
         if (!(await budget.spend(delay))) throw err;
+        last = err;
       }
     }
+    throw last;
   }
 
   /** Measure files for batch planning, using the size they will occupy on the wire. */
@@ -593,8 +600,28 @@ export class Image2PPTClient {
   }
 }
 
-/** `Retry-After` as plain decimal seconds — the only spelling this client accepts. */
-const RETRY_AFTER_SECONDS = /^\d+(?:\.\d+)?$/;
+/**
+ * `Retry-After` as plain decimal seconds — the only spelling this client accepts.
+ *
+ * Written with `[0-9]` and an explicit leading/trailing space-or-tab rather than `\d`
+ * and `trim()`. Python's `\d` matches every Unicode decimal digit and JavaScript's
+ * matches only ASCII, so `Retry-After: ５` would be five seconds to one client and
+ * unparseable to the other — the exact two-client disagreement this pattern exists to
+ * remove. Space and tab are the only whitespace HTTP allows around a field value;
+ * `trim()` would also eat Unicode spaces that never belong there.
+ */
+const RETRY_AFTER_SECONDS = /^[ \t]*([0-9]+(?:\.[0-9]+)?)[ \t]*$/;
+
+/**
+ * How many times one batch may be re-sent after a 429 before giving up.
+ *
+ * The waiting budget alone does not bound the work: a server answering
+ * `Retry-After: 1` indefinitely costs only a second per round, so a 30-minute budget
+ * would buy ~1800 rounds — and every round re-uploads the whole batch, tens of
+ * megabytes at a time. A server still refusing after this many tries is not going to
+ * be talked round by more of them.
+ */
+const MAX_BATCH_ATTEMPTS = 10;
 
 /**
  * Parse the `Retry-After` header as seconds (contract: integer seconds).
@@ -612,7 +639,8 @@ const RETRY_AFTER_SECONDS = /^\d+(?:\.\d+)?$/;
  * zero cannot be taken literally.
  */
 function parseRetryAfter(value: string | null): number | undefined {
-  const raw = value?.trim();
-  if (!raw || !RETRY_AFTER_SECONDS.test(raw)) return undefined;
-  return Math.max(Number(raw), MIN_RETRY_AFTER_SECONDS);
+  if (!value) return undefined;
+  const match = RETRY_AFTER_SECONDS.exec(value);
+  if (match === null) return undefined;
+  return Math.max(Number(match[1]), MIN_RETRY_AFTER_SECONDS);
 }
