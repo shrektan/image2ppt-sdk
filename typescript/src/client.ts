@@ -1,14 +1,16 @@
 /** The image2ppt API client. */
 
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import {
   Image2PPTError,
   Image2PPTTimeoutError,
+  InvalidFileError,
   JobFailedError,
   RateLimitedError,
   exceptionFor,
@@ -26,8 +28,31 @@ import { Job } from "./types.js";
 
 export const DEFAULT_BASE_URL = "https://image2ppt.com";
 
+/**
+ * Sent on every request so the service knows which client version made it.
+ *
+ * Without it the service cannot tell a caller on an old SDK from anyone else, which
+ * means it can never warn anyone that their version is about to stop working. This is
+ * only the identifier half — acting on it (a deprecation header the client surfaces
+ * as a warning) needs the service side first.
+ *
+ * Kept in step with `package.json` by a test; there is no version constant to import
+ * because reading `package.json` at runtime breaks under bundlers.
+ */
+const USER_AGENT = "image2ppt-node/0.2.0";
+
 /** Wait between rate-limited retries when the server sends no `Retry-After`. */
 const RATE_LIMIT_FALLBACK_WAIT_MS = 5_000;
+
+/**
+ * Floor for a server-sent `Retry-After`, in seconds. `Retry-After: 0` is a legal
+ * value meaning "retry now", and a proxy can even send a negative one; taken
+ * literally either turns every retry loop in this client into a tight loop that
+ * re-sends the same multipart body as fast as the link allows — for up to
+ * `rateLimitMaxWaitMs`, with tens of megabytes of files on each pass. A floor makes
+ * a retry a retry instead of a flood, and costs nothing when the server means it.
+ */
+const MIN_RETRY_AFTER_SECONDS = 1;
 
 const MIME_BY_EXT: Record<string, string> = {
   ".png": "image/png",
@@ -44,8 +69,28 @@ const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * MIME type for a supported extension; refuse anything else locally.
+ *
+ * `MIME_BY_EXT` is what the API accepts. Falling back to a generic type meant a
+ * `.txt` or `.docx` was treated as PDF-like, given a batch of its own and uploaded,
+ * only to come back `INVALID_FILE` — and in `submitAll` the batches ahead of it were
+ * already jobs with credits reserved. The supported set is known locally, so this is
+ * a failure that can cost nothing.
+ *
+ * The trade-off is deliberate: a format the service starts accepting is refused here
+ * until this list is updated and released.
+ */
 function guessMime(name: string): string {
-  return MIME_BY_EXT[extname(name).toLowerCase()] ?? "application/octet-stream";
+  const mime = MIME_BY_EXT[extname(name).toLowerCase()];
+  if (mime === undefined) {
+    throw new InvalidFileError(
+      `"${name}" is not a supported file type; this client accepts ` +
+        `${Object.keys(MIME_BY_EXT).sort().join(", ")}. Nothing was uploaded`,
+      { code: "INVALID_FILE" },
+    );
+  }
+  return mime;
 }
 
 function isImageMime(mime: string): boolean {
@@ -65,22 +110,27 @@ function isImageMime(mime: string): boolean {
  * read-only mounts and ACLs, and running as root they report writable for
  * directories nothing can be written to. Creating a real file is the same
  * operation `download` will do a few seconds later, so it is the same answer.
+ *
+ * The probe has a random name and is opened with the `wx` flag, which fails if
+ * anything is already there. A predictable name opened for writing would follow —
+ * and truncate — whatever already sits at that path, including a symlink someone
+ * left in a shared output directory. Only the entry this call actually created is
+ * removed afterwards.
  */
 async function ensureWritableDir(destDir: string): Promise<void> {
   await mkdir(destDir, { recursive: true });
-  const probe = join(destDir, `.image2ppt-write-test-${process.pid}`);
+  const probe = join(destDir, `.image2ppt-write-test-${randomUUID()}`);
   try {
-    await writeFile(probe, "");
+    await writeFile(probe, "", { flag: "wx" });
   } catch (err) {
     throw new Error(
       `cannot write to destDir "${destDir}" (${(err as NodeJS.ErrnoException).code ?? err}); ` +
         "nothing was submitted",
       { cause: err },
     );
-  } finally {
-    // Never created, or already gone: nothing to clean up either way.
-    await rm(probe, { force: true }).catch(() => undefined);
   }
+  // Only reached when this call created it.
+  await rm(probe, { force: true }).catch(() => undefined);
 }
 
 /**
@@ -155,12 +205,14 @@ export class Image2PPTClient {
     const files = await Promise.all(
       paths.map(async (path) => {
         const name = basename(path);
-        return { name, mime: guessMime(name), buffer: await readFile(path) };
+        return { path, name, mime: guessMime(name), buffer: await readFile(path) };
       }),
     );
     // Pre-flight, before a single byte goes out: an oversized request is not
-    // answered with an error, it is cut off — so it must never be sent.
-    for (const file of files) checkFileSize(file.name, file.buffer.byteLength);
+    // answered with an error, it is cut off — so it must never be sent. The error
+    // names the full path, matching `planBatches` and the Python client — a bare
+    // basename is ambiguous the moment two directories hold the same filename.
+    for (const file of files) checkFileSize(file.path, file.buffer.byteLength);
     checkSubmission(
       files.reduce((total, file) => total + file.buffer.byteLength, 0),
       files.filter((file) => isImageMime(file.mime)).length,
@@ -213,8 +265,8 @@ export class Image2PPTClient {
    * them later; do not resubmit those files.
    *
    * @returns One pending `Job` per batch, in batch order.
-   * @throws InvalidFileError A single file is over the per-request limit on its
-   *   own, so no batching can carry it.
+   * @throws InvalidFileError A single file is over the 35MB per-file limit, so no
+   *   batching can carry it.
    * @throws RateLimitedError Still rate limited after `rateLimitMaxWaitMs`.
    */
   async submitAll(paths: string[], options: SubmitOptions = {}): Promise<Job[]> {
@@ -300,6 +352,13 @@ export class Image2PPTClient {
   /**
    * Download a completed job's PPTX to `destPath`; return that path. Throws
    * NotReadyError (409), JobNotFoundError (404), or OutputExpiredError (410).
+   *
+   * **`destPath` either holds a complete deck or is not written at all.** The bytes
+   * go to a temporary file beside it and are renamed into place once the last one
+   * arrives, so a connection dropped mid-download cannot leave a truncated `.pptx`
+   * that opens in a file listing and nowhere else. That matters most for
+   * `convertAll`, whose contract is "the decks already downloaded stay on disk" — a
+   * half-written `part-02.pptx` would be indexed as one of them.
    */
   async download(jobId: string, destPath: string): Promise<string> {
     const res = await this.#request(
@@ -309,13 +368,22 @@ export class Image2PPTClient {
     if (!res.ok) {
       await this.#raiseForError(res);
     }
-    if (res.body) {
-      // Stream to disk in chunks so a large PPTX never sits fully in memory
-      // (mirrors the Python client's iter_content streaming).
-      await pipeline(Readable.fromWeb(res.body), createWriteStream(destPath));
-    } else {
-      // No body stream (shouldn't happen for a 200 download): buffer as a fallback.
-      await writeFile(destPath, Buffer.from(await res.arrayBuffer()));
+    // Same directory as the destination, so the rename is atomic rather than a
+    // cross-filesystem copy.
+    const partial = join(dirname(destPath), `.${basename(destPath)}.${randomUUID()}.part`);
+    try {
+      if (res.body) {
+        // Stream to disk in chunks so a large PPTX never sits fully in memory
+        // (mirrors the Python client's iter_content streaming).
+        await pipeline(Readable.fromWeb(res.body), createWriteStream(partial));
+      } else {
+        // No body stream (shouldn't happen for a 200 download): buffer as a fallback.
+        await writeFile(partial, Buffer.from(await res.arrayBuffer()));
+      }
+      await rename(partial, destPath);
+    } catch (err) {
+      await rm(partial, { force: true }).catch(() => undefined);
+      throw err;
     }
     return destPath;
   }
@@ -323,9 +391,9 @@ export class Image2PPTClient {
   /**
    * One-shot: submit → wait for completion → download to `destPath`.
    *
-   * One job, one PPTX — the files must fit in a single submission (45MB, 50
-   * pages). For more than that, `convertAll` splits the pile and writes one PPTX
-   * per batch.
+   * One job, one PPTX — the files must fit in a single submission (40MB of file
+   * content, 50 pages). For more than that, `convertAll` splits the pile and writes
+   * one PPTX per batch.
    */
   async convert(
     paths: string[],
@@ -443,7 +511,7 @@ export class Image2PPTClient {
     try {
       return await this.#fetch(`${this.baseUrl}${path}`, {
         method,
-        headers: { Authorization: `Bearer ${this.#apiKey}` },
+        headers: { Authorization: `Bearer ${this.#apiKey}`, "User-Agent": USER_AGENT },
         body: init.body,
         signal: AbortSignal.timeout(this.timeoutMs),
       });
@@ -502,8 +570,17 @@ export class Image2PPTClient {
   }
 }
 
+/**
+ * Parse the `Retry-After` header as seconds (contract: integer seconds).
+ *
+ * Anything unusable comes back as `undefined` so the caller falls back to its own
+ * wait: a missing header, an HTTP-date, a non-finite number, or a negative value.
+ * A usable value is floored at `MIN_RETRY_AFTER_SECONDS` — see that constant for
+ * why zero cannot be taken literally.
+ */
 function parseRetryAfter(value: string | null): number | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
-  return Number.isFinite(seconds) ? seconds : undefined;
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  return Math.max(seconds, MIN_RETRY_AFTER_SECONDS);
 }

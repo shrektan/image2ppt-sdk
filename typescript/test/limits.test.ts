@@ -8,7 +8,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  BATCH_TARGET_BYTES,
+  MAX_FILE_CONTENT_BYTES,
   InvalidFileError,
   MAX_FILE_BYTES,
   MAX_PAGES_PER_JOB,
@@ -52,10 +52,21 @@ describe("checkFileSize", () => {
   it("is stricter than the request cap", () => {
     // Guards the reason this check exists: without it, a file between the two
     // caps looks submittable to the batch planner and never is.
-    expect(MAX_FILE_BYTES).toBeLessThan(MAX_UPLOAD_BYTES);
-    const between = Math.floor((MAX_FILE_BYTES + MAX_UPLOAD_BYTES) / 2);
+    expect(MAX_FILE_BYTES).toBeLessThan(MAX_FILE_CONTENT_BYTES);
+    const between = Math.floor((MAX_FILE_BYTES + MAX_FILE_CONTENT_BYTES) / 2);
     expect(() => checkSubmission(between, 1)).not.toThrow(); // request cap is happy
     expect(() => checkFileSize("between.pdf", between)).toThrow(InvalidFileError);
+  });
+
+  it("leaves room for the multipart envelope inside the server's request cap", () => {
+    // The server measures the whole HTTP body; this client measures file bytes. If
+    // the two numbers were equal, a submission of exactly the server's cap in file
+    // content would go on the wire as that plus the multipart envelope — over the
+    // cap, and over it in the way that has no error code, only a dead connection.
+    expect(MAX_FILE_CONTENT_BYTES).toBeLessThan(MAX_UPLOAD_BYTES);
+    expect(() => checkSubmission(MAX_FILE_CONTENT_BYTES, 1)).not.toThrow();
+    // Under the server's request cap, but not once the envelope is added.
+    expect(() => checkSubmission(MAX_UPLOAD_BYTES, 1)).toThrow(InvalidFileError);
   });
 });
 
@@ -64,13 +75,13 @@ describe("checkFileSize", () => {
 // --------------------------------------------------------------------------- //
 describe("checkSubmission", () => {
   it("accepts a submission sitting exactly on both limits", () => {
-    expect(() => checkSubmission(MAX_UPLOAD_BYTES, MAX_PAGES_PER_JOB)).not.toThrow();
+    expect(() => checkSubmission(MAX_FILE_CONTENT_BYTES, MAX_PAGES_PER_JOB)).not.toThrow();
   });
 
   it("rejects one byte over the size cap", () => {
-    expect(() => checkSubmission(MAX_UPLOAD_BYTES + 1, 1)).toThrow(InvalidFileError);
+    expect(() => checkSubmission(MAX_FILE_CONTENT_BYTES + 1, 1)).toThrow(InvalidFileError);
     try {
-      checkSubmission(MAX_UPLOAD_BYTES + 1, 1);
+      checkSubmission(MAX_FILE_CONTENT_BYTES + 1, 1);
     } catch (err) {
       expect((err as InvalidFileError).code).toBe("PAYLOAD_TOO_LARGE");
     }
@@ -105,19 +116,19 @@ describe("planBatches size splitting", () => {
   it("refuses a file between the two caps", () => {
     // The regression this guards: it fits the request cap, so the planner used to
     // build a batch for it that the server would reject every single time.
-    const between = Math.floor((MAX_FILE_BYTES + MAX_UPLOAD_BYTES) / 2);
+    const between = Math.floor((MAX_FILE_BYTES + MAX_FILE_CONTENT_BYTES) / 2);
     expect(() => planBatches([img("doomed.pdf", between)])).toThrow(InvalidFileError);
   });
 
   it("keeps a batch filled exactly to the target as one batch", () => {
-    const half = Math.floor(BATCH_TARGET_BYTES / 2);
-    const batches = planBatches([img("a", half), img("b", BATCH_TARGET_BYTES - half)]);
+    const half = Math.floor(MAX_FILE_CONTENT_BYTES / 2);
+    const batches = planBatches([img("a", half), img("b", MAX_FILE_CONTENT_BYTES - half)]);
     expect(names(batches)).toEqual([["a", "b"]]);
   });
 
   it("starts a second batch one byte past the target", () => {
-    const half = Math.floor(BATCH_TARGET_BYTES / 2);
-    const batches = planBatches([img("a", half), img("b", BATCH_TARGET_BYTES - half + 1)]);
+    const half = Math.floor(MAX_FILE_CONTENT_BYTES / 2);
+    const batches = planBatches([img("a", half), img("b", MAX_FILE_CONTENT_BYTES - half + 1)]);
     expect(names(batches)).toEqual([["a"], ["b"]]);
   });
 
@@ -188,9 +199,9 @@ describe("formatBytes", () => {
     expect(formatBytes(32 * 1024)).toBe("32.0KB");
     expect(formatBytes(5 * 1024 * 1024)).toBe("5.0MB");
 
-    expect(() => checkSubmission(MAX_UPLOAD_BYTES + 1, 1)).toThrow(InvalidFileError);
+    expect(() => checkSubmission(MAX_FILE_CONTENT_BYTES + 1, 1)).toThrow(InvalidFileError);
     try {
-      checkSubmission(MAX_UPLOAD_BYTES + 1, 1);
+      checkSubmission(MAX_FILE_CONTENT_BYTES + 1, 1);
     } catch (err) {
       expect((err as Error).message).not.toContain("0.0MB too much");
     }

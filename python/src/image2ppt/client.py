@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import mimetypes
+import math
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
@@ -22,11 +23,28 @@ from .errors import (
     exception_for,
 )
 from .models import Job
+from ._version import __version__
 
 DEFAULT_BASE_URL = "https://image2ppt.com"
 
+#: Sent on every request so the service knows which client version made it.
+#:
+#: Without it the service cannot tell a caller on an old SDK from anyone else, which
+#: means it can never warn anyone that their version is about to stop working. This
+#: is only the identifier half — acting on it (a deprecation header the client
+#: surfaces as a warning) needs the service side first.
+_USER_AGENT = f"image2ppt-python/{__version__}"
+
 #: Wait between rate-limited retries when the server sends no ``Retry-After``.
 _RATE_LIMIT_FALLBACK_WAIT = 5.0
+
+#: Floor for a server-sent ``Retry-After``. ``Retry-After: 0`` is a legal value
+#: meaning "retry now", and a proxy can even send a negative one; taken literally
+#: either turns every retry loop in this client into a tight loop that re-sends the
+#: same multipart body as fast as the link allows — for up to ``rate_limit_max_wait``
+#: seconds, with tens of megabytes of files on each pass. A floor makes a retry a
+#: retry instead of a flood, and costs nothing when the server means it.
+_MIN_RETRY_AFTER = 1.0
 
 
 def _ensure_writable_dir(dest_dir: str) -> None:
@@ -43,22 +61,26 @@ def _ensure_writable_dir(dest_dir: str) -> None:
     reports writable for directories nothing can be written to. Creating a real
     file is the same operation ``download`` will do a few seconds later, so it is
     the same answer.
+
+    The probe goes through ``tempfile.mkstemp``, which creates a randomly named file
+    with ``O_CREAT | O_EXCL``. A predictable name opened for writing would follow —
+    and truncate — whatever already sits at that path, including a symlink someone
+    left in a shared output directory. Only the entry this call actually created is
+    removed afterwards.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    probe = os.path.join(dest_dir, f".image2ppt-write-test-{os.getpid()}")
     try:
-        with open(probe, "wb"):
-            pass
+        fd, probe = tempfile.mkstemp(prefix=".image2ppt-write-test-", dir=dest_dir)
     except OSError as exc:
         raise OSError(
             f"cannot write to dest_dir {dest_dir!r} ({exc.strerror or exc}); "
             "nothing was submitted"
         ) from exc
-    finally:
-        try:
-            os.remove(probe)
-        except OSError:
-            pass  # never created, or already gone: nothing to clean up
+    os.close(fd)
+    try:
+        os.remove(probe)
+    except OSError:
+        pass  # already gone: nothing to clean up
 
 
 def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
@@ -133,7 +155,9 @@ class Image2PPTClient:
         self.timeout = timeout
         self.rate_limit_max_wait = max(0.0, rate_limit_max_wait)
         self._session = session or requests.Session()
-        self._session.headers.update({"Authorization": f"Bearer {api_key}"})
+        self._session.headers.update(
+            {"Authorization": f"Bearer {api_key}", "User-Agent": _USER_AGENT}
+        )
 
     # ----- public methods ---------------------------------------------- #
     def submit(
@@ -146,7 +170,7 @@ class Image2PPTClient:
         """Submit a batch of files and create a conversion job.
 
         Checked locally before anything is uploaded: the files must add up to at
-        most 45MB and at most 50 pages. Over either limit this raises without
+        most 40MB and at most 50 pages. Over either limit this raises without
         opening a connection — going over the size cap on the wire does not come
         back as a clean error, it comes back as a dead connection.
 
@@ -159,7 +183,9 @@ class Image2PPTClient:
 
         Args:
             paths: Local file paths (one or more). Supports png/jpeg/webp/gif/pdf,
-                each file <= 35MB, and <= 45MB of file content per request. An
+                each file <= 35MB, and <= 40MB of file content per request (the
+                server's cap is 45MB on the whole HTTP body; the gap is the
+                multipart envelope). An
                 image is 1 page, a PDF is its page count; the total must be
                 <= 50 pages. For more files than one request can hold, use
                 ``submit_all`` / ``convert_all``.
@@ -246,9 +272,9 @@ class Image2PPTClient:
             One pending ``Job`` per batch, in batch order.
 
         Raises:
-            InvalidFileError: A single file is over the per-request limit on its
-                own, so no batching can carry it. Plus the same errors as
-                ``submit`` for each batch.
+            InvalidFileError: A single file is over the 35MB per-file limit, so
+                no batching can carry it. Plus the same errors as ``submit`` for
+                each batch.
             RateLimitedError: Still rate limited after ``rate_limit_max_wait``
                 seconds of waiting.
         """
@@ -342,6 +368,14 @@ class Image2PPTClient:
     def download(self, job_id: str, dest_path: str) -> str:
         """Stream a completed job's PPTX to ``dest_path``; return that path.
 
+        **``dest_path`` either holds a complete deck or is left exactly as it was.**
+        The bytes go to a temporary file beside it and are renamed into place once
+        the last one arrives, so a connection dropped mid-download cannot leave a
+        truncated ``.pptx`` — nor destroy a good deck that was already there. That
+        matters most for ``convert_all``, whose contract is "the decks already
+        downloaded stay on disk": a half-written ``part-02.pptx`` would be indexed
+        as one of them.
+
         Raises NotReadyError (409) if the job isn't done, JobNotFoundError (404) if
         it doesn't exist, OutputExpiredError (410) if the deliverable was reaped.
         """
@@ -353,10 +387,25 @@ class Image2PPTClient:
         try:
             if not resp.ok:
                 self._raise_for_error(resp)
-            with open(dest_path, "wb") as out:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if chunk:
-                        out.write(chunk)
+            # Same directory as the destination, so the rename is atomic rather than
+            # a cross-filesystem copy.
+            fd, partial = tempfile.mkstemp(
+                prefix=f".{os.path.basename(dest_path)}.",
+                suffix=".part",
+                dir=os.path.dirname(dest_path) or ".",
+            )
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            out.write(chunk)
+                os.replace(partial, dest_path)
+            except BaseException:
+                try:
+                    os.remove(partial)
+                except OSError:
+                    pass  # already gone
+                raise
         finally:
             resp.close()
         return dest_path
@@ -376,9 +425,9 @@ class Image2PPTClient:
         Arguments mirror ``submit`` and ``wait``. For the synchronous
         "give me a batch of images, hand me back a PPTX" case.
 
-        One job, one PPTX — the files must fit in a single submission (45MB,
-        50 pages). For more than that, ``convert_all`` splits the pile and writes
-        one PPTX per batch.
+        One job, one PPTX — the files must fit in a single submission (40MB of
+        file content, 50 pages). For more than that, ``convert_all`` splits the pile
+        and writes one PPTX per batch.
         """
         job = self.submit(paths, locale=locale, aspect_ratio=aspect_ratio)
         completed = self.wait(job.job_id, poll_interval=poll_interval, timeout=timeout)
@@ -580,11 +629,26 @@ class Image2PPTClient:
                 handle.close()
 
     def _guess_mime(self, filename: str) -> str:
+        """MIME type for a supported extension; refuse anything else locally.
+
+        ``_MIME_BY_EXT`` is what the API accepts. Guessing a type for anything else
+        meant a ``.txt`` or ``.docx`` was treated as PDF-like, given a batch of its
+        own and uploaded, only to come back ``INVALID_FILE`` — and in ``submit_all``
+        the batches ahead of it were already jobs with credits reserved. The
+        supported set is known locally, so this is a failure that can cost nothing.
+
+        The trade-off is deliberate: a format the service starts accepting is
+        refused here until this list is updated and released.
+        """
         ext = os.path.splitext(filename)[1].lower()
-        if ext in self._MIME_BY_EXT:
+        try:
             return self._MIME_BY_EXT[ext]
-        guessed, _ = mimetypes.guess_type(filename)
-        return guessed or "application/octet-stream"
+        except KeyError:
+            raise InvalidFileError(
+                f"{filename!r} is not a supported file type; this client accepts "
+                f"{', '.join(sorted(self._MIME_BY_EXT))}. Nothing was uploaded",
+                code="INVALID_FILE",
+            ) from None
 
     def _sleep_until(self, deadline: float, seconds: float, job_id: str) -> None:
         """Sleep ``seconds``, but never past ``deadline``; raise TimeoutError if past."""
@@ -622,10 +686,20 @@ class Image2PPTClient:
 
     @staticmethod
     def _parse_retry_after(value: Optional[str]) -> Optional[float]:
-        """Parse the Retry-After header as seconds (contract: integer seconds)."""
+        """Parse the Retry-After header as seconds (contract: integer seconds).
+
+        Anything unusable comes back as ``None`` so the caller falls back to its own
+        wait: a missing header, an HTTP-date, ``nan``/``inf``, or a negative value
+        (which additionally made ``time.sleep`` raise ``ValueError`` out of
+        ``submit_all``). A usable value is floored at ``_MIN_RETRY_AFTER`` — see that
+        constant for why zero cannot be taken literally.
+        """
         if not value:
             return None
         try:
-            return float(value)
+            seconds = float(value)
         except (TypeError, ValueError):
             return None
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return max(seconds, _MIN_RETRY_AFTER)

@@ -16,19 +16,22 @@ from PIL import Image
 
 from image2ppt import (
     MAX_FILE_BYTES,
+    MAX_FILE_CONTENT_BYTES,
     MAX_PAGES_PER_JOB,
-    MAX_UPLOAD_BYTES,
     AuthenticationError,
     Image2PPTClient,
     Image2PPTError,
     Image2PPTTimeoutError,
     InsufficientCreditsError,
+    InvalidAspectRatioError,
     InvalidFileError,
     Job,
     JobFailedError,
     JobNotFoundError,
     MalformedUploadError,
+    NoFilesError,
     NotReadyError,
+    PageRateExceededError,
     RateLimitedError,
     TooManySlidesError,
     UploadAbortedError,
@@ -265,14 +268,19 @@ def test_wait_raises_on_failed():
     assert exc.value.job.credits_refunded == 3
 
 
-def test_wait_backs_off_on_429():
+def test_wait_backs_off_on_429(monkeypatch):
     responses = iter([
         FakeResponse(429, {"error": {"code": "RATE_LIMITED", "message": "slow down"}}, headers={"Retry-After": "0"}),
         FakeResponse(200, {"jobId": "j", "status": "completed"}),
     ])
     handler = lambda *a, **k: next(responses)
+    # Fake clock: the header says 0, but the client floors it (see the floor tests
+    # below), so a real sleep would cost a second of suite time for nothing.
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
     job = make_client(handler).wait("j", poll_interval=0)
     assert job.is_completed
+    assert slept == [1.0]  # floored, not the literal 0 from the header
 
 
 def test_wait_timeout():
@@ -441,7 +449,7 @@ def exploding_handler(*_args, **_kwargs):
 def test_submit_refuses_oversized_batch_without_sending_anything(tmp_path):
     """Two individually-legal files that add up past the request cap: rejected
     before a connection is opened."""
-    half = MAX_UPLOAD_BYTES // 2
+    half = MAX_FILE_CONTENT_BYTES // 2
     files = [
         sparse_file(tmp_path, "a.pdf", half),
         sparse_file(tmp_path, "b.pdf", half + 1),
@@ -635,7 +643,10 @@ def rate_limited_response():
     )
 
 
-def test_submit_all_waits_out_a_rate_limit_and_retries_the_same_batch(tmp_path):
+def test_submit_all_waits_out_a_rate_limit_and_retries_the_same_batch(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("image2ppt.client.time.sleep", lambda _s: None)
     paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
     responses = iter([
         FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
@@ -843,3 +854,228 @@ def test_convert_all_leaves_no_probe_file_behind(tmp_path):
     )
 
     assert sorted(p.name for p in out_dir.iterdir()) == ["part-01.pptx"]
+
+
+# --------------------------------------------------------------------------- #
+# Retry-After sanitising
+#
+# The retry loops sleep for as long as the server asks. Taken literally, three
+# legal-looking header values turn that into a tight loop that re-sends the same
+# multipart body — tens of megabytes of files — as fast as the link allows, for as
+# long as the waiting budget lasts. These pin the floor that stops it.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "header, expected",
+    [
+        ("0", 1.0),  # legal ("retry now"), but literally zero is a flood
+        ("0.25", 1.0),  # sub-second is the same problem, just slower
+        ("12", 12.0),  # a real wait is passed through untouched
+        ("-1", None),  # nonsense from a proxy; also made time.sleep raise
+        ("nan", None),
+        ("inf", None),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", None),  # HTTP-date form: not seconds
+        ("", None),
+        (None, None),
+    ],
+)
+def test_retry_after_is_sanitised(header, expected):
+    assert Image2PPTClient._parse_retry_after(header) == expected
+
+
+def test_submit_all_never_busy_loops_on_retry_after_zero(tmp_path, monkeypatch):
+    """A 429 with ``Retry-After: 0`` must still wait, not re-upload immediately."""
+    paths = make_images(tmp_path, 2)
+    responses = iter([
+        FakeResponse(
+            429,
+            {"error": {"code": "RATE_LIMITED", "message": "slow"}},
+            headers={"Retry-After": "0"},
+        ),
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    client, _session = client_and_session(lambda *a, **k: next(responses))
+
+    jobs = client.submit_all(paths)
+
+    assert [job.job_id for job in jobs] == ["job_a"]
+    assert slept == [1.0]  # not 0: the retry is a retry, not a flood
+
+
+def test_submit_all_treats_a_negative_retry_after_as_missing(tmp_path, monkeypatch):
+    """A negative header used to reach ``time.sleep`` and raise ValueError."""
+    paths = make_images(tmp_path, 2)
+    responses = iter([
+        FakeResponse(
+            429,
+            {"error": {"code": "RATE_LIMITED", "message": "slow"}},
+            headers={"Retry-After": "-1"},
+        ),
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    client, _session = client_and_session(lambda *a, **k: next(responses))
+
+    jobs = client.submit_all(paths)
+
+    assert [job.job_id for job in jobs] == ["job_a"]
+    assert slept == [5.0]  # the documented fallback, not a crash
+
+
+# --------------------------------------------------------------------------- #
+# Destination write probe
+# --------------------------------------------------------------------------- #
+def test_write_probe_does_not_touch_an_existing_file(tmp_path):
+    """The probe must never open a path it did not create.
+
+    A predictable probe name opened for writing truncates whatever is already
+    there — including a symlink someone left in a shared output directory.
+    """
+    from image2ppt.client import _ensure_writable_dir
+
+    dest = tmp_path / "decks"
+    dest.mkdir()
+    victim = tmp_path / "important.txt"
+    victim.write_text("do not truncate me")
+    # A symlink named the way a predictable probe would be named.
+    (dest / f".image2ppt-write-test-{os.getpid()}").symlink_to(victim)
+
+    _ensure_writable_dir(str(dest))
+
+    assert victim.read_text() == "do not truncate me"
+
+
+def test_write_probe_leaves_nothing_behind(tmp_path):
+    dest = tmp_path / "decks"
+    from image2ppt.client import _ensure_writable_dir
+
+    _ensure_writable_dir(str(dest))
+
+    assert list(dest.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# Unsupported file types
+#
+# The accepted extensions are known locally, so uploading a .txt just to be told
+# INVALID_FILE is a round trip that never had to happen — and in submit_all the
+# batches ahead of it are already jobs with credits reserved by the time the server
+# answers.
+# --------------------------------------------------------------------------- #
+def test_submit_refuses_an_unsupported_extension_without_sending_anything(tmp_path):
+    doc = tmp_path / "notes.txt"
+    doc.write_bytes(b"hello")
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(InvalidFileError) as exc:
+        client.submit([str(doc)])
+
+    assert exc.value.code == "INVALID_FILE"
+    assert "notes.txt" in exc.value.message
+    assert len(session.calls) == 0
+
+
+def test_submit_all_refuses_before_paying_for_the_batches_ahead(tmp_path):
+    """The unsupported file is last; the batches before it must not be submitted."""
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
+    doc = tmp_path / "notes.docx"
+    doc.write_bytes(b"hello")
+    client, session = client_and_session(exploding_handler)
+
+    with pytest.raises(InvalidFileError) as exc:
+        client.submit_all([*paths, str(doc)])
+
+    assert exc.value.code == "INVALID_FILE"
+    assert len(session.calls) == 0  # nothing created, nothing charged
+
+
+# --------------------------------------------------------------------------- #
+# Download is all-or-nothing
+# --------------------------------------------------------------------------- #
+class ExplodingBody(FakeResponse):
+    """A 200 whose body dies partway through, like a dropped connection."""
+
+    def iter_content(self, chunk_size=65536):
+        yield b"PK\x03\x04 first half"
+        raise requests.ConnectionError("connection reset mid-download")
+
+
+def test_download_leaves_no_truncated_file_behind(tmp_path):
+    dest = tmp_path / "deck.pptx"
+    client = make_client(lambda *a, **k: ExplodingBody(200))
+
+    with pytest.raises(requests.ConnectionError):
+        client.download("job_a", str(dest))
+
+    assert not dest.exists()  # a half deck would open in a listing and nowhere else
+    assert list(tmp_path.iterdir()) == []  # and no leftover partial either
+
+
+def test_a_failed_download_does_not_destroy_the_deck_already_there(tmp_path):
+    """Writing straight to the destination would truncate it on the first chunk.
+
+    ``convert_all`` reuses fixed names (``part-01.pptx``, ...), so a re-run whose
+    download dies partway would replace a good deck from the previous run with a
+    broken one — or with nothing.
+    """
+    dest = tmp_path / "deck.pptx"
+    dest.write_bytes(b"PREVIOUS-GOOD-DECK")
+    client = make_client(lambda *a, **k: ExplodingBody(200))
+
+    with pytest.raises(requests.ConnectionError):
+        client.download("job_a", str(dest))
+
+    assert dest.read_bytes() == b"PREVIOUS-GOOD-DECK"
+    assert [f.name for f in tmp_path.iterdir()] == ["deck.pptx"]
+
+
+def test_download_writes_the_whole_deck_on_success(tmp_path):
+    dest = tmp_path / "deck.pptx"
+    client = make_client(lambda *a, **k: FakeResponse(200, content=b"DECK-BYTES"))
+
+    assert client.download("job_a", str(dest)) == str(dest)
+    assert dest.read_bytes() == b"DECK-BYTES"
+    assert [f.name for f in tmp_path.iterdir()] == ["deck.pptx"]
+
+
+# --------------------------------------------------------------------------- #
+# Client identification
+#
+# Without a User-Agent the service cannot tell which SDK version made a request, so
+# it can never warn anyone that theirs is about to stop working.
+# --------------------------------------------------------------------------- #
+def test_requests_identify_the_sdk_and_its_version():
+    import image2ppt
+
+    session = FakeSession(lambda *a, **k: FakeResponse(200, {"email": "e", "credits": 1}))
+    Image2PPTClient("i2p_live_test", session=session).account()
+
+    assert session.headers["User-Agent"] == f"image2ppt-python/{image2ppt.__version__}"
+
+
+# --------------------------------------------------------------------------- #
+# Error-code mapping for the codes the contract lists
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("NO_FILES", NoFilesError),
+        ("INVALID_ASPECT_RATIO", InvalidAspectRatioError),
+        ("PAGE_RATE_EXCEEDED", PageRateExceededError),
+    ],
+)
+def test_documented_400_codes_get_their_own_type(tmp_path, code, expected):
+    """These used to land on the base class, so `except InvalidFileError` missed
+    them and callers had to compare strings."""
+    paths = make_images(tmp_path, 1)
+    client = make_client(
+        lambda *a, **k: FakeResponse(400, {"error": {"code": code, "message": "no"}})
+    )
+
+    with pytest.raises(expected) as exc:
+        client.submit(paths)
+
+    assert exc.value.code == code
+    assert isinstance(exc.value, Image2PPTError)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from image2ppt import (
-    BATCH_TARGET_BYTES,
+    MAX_FILE_CONTENT_BYTES,
     MAX_FILE_BYTES,
     MAX_PAGES_PER_JOB,
     MAX_UPLOAD_BYTES,
@@ -55,23 +55,39 @@ def test_a_file_one_byte_over_the_per_file_cap_is_refused():
 def test_the_per_file_cap_is_stricter_than_the_request_cap():
     """Guards the reason this check exists: without it, a file between the two
     caps looks submittable to the batch planner and never is."""
-    assert MAX_FILE_BYTES < MAX_UPLOAD_BYTES
-    between = (MAX_FILE_BYTES + MAX_UPLOAD_BYTES) // 2
+    assert MAX_FILE_BYTES < MAX_FILE_CONTENT_BYTES
+    between = (MAX_FILE_BYTES + MAX_FILE_CONTENT_BYTES) // 2
     check_submission(between, 1)  # the request cap is happy with it
     with pytest.raises(InvalidFileError):
         check_file_size("between.pdf", between)  # the file cap is not
+
+
+def test_file_content_cap_leaves_room_for_the_multipart_envelope():
+    """The server measures the whole HTTP body; this client measures file bytes.
+
+    If the two numbers were equal, a submission of exactly the server's cap in file
+    content would go on the wire as that plus the multipart envelope — over the cap,
+    and over it in the way that has no error code, only a dead connection. The gap is
+    the whole reason both numbers exist.
+    """
+    assert MAX_FILE_CONTENT_BYTES < MAX_UPLOAD_BYTES
+    check_submission(MAX_FILE_CONTENT_BYTES, 1)  # right at what this client allows
+    with pytest.raises(InvalidFileError) as exc:
+        # Under the server's request cap, but not once the envelope is added.
+        check_submission(MAX_UPLOAD_BYTES, 1)
+    assert exc.value.code == "PAYLOAD_TOO_LARGE"
 
 
 # --------------------------------------------------------------------------- #
 # check_submission — the pre-flight gate
 # --------------------------------------------------------------------------- #
 def test_check_accepts_a_submission_at_both_limits():
-    check_submission(MAX_UPLOAD_BYTES, MAX_PAGES_PER_JOB)  # exactly at the cap: fine
+    check_submission(MAX_FILE_CONTENT_BYTES, MAX_PAGES_PER_JOB)  # exactly at the cap
 
 
 def test_check_rejects_one_byte_over_the_size_cap():
     with pytest.raises(InvalidFileError) as exc:
-        check_submission(MAX_UPLOAD_BYTES + 1, 1)
+        check_submission(MAX_FILE_CONTENT_BYTES + 1, 1)
     assert exc.value.code == "PAYLOAD_TOO_LARGE"
 
 
@@ -100,20 +116,20 @@ def test_single_oversized_file_is_unbatchable():
 def test_a_file_between_the_two_caps_is_refused_by_the_planner():
     """The regression this guards: it fits the request cap, so the planner used to
     build a batch for it that the server would reject every single time."""
-    between = (MAX_FILE_BYTES + MAX_UPLOAD_BYTES) // 2
+    between = (MAX_FILE_BYTES + MAX_FILE_CONTENT_BYTES) // 2
     with pytest.raises(InvalidFileError):
         plan_batches([img("doomed.pdf", between)])
 
 
 def test_batch_filled_exactly_to_the_target_stays_one_batch():
-    half = BATCH_TARGET_BYTES // 2
-    batches = plan_batches([img("a", half), img("b", BATCH_TARGET_BYTES - half)])
+    half = MAX_FILE_CONTENT_BYTES // 2
+    batches = plan_batches([img("a", half), img("b", MAX_FILE_CONTENT_BYTES - half)])
     assert names(batches) == [["a", "b"]]
 
 
 def test_one_byte_past_the_target_starts_a_second_batch():
-    half = BATCH_TARGET_BYTES // 2
-    batches = plan_batches([img("a", half), img("b", BATCH_TARGET_BYTES - half + 1)])
+    half = MAX_FILE_CONTENT_BYTES // 2
+    batches = plan_batches([img("a", half), img("b", MAX_FILE_CONTENT_BYTES - half + 1)])
     assert names(batches) == [["a"], ["b"]]
 
 
@@ -166,7 +182,11 @@ def test_format_bytes_does_not_round_small_overages_to_zero():
     否则错误消息会变成「45.0MB 超过 45.0MB（超了 0.0MB）」——自相矛盾，
     读起来像是这道检查本身坏了。真实联调时就是这么显示的。
     """
-    from image2ppt._limits import MAX_UPLOAD_BYTES, check_submission, format_bytes
+    from image2ppt._limits import (
+        MAX_FILE_CONTENT_BYTES,
+        check_submission,
+        format_bytes,
+    )
     from image2ppt.errors import InvalidFileError
 
     assert format_bytes(1) == "1B"
@@ -174,7 +194,7 @@ def test_format_bytes_does_not_round_small_overages_to_zero():
     assert format_bytes(5 * 1024 * 1024) == "5.0MB"
 
     try:
-        check_submission(total_bytes=MAX_UPLOAD_BYTES + 1, image_pages=1)
+        check_submission(total_bytes=MAX_FILE_CONTENT_BYTES + 1, image_pages=1)
     except InvalidFileError as exc:
         assert "0.0MB too much" not in str(exc)
     else:

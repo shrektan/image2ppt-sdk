@@ -57,10 +57,14 @@ console.log(email, "credits:", credits);
 - **Async.** `submit` resolves with a job id immediately; conversion runs in the background. A single page typically takes ~2 minutes; 90% of jobs finish within 3.
 - **One job = one PPTX.** All files in a submission are merged into a single deck, in upload order.
 - **Billed per page.** 1 page = 1 credit, reserved at submit and settled on completion. If some pages fail but others succeed, the job still completes with the good pages and the failed pages' credits are refunded (`creditsRefunded`).
-- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request.
+- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 40MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**, which here means the size on disk — this SDK uploads files as-is. (The Python SDK pre-compresses images first and counts the compressed size, so a 40MB PNG that compresses to 1MB passes there and is refused here — the two clients agree on the limits, not always on the verdict for one file.)
+- **Why 40MB and not the server's 45MB.** The server's cap is on the whole HTTP request; this check counts file bytes. What goes on the wire is a multipart body — boundaries, per-part headers, filenames — so it is always larger than the files it carries. Counting file bytes against 45MB with no gap would let a submission through that lands just over the cap on the wire, which is the failure this whole check exists to prevent. `submit()` and the batch planner use the same 40MB on purpose.
+- **Only the formats the API accepts.** `png`, `jpg`/`jpeg`, `webp`, `gif`, `pdf`. Anything else throws `InvalidFileError` locally — the batch calls check every file before submitting the first one, so an unsupported file at the end of the pile cannot leave you paying for the batches ahead of it.
 - **The local page check is a lower bound.** The client does not parse PDFs, so it counts each one as *at least* 1 page. That is enough to refuse combinations that can never work (50 images plus any PDF is already 51 pages), but a submission that passes locally can still come back `TOO_MANY_SLIDES` — a 30-page PDF counts as 1 here and 30 on the server.
-- **Going over the request limit is not a polite error.** Past 45MB the connection is cut before the API can answer, so the caller sees a write timeout or a broken pipe instead of a status code. The client therefore checks locally *before* uploading and throws `InvalidFileError` (`code: "PAYLOAD_TOO_LARGE"`) without sending a byte.
+- **Going over the request limit is not a polite error.** Past the server’s 45MB request cap the connection is cut before the API can answer, so the caller sees a write timeout or a broken pipe instead of a status code. The client therefore checks locally *before* uploading — against its own 40MB of file content, see above — and throws `InvalidFileError` (`code: "PAYLOAD_TOO_LARGE"`) without sending a byte.
 - **A failed submission is never retried automatically.** A network error only tells you the exchange broke — not whether the request body arrived. The job may not exist, or it may exist with credits already reserved and only the response lost. Retrying the second case charges you twice, and there is no idempotency key to tell them apart, so the error is thrown as-is. Check `account()` or your job list before resending. (Rate limits *are* retried by `submitAll()` / `convertAll()`: a 429 is the server saying it did not take the submission.)
+- **Downloads are all-or-nothing.** `download()` writes to a temporary file next to the destination and renames it into place at the end, so a dropped connection cannot leave a truncated `.pptx` behind — or destroy a good deck already sitting at that path.
+- **Every request identifies the client** with a `User-Agent` of `image2ppt-node/<version>`, so a bug report and the server-side logs agree on which version you were running.
 - **Time units.** `pollIntervalMs` and `timeoutMs` are in **milliseconds** (idiomatic for Node's timers).
 
 > The Node SDK uploads files as-is; the server compresses them. (The Python SDK additionally pre-compresses images client-side to save bandwidth — a future addition here.)
@@ -120,10 +124,13 @@ Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `m
 | Class | HTTP | code |
 |---|---|---|
 | `AuthenticationError` | 401 / 403 | `INVALID_API_KEY`, `API_KEY_REQUIRED`, `ACCOUNT_DELETED` |
-| `InvalidFileError` | 400 / 413 | `INVALID_FILE`, `PAYLOAD_TOO_LARGE` (the size check also fires locally, before upload) |
+| `InvalidFileError` | 400 / 413 | `INVALID_FILE`, `INVALID_PDF`, `PAYLOAD_TOO_LARGE` (the size checks also fire locally, before upload) |
 | `UploadAbortedError` | 400 | `UPLOAD_ABORTED` — the body never finished arriving and the server took nothing, so **resending the same files is safe** |
 | `MalformedUploadError` | 400 | `MALFORMED_UPLOAD` — the body was not valid `multipart/form-data`; **resending identical bytes will not help** |
+| `NoFilesError` | 400 | `NO_FILES` — no files reached the server |
+| `InvalidAspectRatioError` | 400 | `INVALID_ASPECT_RATIO` — use `auto`, `16:9`, or `4:3` |
 | `TooManySlidesError` | 400 | `TOO_MANY_SLIDES` |
+| `PageRateExceededError` | 400 | `PAGE_RATE_EXCEEDED` — this one submission has more pages than a minute's quota, so waiting will not help; split it |
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retryAfter`) |
 | `JobNotFoundError` | 404 | `JOB_NOT_FOUND` |

@@ -14,8 +14,8 @@ See https://github.com/shrektan/image2ppt-sdk for docs and examples.
 from __future__ import annotations
 
 from ._limits import (
-    BATCH_TARGET_BYTES,
     MAX_FILE_BYTES,
+    MAX_FILE_CONTENT_BYTES,
     MAX_PAGES_PER_JOB,
     MAX_UPLOAD_BYTES,
     UploadItem,
@@ -29,19 +29,21 @@ from .errors import (
     Image2PPTError,
     Image2PPTTimeoutError,
     InsufficientCreditsError,
+    InvalidAspectRatioError,
     InvalidFileError,
     JobFailedError,
     JobNotFoundError,
     MalformedUploadError,
+    NoFilesError,
     NotReadyError,
     OutputExpiredError,
+    PageRateExceededError,
     RateLimitedError,
     TooManySlidesError,
     UploadAbortedError,
 )
 from .models import Job
-
-__version__ = "0.2.0"
+from ._version import __version__
 
 __all__ = [
     "Image2PPTClient",
@@ -49,7 +51,7 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "MAX_FILE_BYTES",
     "MAX_UPLOAD_BYTES",
-    "BATCH_TARGET_BYTES",
+    "MAX_FILE_CONTENT_BYTES",
     "MAX_PAGES_PER_JOB",
     "UploadItem",
     "check_file_size",
@@ -60,6 +62,9 @@ __all__ = [
     "InvalidFileError",
     "UploadAbortedError",
     "MalformedUploadError",
+    "NoFilesError",
+    "InvalidAspectRatioError",
+    "PageRateExceededError",
     "TooManySlidesError",
     "InsufficientCreditsError",
     "RateLimitedError",

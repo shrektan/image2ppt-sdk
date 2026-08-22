@@ -70,6 +70,30 @@ export class UploadAbortedError extends Image2PPTError {}
  */
 export class MalformedUploadError extends Image2PPTError {}
 
+/**
+ * The request carried no files at all (400 `NO_FILES`). Using this SDK you should
+ * never see it — `submit` refuses an empty `paths` before opening a connection.
+ */
+export class NoFilesError extends Image2PPTError {}
+
+/**
+ * `aspectRatio` was not one of the accepted values (400 `INVALID_ASPECT_RATIO`).
+ * Accepted: `auto` (default), `16:9`, `4:3`. Nothing was created and nothing was
+ * charged — fix the value and submit again.
+ */
+export class InvalidAspectRatioError extends Image2PPTError {}
+
+/**
+ * One submission holds more pages than the per-minute quota allows (400
+ * `PAGE_RATE_EXCEEDED`).
+ *
+ * Distinct from `RateLimitedError`: a 429 means "not right now, try again in N
+ * seconds" and the same submission will eventually go through. `PAGE_RATE_EXCEEDED`
+ * means this submission can *never* fit the window whole, so waiting does not help —
+ * split it, e.g. with `submitAll` / `convertAll`.
+ */
+export class PageRateExceededError extends Image2PPTError {}
+
 /** The submission exceeds the 50-page-per-job limit (400 TOO_MANY_SLIDES). */
 export class TooManySlidesError extends Image2PPTError {}
 
@@ -140,6 +164,9 @@ const CODE_TO_CLASS: Record<string, new (m: string, i?: ErrorInit) => Image2PPTE
   PAYLOAD_TOO_LARGE: InvalidFileError,
   UPLOAD_ABORTED: UploadAbortedError,
   MALFORMED_UPLOAD: MalformedUploadError,
+  NO_FILES: NoFilesError,
+  INVALID_ASPECT_RATIO: InvalidAspectRatioError,
+  PAGE_RATE_EXCEEDED: PageRateExceededError,
   TOO_MANY_SLIDES: TooManySlidesError,
   INSUFFICIENT_CREDITS: InsufficientCreditsError,
   RATE_LIMITED: RateLimitedError,

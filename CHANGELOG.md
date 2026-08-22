@@ -10,11 +10,18 @@ on the wire, and can split a large pile of files into batches on their own.
 
 ### Added
 - **Both clients** — a pre-flight size check on `submit()`. The files in one
-  request must add up to ≤ 45MB; over that the client raises `InvalidFileError`
+  request must add up to ≤ 40MB; over that the client raises `InvalidFileError`
   (`PAYLOAD_TOO_LARGE`) **before opening a connection**. This limit could not be
   reported properly from the server side: an oversized request is cut off by the
   network before the API can answer, so callers used to see a bare write timeout
   or broken pipe with no error code.
+
+  The number is 40MB rather than the server's 45MB because the two measure
+  different things: the server caps the whole HTTP request, this check counts file
+  bytes, and what travels on the wire is a multipart body — always larger than the
+  files it carries. `submit()` and the batch planner now share the one number
+  (`MAX_FILE_CONTENT_BYTES`); two different answers to "how much fits in one
+  request" is how a client ends up refusing what it would happily have planned.
 - **Both clients** — `submit_all()` / `submitAll()` and `convert_all()` /
   `convertAll()`: split files into batches that each fit a request (≤ 40MB of file
   content, ≤ 50 images, every PDF in a batch of its own) and create one job per
@@ -31,7 +38,7 @@ on the wire, and can split a large pile of files into batches on their own.
   was certain to be rejected server-side. The check is a lower bound, not the
   server's verdict — the SDKs do not parse PDFs — and the docs now say so.
 - **Both clients** — the limits and the batch planner are public: `MAX_FILE_BYTES`,
-  `MAX_UPLOAD_BYTES`, `BATCH_TARGET_BYTES`, `MAX_PAGES_PER_JOB`, `UploadItem`,
+  `MAX_UPLOAD_BYTES`, `MAX_FILE_CONTENT_BYTES`, `MAX_PAGES_PER_JOB`, `UploadItem`,
   `check_file_size()` / `checkFileSize()`, `check_submission()` /
   `checkSubmission()`, `plan_batches()` / `planBatches()`.
 - **Both clients** — **submissions are never retried automatically**, and the
@@ -61,6 +68,27 @@ on the wire, and can split a large pile of files into batches on their own.
   (`400 MALFORMED_UPLOAD`) means the body was not valid `multipart/form-data` —
   **resending identical bytes will not help**.
 
+- **Both clients** — three more codes from the contract get their own exception
+  types instead of landing on the base class, where callers had to compare strings
+  to tell them apart: `NoFilesError` (`NO_FILES`), `InvalidAspectRatioError`
+  (`INVALID_ASPECT_RATIO`) and `PageRateExceededError` (`PAGE_RATE_EXCEEDED`). The
+  last one is worth its own type precisely because it looks like rate limiting and
+  is not: a 429 means "not right now", while `PAGE_RATE_EXCEEDED` means this one
+  submission can never fit a minute's quota, so waiting does not help — split it.
+- **Both clients** — unsupported file types are refused **locally**. Anything
+  outside `png` / `jpg` / `jpeg` / `webp` / `gif` / `pdf` raises `InvalidFileError`
+  before a connection is opened. It used to be uploaded as an unknown type and
+  rejected server-side, which in `submit_all()` / `submitAll()` meant the batches
+  ahead of it were already jobs with credits reserved by the time the answer came
+  back. The accepted set is known locally, so that failure can cost nothing. The
+  trade-off is deliberate: a format the service starts accepting is refused here
+  until the SDK is updated and released.
+- **Both clients** — every request now carries a `User-Agent`
+  (`image2ppt-python/<version>`, `image2ppt-node/<version>`). Without it the
+  service cannot tell which client version made a call, so it can never warn anyone
+  that theirs is about to stop working. This is the identifier half only; acting on
+  it needs the service side.
+
 ### Fixed
 - **API docs** — four long-standing inaccuracies in this repo's copy of the API
   reference, each of which could break real client code. `downloadUrl` was
@@ -78,6 +106,32 @@ on the wire, and can split a large pile of files into batches on their own.
   which silently succeeds on an existing read-only one — meant an unusable
   destination failed only once every job existed with credits reserved and nowhere
   to put the output.
+- **Both clients** — the writable-destination probe no longer opens a predictable
+  path. It used to create `.image2ppt-write-test-<pid>` with a plain write, which
+  **truncates whatever is already at that path** — including a symlink left in a
+  shared output directory, pointing anywhere the process can write. The probe now
+  has a random name and is created exclusively (`O_EXCL` / `wx`), and only the entry
+  the call itself created is removed.
+- **Both clients** — a `Retry-After` of `0` (a legal value meaning "retry now"), a
+  sub-second value, or a negative one no longer turns the rate-limit retry into a
+  tight loop that re-sends the same multipart body — tens of megabytes of files —
+  as fast as the link allows, for as long as the waiting budget lasts. Usable values
+  are floored at one second; unusable ones (negative, `nan`, `inf`, an HTTP-date)
+  fall back to the documented 5s wait. In Python a negative value additionally
+  reached `time.sleep` and raised a bare `ValueError` out of `submit_all()`.
+- **Both clients** — `download()` is all-or-nothing. It writes to a temporary file
+  beside the destination and renames it into place once the last byte arrives, so a
+  connection dropped mid-download can no longer leave a truncated `.pptx` — nor
+  destroy a good deck already at that path. `convert_all()` / `convertAll()` reuse
+  fixed names (`part-01.pptx`, ...), so a re-run used to be able to replace a
+  finished deck with a broken one, and its contract ("the decks already downloaded
+  stay on disk") would have counted the broken one.
+- **Both clients** — `INVALID_PDF` is now listed in the README error tables. It has
+  always mapped to `InvalidFileError`; only the table was missing it.
+- **Python** — the docs now say that the 35MB per-file check counts the size
+  *after* client-side compression, while the Node client counts the size on disk.
+  The two clients enforce the same limits but can disagree about one file, and the
+  READMEs used to describe the check in identical words as if they could not.
 - **Python** — `__version__` said `0.1.0` while the package was `0.1.1`. Both now
   come from the same release number, with a test guarding against the drift.
 
