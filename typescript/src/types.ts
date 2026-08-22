@@ -18,6 +18,14 @@ export interface ClientOptions {
   timeoutMs?: number;
   /** Inject a custom fetch (for testing). Defaults to the global `fetch` (Node 18+). */
   fetch?: typeof fetch;
+  /**
+   * Total ms `submitAll` / `convertAll` may spend **waiting out rate limits** across
+   * the whole call (default 1_800_000 = 30 min). Only waiting counts against it — the
+   * time the uploads themselves take does not, so a slow link cannot quietly turn this
+   * into "do not wait at all". Submitting a large pile *will* hit the per-minute page
+   * quota, so waiting is the normal path, not an error.
+   */
+  rateLimitMaxWaitMs?: number;
 }
 
 export interface SubmitOptions {

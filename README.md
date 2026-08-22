@@ -33,6 +33,12 @@ const job = await client.convert(["slide1.png", "report.pdf"], "out.pptx");
 console.log("done, credits used:", job.creditsUsed);
 ```
 
+## More files than one request can hold
+
+One request carries at most 45MB of file content and 50 pages, and one file at most 35MB. Both SDKs check all three **locally, before uploading** — going over the request limit is not a polite error, the connection is simply cut before the API can answer.
+
+For a pile bigger than that, `convert_all()` / `convertAll()` splits it into batches and writes **one PPTX per batch** (there is no server-side merge). `convert()` is unchanged: one job, one deck. Details in each SDK's README.
+
 ## Getting an API key
 
 1. Sign in at [image2ppt.com](https://image2ppt.com).

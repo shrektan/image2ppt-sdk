@@ -1,9 +1,9 @@
 > 🌐 **English** (current) · [中文](./api.zh.md)
 
-# image2ppt API
+# Image2PPT API
 
 Batch-convert images and PDFs into **editable** PowerPoint (`.pptx`). You upload a
-batch of files; image2ppt reconstructs the layout with AI (OCR, vision,
+batch of files; Image2PPT reconstructs the layout with AI (OCR, vision,
 segmentation) into editable text and shapes, and hands you back one `.pptx`.
 
 This doc is for developers integrating the API — read it top to bottom and you're
@@ -28,7 +28,7 @@ result.
 
 ### Get a key
 
-Sign in to image2ppt, open the **Developer / API** page from the account menu, and
+Sign in to Image2PPT, open the **Developer / API** page from the account menu, and
 create a key under **API Keys**. You'll get a string like:
 
 ```
@@ -90,12 +90,31 @@ Upload a batch of files and create a conversion job. The request body is
 
 | Field | Required | Description |
 |---|---|---|
-| `files` | Yes | One or more files. `png` / `jpeg` / `webp` / `gif` / `pdf`, **each ≤ 35MB**. Repeat the `files` field name to send multiple files. |
+| `files` | Yes | One or more files. `png` / `jpeg` / `webp` / `gif` / `pdf`, **each ≤ 35MB and ≤ 45MB total file content per request**. Repeat the `files` field name to send multiple files. |
 | `locale` | No | Output locale: `zh-CN` (default) or `en`. |
 | `aspectRatio` | No | Slide ratio: `auto` (default, follows the source) / `16:9` / `4:3`. |
 
-**How pages are counted**: an image is 1 page; a PDF counts as its actual page
-count. The **total per submission must be ≤ 50 pages**.
+**A submission has two independent limits, and it must satisfy both**:
+
+| Limit | Value | Notes |
+|---|---|---|
+| **Total pages** | **≤ 50 pages** | An image is 1 page; a PDF counts as its actual page count. |
+| **Total size** | **≤ 45MB** | The combined file content of one request. A single file is separately capped at 35MB. |
+
+They are independent: **23 high-resolution images are only 23 pages, yet easily
+exceed 45MB**. Being under the page limit does not mean the request will be
+accepted.
+
+Exceeding the size limit returns `413 PAYLOAD_TOO_LARGE`. **When you see it, send
+fewer files per request** — retrying the same payload will not succeed.
+
+The official SDKs offer two modes, and they behave differently. `submit()` /
+`convert()` send exactly the batch you hand them; they check size and page count
+locally before uploading, so an over-limit batch fails immediately instead of
+after a full upload — but they **do not split for you**. For automatic splitting
+use `submit_all()` / `convert_all()` (`submitAll()` / `convertAll()` in
+TypeScript), which divide the files into as many submissions as the size and page
+limits require, one job per submission.
 
 **Success** — `201 Created`
 
@@ -132,6 +151,9 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 | 400 | `INVALID_FILE` | Unsupported format, or a single file over 35MB. |
 | 400 | `TOO_MANY_SLIDES` | Total pages over 50. |
 | 402 | `INSUFFICIENT_CREDITS` | Not enough credits to cover this submission. |
+| 400 | `UPLOAD_ABORTED` | The upload was cut off before the body finished arriving. Retrying is fine; if it keeps happening the submission is probably too big — split it by the size limit above. |
+| 400 | `MALFORMED_UPLOAD` | The body is not valid `multipart/form-data`. A client-side framing problem — retrying will not help; check the boundary and per-part headers. |
+| 413 | `PAYLOAD_TOO_LARGE` | Total file content in one request exceeds 45MB. |
 | 429 | `RATE_LIMITED` | Rate limit hit — see [Rate limits](#rate-limits). |
 
 ---
@@ -148,11 +170,10 @@ Poll this endpoint for progress.
   "status": "processing",
   "progress": 45,
   "slideCount": 12,
-  "creditsUsed": 12,
+  "creditsUsed": 0,
   "creditsRefunded": 0,
-  "createdAt": "2026-07-07T08:00:00Z",
-  "completedAt": null,
-  "downloadUrl": null
+  "createdAt": "2026-07-07 08:00:00",
+  "completedAt": null
 }
 ```
 
@@ -165,8 +186,8 @@ Poll this endpoint for progress.
 | `slideCount` | Total pages. |
 | `creditsUsed` | Credits actually charged after settlement. |
 | `creditsRefunded` | Credits refunded for failed pages on partial success — see [Billing & refunds](#billing--refunds). |
-| `createdAt` / `completedAt` | Creation / completion time (`null` until complete). |
-| `downloadUrl` | Given **only when `completed`** — a relative path to the download endpoint; `null` otherwise. |
+| `createdAt` / `completedAt` | UTC creation / completion time in `YYYY-MM-DD HH:MM:SS` format (`completedAt` is `null` until complete). |
+| `downloadUrl` | Given **only when `completed` and the output is still retained** — a relative path to the download endpoint; omitted otherwise. |
 | `error` | Given **only when `failed`** — `{"code": "...", "message": "..."}`. |
 
 **A failed job looks like**
@@ -179,9 +200,8 @@ Poll this endpoint for progress.
   "slideCount": 12,
   "creditsUsed": 0,
   "creditsRefunded": 12,
-  "createdAt": "2026-07-07T08:00:00Z",
-  "completedAt": "2026-07-07T08:01:00Z",
-  "downloadUrl": null,
+  "createdAt": "2026-07-07 08:00:00",
+  "completedAt": "2026-07-07 08:01:00",
   "error": { "code": "CONVERSION_FAILED", "message": "Conversion failed, please retry later" }
 }
 ```
@@ -210,6 +230,7 @@ Once the job is complete, download the PPTX here.
 |---|---|---|
 | 409 | `NOT_READY` | Job isn't complete yet; the result isn't downloadable. Wait for `completed`. |
 | 410 | `OUTPUT_EXPIRED` | The result was cleaned up after its retention window — see [Retention](#retention). |
+| 416 | `RANGE_NOT_SATISFIABLE` | The requested `Range` starts beyond the file size; discard the stale resume offset and retry. |
 | 404 | `JOB_NOT_FOUND` | Job id doesn't exist or isn't owned by this account. |
 
 > <a id="retention"></a>**Retention**: the finished PPTX is **kept for 7 days** after
@@ -374,8 +395,12 @@ and full details on each exception are in the GitHub repo's README and examples.
 | 402 | `INSUFFICIENT_CREDITS` | Not enough available credits, or a zero balance (submit). |
 | 403 | `API_KEY_REQUIRED` | No valid API key present (submit). |
 | 403 | `ACCOUNT_DELETED` | Account has been deleted (submit). |
+| 400 | `UPLOAD_ABORTED` | The upload was cut off before the body finished arriving (submit). |
+| 400 | `MALFORMED_UPLOAD` | The body is not valid `multipart/form-data` (submit). |
+| 413 | `PAYLOAD_TOO_LARGE` | Total file content in one request exceeds 45MB (submit). |
 | 429 | `RATE_LIMITED` | Rate limit hit, with a `Retry-After` header (submit). Status polling is not rate limited. |
 | 404 | `JOB_NOT_FOUND` | Job id doesn't exist or isn't owned by this account (status, download). |
 | 409 | `NOT_READY` | Download requested before the job completed (download). |
 | 410 | `OUTPUT_EXPIRED` | Result cleaned up after its retention window (download). |
+| 416 | `RANGE_NOT_SATISFIABLE` | Resume range starts beyond the result file size (download). |
 | 5xx | `STORAGE_FAILED`, etc. | Server-side error; retry later. If it persists, contact us. |

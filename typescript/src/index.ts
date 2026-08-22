@@ -20,14 +20,29 @@ export {
   Image2PPTError,
   Image2PPTTimeoutError,
   InsufficientCreditsError,
+  InvalidAspectRatioError,
   InvalidFileError,
   JobFailedError,
   JobNotFoundError,
+  MalformedUploadError,
+  NoFilesError,
   NotReadyError,
   OutputExpiredError,
+  PageRateExceededError,
   RateLimitedError,
   TooManySlidesError,
+  UploadAbortedError,
 } from "./errors.js";
+export {
+  BATCH_TARGET_BYTES,
+  MAX_FILE_BYTES,
+  MAX_PAGES_PER_JOB,
+  MAX_UPLOAD_BYTES,
+  checkFileSize,
+  checkSubmission,
+  planBatches,
+} from "./limits.js";
+export type { UploadItem } from "./limits.js";
 export { Job } from "./types.js";
 export type {
   Account,

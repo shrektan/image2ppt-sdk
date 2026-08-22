@@ -3,24 +3,38 @@
  *
  * Uses an injected fake `fetch` returning real `Response` objects (Node 18+ has
  * them globally), so there's no network and no mocking library. Polling tests use
- * pollIntervalMs=0 / Retry-After: 0 to run instantly.
+ * pollIntervalMs=0 to run instantly. Rate-limit tests capture the delay off
+ * `setTimeout` instead of sleeping through it: `Retry-After` is floored (see
+ * "Retry-After sanitising"), so setting it to 0 no longer skips the wait.
  */
 
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   AuthenticationError,
   Image2PPTClient,
+  Image2PPTError,
   Image2PPTTimeoutError,
   InsufficientCreditsError,
+  InvalidAspectRatioError,
+  InvalidFileError,
   Job,
   JobNotFoundError,
+  MalformedUploadError,
+  MAX_FILE_BYTES,
+  MAX_PAGES_PER_JOB,
+  MAX_UPLOAD_BYTES,
+  NoFilesError,
   NotReadyError,
+  PageRateExceededError,
   RateLimitedError,
+  type Job as JobType,
+  TooManySlidesError,
+  UploadAbortedError,
 } from "../src/index.js";
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
@@ -30,14 +44,35 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
   });
 }
 
+/** A fake fetch that also records every call, so tests can assert on what was sent. */
+type RecordingFetch = typeof fetch & {
+  calls: Array<{ url: string; init: RequestInit }>;
+};
+
+/** A fake fetch driven by a per-call script; the handler may throw to simulate
+ * a network failure. `n` is the 1-based call number. */
+function fetchScript(handler: (n: number) => Response | Promise<Response>): RecordingFetch {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const impl = (async (url: unknown, init: RequestInit = {}) => {
+    calls.push({ url: String(url), init });
+    return handler(calls.length);
+  }) as unknown as RecordingFetch;
+  impl.calls = calls;
+  return impl;
+}
+
 /** A fake fetch that returns the given responses in sequence. */
-function fetchSequence(...responses: Response[]): typeof fetch {
-  let i = 0;
-  return (async () => {
-    const res = responses[Math.min(i, responses.length - 1)];
-    i += 1;
-    return res;
-  }) as unknown as typeof fetch;
+function fetchSequence(...responses: Response[]): RecordingFetch {
+  return fetchScript((n) => responses[Math.min(n - 1, responses.length - 1)]);
+}
+
+/** Filenames carried by each POST, in order: [[batch1...], [batch2...]]. */
+function postedFilenames(fetchImpl: RecordingFetch): string[][] {
+  return fetchImpl.calls
+    .filter((call) => call.init.method === "POST")
+    .map((call) =>
+      (call.init.body as FormData).getAll("files").map((part) => (part as File).name),
+    );
 }
 
 function client(fetchImpl: typeof fetch): Image2PPTClient {
@@ -102,6 +137,35 @@ describe("submit", () => {
     await expect(c.submit([file])).rejects.toBeInstanceOf(AuthenticationError);
   });
 
+  it("maps UPLOAD_ABORTED to its own type", async () => {
+    // The one upload failure a caller may safely resend: the server states it
+    // took nothing. It must be distinguishable from MALFORMED_UPLOAD.
+    const file = await tempFile();
+    const c = client(
+      fetchSequence(json(400, { error: { code: "UPLOAD_ABORTED", message: "body incomplete" } })),
+    );
+    await expect(c.submit([file])).rejects.toMatchObject({
+      name: "UploadAbortedError",
+      code: "UPLOAD_ABORTED",
+      statusCode: 400,
+    });
+  });
+
+  it("maps MALFORMED_UPLOAD to its own type", async () => {
+    // Opposite advice — resending identical bytes is pointless — so it must not
+    // share a type with UPLOAD_ABORTED.
+    const file = await tempFile();
+    const c = client(
+      fetchSequence(json(400, { error: { code: "MALFORMED_UPLOAD", message: "bad multipart" } })),
+    );
+    const err = await c.submit([file]).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(MalformedUploadError);
+    expect(err).not.toBeInstanceOf(UploadAbortedError);
+  });
+
   it("maps 402 to InsufficientCreditsError", async () => {
     const file = await tempFile();
     const c = client(fetchSequence(json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no credits" } })));
@@ -151,8 +215,19 @@ describe("wait", () => {
         json(200, { jobId: "j", status: "completed" }),
       ),
     );
-    const job = await c.wait("j", { pollIntervalMs: 0 });
-    expect(job.isCompleted).toBe(true);
+    // The header says 0 but the client floors it, so let the timer fire instantly
+    // rather than spending a real second of suite time.
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void) =>
+        realSetTimeout(cb, 0)) as unknown as typeof setTimeout);
+    try {
+      const job = await c.wait("j", { pollIntervalMs: 0 });
+      expect(job.isCompleted).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("throws Image2PPTTimeoutError past the deadline", async () => {
@@ -253,5 +328,1017 @@ describe("Job", () => {
     expect(job.isCompleted).toBe(true);
     expect(job.isTerminal).toBe(true);
     expect(job.creditsUsed).toBe(5);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// upload size guard — the regression this whole feature exists for
+//
+// A submission over the per-request size cap does not come back as an error: the
+// network layer in front of the API drops the connection mid-upload, and the
+// caller sees a bare write timeout. So the only acceptable behavior is to refuse
+// locally, having sent nothing. Every test here asserts on the recorded calls.
+// --------------------------------------------------------------------------- //
+
+/** A file of exactly `size` bytes, allocated sparsely (instant, no real I/O). */
+async function sparseFile(name: string, size: number): Promise<string> {
+  const path = join(dir, name);
+  await writeFile(path, "");
+  await truncate(path, size);
+  return path;
+}
+
+async function manyImages(count: number): Promise<string[]> {
+  const paths: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    paths.push(await tempFile(`p${String(i).padStart(3, "0")}.png`));
+  }
+  return paths;
+}
+
+describe("upload size guard", () => {
+  it("refuses an oversized batch without sending anything", async () => {
+    // Two individually-legal files that add up past the request cap.
+    const half = Math.floor(MAX_UPLOAD_BYTES / 2);
+    const files = [
+      await sparseFile("a.png", half),
+      await sparseFile("b.png", half + 1),
+    ];
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submit(files)).rejects.toBeInstanceOf(InvalidFileError);
+    await expect(client(f).submit(files)).rejects.toMatchObject({
+      code: "PAYLOAD_TOO_LARGE",
+    });
+    expect(f.calls).toHaveLength(0); // nothing went on the wire
+  });
+
+  it("refuses too many pages without sending anything", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submit(files)).rejects.toBeInstanceOf(TooManySlidesError);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("still sends exactly one request for a submission within the limits", async () => {
+    const file = await tempFile();
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    expect(postedFilenames(f)).toEqual([["a.png"]]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// submitAll / convertAll — automatic batching
+// --------------------------------------------------------------------------- //
+describe("submitAll", () => {
+  it("splits past the page limit into two jobs", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const ids = ["job_a", "job_b"];
+    const f = fetchScript((n) => json(201, { jobId: ids[n - 1], status: "pending" }));
+
+    const jobs = await client(f).submitAll(files);
+
+    expect(jobs.map((job) => job.jobId)).toEqual(ids);
+    const sent = postedFilenames(f);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toHaveLength(MAX_PAGES_PER_JOB);
+    expect(sent[1]).toEqual([`p${String(MAX_PAGES_PER_JOB).padStart(3, "0")}.png`]);
+  });
+
+  it("gives a PDF its own job", async () => {
+    const img = await tempFile("a.png");
+    const doc = await tempFile("doc.pdf");
+    const f = fetchScript(() => json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submitAll([img, doc]);
+
+    expect(postedFilenames(f)).toEqual([["a.png"], ["doc.pdf"]]);
+  });
+
+  it("behaves like submit for a single batch", async () => {
+    const files = await manyImages(3);
+    const f = fetchScript(() => json(201, { jobId: "j", status: "pending" }));
+
+    const jobs = await client(f).submitAll(files);
+
+    expect(jobs).toHaveLength(1);
+    expect(postedFilenames(f)).toHaveLength(1);
+  });
+});
+
+describe("convertAll", () => {
+  it("writes one numbered PPTX per batch", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const outDir = join(dir, "decks");
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(201, { jobId: "job_b", status: "pending" }),
+      json(200, { jobId: "job_a", status: "completed" }),
+      new Response(Buffer.from("DECK-A"), { status: 200 }),
+      json(200, { jobId: "job_b", status: "completed" }),
+      new Response(Buffer.from("DECK-B"), { status: 200 }),
+    );
+
+    const written = await client(f).convertAll(files, outDir, { pollIntervalMs: 0 });
+
+    expect(written).toEqual([join(outDir, "part-01.pptx"), join(outDir, "part-02.pptx")]);
+    expect((await readFile(written[0])).toString()).toBe("DECK-A");
+    expect((await readFile(written[1])).toString()).toBe("DECK-B");
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// a failed submission is NOT retried
+//
+// This looks like a missing feature; it is a deliberate one. A network error
+// proves only that the exchange broke — the server may have received the whole
+// body, created the job and reserved credits, and then lost the connection while
+// answering. Retrying that case charges the user twice. Nothing here can tell the
+// two apart without an idempotency key the API does not offer, so the error goes
+// to the caller untouched. These tests exist so nobody quietly adds the retry back.
+// --------------------------------------------------------------------------- //
+describe("no automatic submit retry", () => {
+  it("does not retry a broken connection", async () => {
+    const file = await tempFile();
+    const f = fetchScript(() => {
+      throw new TypeError("fetch failed");
+    });
+
+    await expect(client(f).submit([file])).rejects.toBeInstanceOf(TypeError);
+    expect(f.calls).toHaveLength(1); // tried exactly once
+  });
+
+  it("does not retry a request it timed out", async () => {
+    const file = await tempFile();
+    const f = fetchScript(() => {
+      throw new DOMException("The operation was aborted", "TimeoutError");
+    });
+
+    await expect(client(f).submit([file])).rejects.toMatchObject({
+      code: "REQUEST_TIMEOUT",
+    });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("does not retry an HTTP error answer", async () => {
+    const file = await tempFile();
+    const f = fetchSequence(
+      json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no" } }),
+    );
+
+    await expect(client(f).submit([file])).rejects.toBeInstanceOf(InsufficientCreditsError);
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("does not retry inside submitAll either, and still hands back the jobs", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    let n = 0;
+    const f = fetchScript(() => {
+      n += 1;
+      if (n === 1) return json(201, { jobId: "job_a", status: "pending" });
+      throw new TypeError("fetch failed");
+    });
+
+    const err = await client(f).submitAll(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TypeError);
+    expect(f.calls).toHaveLength(2); // batch 1, then batch 2 once
+    expect(submittedIds(err)).toEqual(["job_a"]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// submitAll rate limiting
+//
+// A pile big enough to need batching is a pile big enough to hit the per-minute
+// page quota, so a 429 mid-pile is the normal case, not an exception. If it were
+// thrown, batching would only trade one failure for another. Retry-After is 0 in
+// these tests so nothing actually sleeps.
+// --------------------------------------------------------------------------- //
+function rateLimited(retryAfter?: string): Response {
+  return json(
+    429,
+    { error: { code: "RATE_LIMITED", message: "slow down" } },
+    retryAfter === undefined ? {} : { "Retry-After": retryAfter },
+  );
+}
+
+/** Job ids off an error's `submittedJobs`, whatever error type it is. */
+function submittedIds(err: unknown): string[] {
+  return ((err as { submittedJobs?: JobType[] }).submittedJobs ?? []).map((j) => j.jobId);
+}
+
+describe("submitAll rate limiting", () => {
+  it("waits out a rate limit and retries the same batch", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      rateLimited("0"), // second batch bounces off the per-minute quota
+      json(201, { jobId: "job_b", status: "pending" }),
+    );
+
+    // Fire the floored wait immediately instead of sleeping through it.
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void) =>
+        realSetTimeout(cb, 0)) as unknown as typeof setTimeout);
+    let jobs;
+    try {
+      jobs = await client(f).submitAll(files);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(jobs.map((job) => job.jobId)).toEqual(["job_a", "job_b"]);
+    const sent = postedFilenames(f);
+    expect(sent).toHaveLength(3); // batch 1, the rejected batch 2, then batch 2 again
+    expect(sent[1]).toEqual(sent[2]); // the retry carried exactly the same files
+  });
+
+  it("hands back created jobs when it gives up", async () => {
+    // Giving up must not strand the jobs already created — they are running and
+    // their credits are already reserved.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchSequence(json(201, { jobId: "job_a", status: "pending" }), rateLimited("0"));
+    // No waiting budget at all: the first 429 ends it.
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 0,
+    });
+
+    const err = await c.submitAll(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect(submittedIds(err)).toEqual(["job_a"]);
+    expect(postedFilenames(f)).toHaveLength(2); // no pointless extra attempt
+  });
+
+  it("uses a default wait when the server sends no Retry-After", async () => {
+    // The delay is captured off setTimeout rather than actually slept through, so
+    // the test pins the documented 5s fallback without taking 5s.
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited(), json(201, { jobId: "job_a", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((fn: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(fn, 0);
+      }) as unknown as typeof setTimeout);
+
+    try {
+      const jobs = await client(f).submitAll(files);
+      expect(jobs.map((job) => job.jobId)).toEqual(["job_a"]);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(delays).toEqual([5_000]); // the documented fallback, not zero
+  });
+
+  it("keeps submittedJobs on a non-rate-limit failure too", async () => {
+    // Any failure mid-pile strands paid-for jobs, not just a rate limit.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no" } }),
+    );
+
+    const err = await client(f).submitAll(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(InsufficientCreditsError);
+    expect(submittedIds(err)).toEqual(["job_a"]);
+  });
+
+  it("convertAll hands back jobs when a later one fails", async () => {
+    // The first deck is on disk, the second job failed — but jobs 1..N are all
+    // still identified on the error.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const outDir = join(dir, "decks");
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(201, { jobId: "job_b", status: "pending" }),
+      json(200, { jobId: "job_a", status: "completed" }),
+      new Response(Buffer.from("DECK-A"), { status: 200 }),
+      json(200, {
+        jobId: "job_b",
+        status: "failed",
+        error: { code: "CONVERSION_FAILED", message: "boom" },
+      }),
+    );
+
+    const err = await client(f)
+      .convertAll(files, outDir, { pollIntervalMs: 0 })
+      .catch((e: unknown) => e);
+
+    expect((err as Error).name).toBe("JobFailedError");
+    expect(submittedIds(err)).toEqual(["job_a", "job_b"]);
+    expect((await readFile(join(outDir, "part-01.pptx"))).toString()).toBe("DECK-A");
+  });
+});
+
+
+// --------------------------------------------------------------------------- //
+// per-file limit and destination checks — both must fail before spending money
+// --------------------------------------------------------------------------- //
+describe("per-file limit", () => {
+  it("refuses a single file over the per-file limit", async () => {
+    // It fits the 45MB request cap, but the server rejects it every time.
+    const big = await sparseFile("big.pdf", MAX_FILE_BYTES + 1);
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    const err = await client(f).submit([big]).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(InvalidFileError);
+    expect((err as InvalidFileError).code).toBe("INVALID_FILE");
+    expect((err as Error).message).toContain("big.pdf");
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("refuses it in submitAll too, instead of planning a doomed batch", async () => {
+    const big = await sparseFile("big.pdf", MAX_FILE_BYTES + 1);
+    const img = await tempFile("a.png");
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submitAll([img, big])).rejects.toBeInstanceOf(InvalidFileError);
+    expect(f.calls).toHaveLength(0); // the good file isn't submitted either
+  });
+});
+
+describe("convertAll destination", () => {
+  it("checks the destination before submitting anything", async () => {
+    // An unusable destDir must not cost credits: no job may exist afterwards.
+    const files = await manyImages(2);
+    const notADir = join(dir, "decks");
+    await writeFile(notADir, "I am a regular file");
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).convertAll(files, notADir)).rejects.toThrow();
+    expect(f.calls).toHaveLength(0);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// PDF pages, and a destination that only *looks* usable
+// --------------------------------------------------------------------------- //
+describe("PDF pages in submit", () => {
+  it("counts a PDF as a page, so 50 images plus one is refused", async () => {
+    // 50 images is exactly the limit; any PDF alongside makes it at least 51, so
+    // the server would reject it every time. Refuse locally, send nothing.
+    const files = await manyImages(MAX_PAGES_PER_JOB);
+    files.push(await tempFile("doc.pdf"));
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    const err = await client(f).submit(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TooManySlidesError);
+    expect((err as Error).message).toContain("at least 51");
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("still accepts 49 images plus one PDF", async () => {
+    // The guard must not over-reach: 49 + 1 is exactly 50 at the lower bound.
+    const files = await manyImages(MAX_PAGES_PER_JOB - 1);
+    files.push(await tempFile("doc.pdf"));
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit(files);
+
+    expect(postedFilenames(f)).toHaveLength(1);
+  });
+});
+
+describe("convertAll destination writability", () => {
+  it("refuses a destDir that exists but cannot be written", async () => {
+    // The bug this catches: a recursive mkdir SUCCEEDS on a read-only directory,
+    // so creating the directory early proved nothing — the submissions still went
+    // out and only writing the first deck failed, after the credits were spent.
+    const files = await manyImages(2);
+    const readOnly = join(dir, "decks");
+    await mkdir(readOnly);
+    await chmod(readOnly, 0o555);
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    try {
+      const err = await client(f).convertAll(files, readOnly).catch((e: unknown) => e);
+      expect((err as Error).message).toContain("cannot write");
+      expect(f.calls).toHaveLength(0); // nothing submitted, nothing charged
+    } finally {
+      await chmod(readOnly, 0o755); // let the temp-dir cleanup remove it
+    }
+  });
+
+  it("leaves no probe file behind", async () => {
+    const files = await manyImages(1);
+    const outDir = join(dir, "decks");
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(200, { jobId: "job_a", status: "completed" }),
+      new Response(Buffer.from("DECK-A"), { status: 200 }),
+    );
+
+    await client(f).convertAll(files, outDir, { pollIntervalMs: 0 });
+
+    expect((await readdir(outDir)).sort()).toEqual(["part-01.pptx"]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Retry-After sanitising
+//
+// The retry loops sleep for as long as the server asks. Taken literally, two
+// legal-looking header values turn that into a tight loop that re-sends the same
+// multipart body — tens of megabytes of files — as fast as the link allows, for as
+// long as the waiting budget lasts. These pin the floor that stops it, and mirror
+// the Python client's tests one for one.
+// --------------------------------------------------------------------------- //
+describe("Retry-After sanitising", () => {
+  /** Run `fn`, capturing every delay handed to setTimeout instead of sleeping. */
+  async function captureDelays(fn: () => Promise<void>): Promise<number[]> {
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await fn();
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  it.each([
+    ["0", 1_000], // legal ("retry now"), but literally zero is a flood
+    ["0.25", 1_000], // sub-second is the same problem, just slower
+    ["12", 12_000], // a real wait is passed through untouched
+  ])("floors Retry-After %s to %ims", async (header, expected) => {
+    const files = await manyImages(2);
+    const f = fetchSequence(
+      rateLimited(header as string),
+      json(201, { jobId: "job_a", status: "pending" }),
+    );
+
+    const delays = await captureDelays(async () => {
+      const jobs = await client(f).submitAll(files);
+      expect(jobs.map((job) => job.jobId)).toEqual(["job_a"]);
+    });
+
+    expect(delays).toEqual([expected]);
+  });
+
+  it.each([["-1"], ["nan"], ["Wed, 21 Oct 2026 07:28:00 GMT"]])(
+    "treats an unusable Retry-After %s as missing",
+    async (header) => {
+      const files = await manyImages(2);
+      const f = fetchSequence(
+        rateLimited(header),
+        json(201, { jobId: "job_a", status: "pending" }),
+      );
+
+      const delays = await captureDelays(async () => {
+        const jobs = await client(f).submitAll(files);
+        expect(jobs.map((job) => job.jobId)).toEqual(["job_a"]);
+      });
+
+      expect(delays).toEqual([5_000]); // the documented fallback, not a busy loop
+    },
+  );
+});
+
+// --------------------------------------------------------------------------- //
+// Destination write probe
+// --------------------------------------------------------------------------- //
+describe("destination write probe", () => {
+  let probeDir: string;
+  beforeEach(async () => {
+    probeDir = await mkdtemp(join(tmpdir(), "image2ppt-probe-"));
+  });
+  afterEach(async () => {
+    await rm(probeDir, { recursive: true, force: true });
+  });
+
+  it("never opens a path it did not create", async () => {
+    // A predictable probe name opened for writing truncates whatever is already
+    // there — including a symlink someone left in a shared output directory.
+    const outDir = join(probeDir, "decks");
+    await mkdir(outDir);
+    const victim = join(probeDir, "important.txt");
+    await writeFile(victim, "do not truncate me");
+    await symlink(victim, join(outDir, `.image2ppt-write-test-${process.pid}`));
+
+    const files = await manyImages(1);
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      json(200, { jobId: "job_a", status: "completed" }),
+      new Response(Buffer.from("DECK-A"), { status: 200 }),
+    );
+    await client(f).convertAll(files, outDir, { pollIntervalMs: 0 });
+
+    expect(await readFile(victim, "utf8")).toBe("do not truncate me");
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Unsupported file types
+//
+// The accepted extensions are known locally, so uploading a .txt just to be told
+// INVALID_FILE is a round trip that never had to happen — and in submitAll the
+// batches ahead of it are already jobs with credits reserved by the time the server
+// answers.
+// --------------------------------------------------------------------------- //
+describe("unsupported file types", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "image2ppt-ext-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("refuses an unsupported extension without sending anything", async () => {
+    const doc = join(dir, "notes.txt");
+    await writeFile(doc, "hello");
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submit([doc])).rejects.toBeInstanceOf(InvalidFileError);
+    await expect(client(f).submit([doc])).rejects.toMatchObject({ code: "INVALID_FILE" });
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("submitAll refuses before paying for the batches ahead", async () => {
+    // The unsupported file is last; the batches before it must not be submitted.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1);
+    const doc = join(dir, "notes.docx");
+    await writeFile(doc, "hello");
+    const f = fetchScript(() => {
+      throw new Error("no HTTP request should have been made");
+    });
+
+    await expect(client(f).submitAll([...files, doc])).rejects.toBeInstanceOf(
+      InvalidFileError,
+    );
+    expect(f.calls).toHaveLength(0); // nothing created, nothing charged
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Download is all-or-nothing
+// --------------------------------------------------------------------------- //
+describe("download atomicity", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "image2ppt-dl-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** A 200 whose body dies partway through, like a dropped connection. */
+  function explodingBody(): Response {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("PK\u0003\u0004 first half"));
+        controller.error(new Error("connection reset mid-download"));
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }
+
+  it("leaves no truncated file behind", async () => {
+    const dest = join(dir, "deck.pptx");
+    const f = fetchSequence(explodingBody());
+
+    await expect(client(f).download("job_a", dest)).rejects.toThrow();
+
+    // A half deck would show up in a listing and open nowhere else.
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it("does not destroy the deck already there", async () => {
+    // Writing straight to the destination would truncate it on the first chunk.
+    // `convertAll` reuses fixed names (part-01.pptx, ...), so a re-run whose
+    // download dies partway would replace a good deck with a broken one.
+    const dest = join(dir, "deck.pptx");
+    await writeFile(dest, "PREVIOUS-GOOD-DECK");
+    const f = fetchSequence(explodingBody());
+
+    await expect(client(f).download("job_a", dest)).rejects.toThrow();
+
+    expect(await readFile(dest, "utf8")).toBe("PREVIOUS-GOOD-DECK");
+    expect(await readdir(dir)).toEqual(["deck.pptx"]);
+  });
+
+  it("writes the whole deck on success", async () => {
+    const dest = join(dir, "deck.pptx");
+    const f = fetchSequence(new Response(Buffer.from("DECK-BYTES"), { status: 200 }));
+
+    expect(await client(f).download("job_a", dest)).toBe(dest);
+    expect(await readFile(dest, "utf8")).toBe("DECK-BYTES");
+    expect(await readdir(dir)).toEqual(["deck.pptx"]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Client identification
+//
+// Without a User-Agent the service cannot tell which SDK version made a request, so
+// it can never warn anyone that theirs is about to stop working.
+// --------------------------------------------------------------------------- //
+describe("client identification", () => {
+  it("sends a User-Agent naming the SDK and its version", async () => {
+    const f = fetchSequence(json(200, { email: "e", credits: 1 }));
+    await client(f).account();
+
+    const headers = f.calls[0]?.init.headers as Record<string, string>;
+    expect(headers["User-Agent"]).toMatch(/^image2ppt-node\/\d+\.\d+\.\d+$/);
+  });
+
+  it("keeps that version in step with package.json", async () => {
+    const pkg = JSON.parse(
+      await readFile(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    const f = fetchSequence(json(200, { email: "e", credits: 1 }));
+    await client(f).account();
+
+    const headers = f.calls[0]?.init.headers as Record<string, string>;
+    expect(headers["User-Agent"]).toBe(`image2ppt-node/${pkg.version}`);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Error-code mapping for the codes the contract lists
+// --------------------------------------------------------------------------- //
+describe("documented 400 codes", () => {
+  it.each([
+    ["NO_FILES", NoFilesError],
+    ["INVALID_ASPECT_RATIO", InvalidAspectRatioError],
+    ["PAGE_RATE_EXCEEDED", PageRateExceededError],
+  ])("maps %s to its own type", async (code, expected) => {
+    // These used to land on the base class, so `instanceof InvalidFileError` missed
+    // them and callers had to compare strings.
+    const files = await manyImages(1);
+    const f = fetchSequence(json(400, { error: { code, message: "no" } }));
+
+    const err = await client(f).submit(files).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(expected);
+    expect(err).toMatchObject({ code });
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// The rate-limit waiting budget
+//
+// `rateLimitMaxWaitMs` promises time spent *waiting*. A wall-clock deadline set at
+// the start of the call would be spent by the uploads themselves, so on a slow link
+// a large pile could exhaust it before the first 429 ever arrived — turning the
+// option into "do not wait at all", with the cutoff decided by link speed. Mirrors
+// the Python tests of the same name.
+// --------------------------------------------------------------------------- //
+describe("rate-limit waiting budget", () => {
+  /** Run `fn`, capturing every delay handed to setTimeout instead of sleeping. */
+  async function captureDelays(fn: () => Promise<void>): Promise<number[]> {
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await fn();
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  it("is not consumed by upload time", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1); // two batches
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      rateLimited("0"), // second batch bounces
+      json(201, { jobId: "job_b", status: "pending" }),
+    );
+    // The clock races far past the whole budget while the first batch uploads. Only
+    // waiting may take from the budget, so this must not change the outcome.
+    let ticks = 0;
+    const nowSpy = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => (ticks += 10_000_000));
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 10_000,
+    });
+
+    let delays: number[];
+    try {
+      delays = await captureDelays(async () => {
+        const jobs = await c.submitAll(files);
+        expect(jobs.map((job) => job.jobId)).toEqual(["job_a", "job_b"]);
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(delays).toEqual([1_000]); // it waited, rather than giving up on a spent clock
+  });
+
+  it("is spent by waiting and then gives up", async () => {
+    // Two waits of 4s fit in a 10s budget; the third does not.
+    const files = await manyImages(2);
+    let calls = 0;
+    const f = fetchScript(() => {
+      calls += 1;
+      // A budget that never depletes would retry forever. Fail loudly instead of
+      // hanging the suite.
+      if (calls > 3) throw new Error("retried past the waiting budget");
+      return rateLimited("4");
+    });
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 10_000,
+    });
+
+    const delays = await captureDelays(async () => {
+      await expect(c.submitAll(files)).rejects.toBeInstanceOf(RateLimitedError);
+    });
+
+    expect(delays).toEqual([4_000, 4_000]); // 8s spent, the third 4s would not fit
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Retry-After spellings a lenient number parser would accept
+//
+// `Number("0x10")` is 16 and Python's `float("1e3")` is 1000. Accepting "whatever
+// the parser allows" makes the two SDKs disagree about the same header, so both
+// match plain decimal seconds explicitly. Mirrors the Python parametrised test.
+// --------------------------------------------------------------------------- //
+describe("Retry-After spellings", () => {
+  async function delaysFor(header: string): Promise<number[]> {
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited(header), json(201, { jobId: "j", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await client(f).submitAll(files);
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  it.each([["0x10"], ["1e3"], ["+5"], [".5"], ["5s"], ["nan"], ["inf"], ["-1"]])(
+    "treats %s as missing and uses the documented fallback",
+    async (header) => {
+      expect(await delaysFor(header)).toEqual([5_000]);
+    },
+  );
+
+  it("accepts a value with the transport's surrounding whitespace", async () => {
+    expect(await delaysFor("  12  ")).toEqual([12_000]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Retry-After: digits and whitespace must mean the same thing in both clients
+//
+// The parser matches `[0-9]` and an explicit space-or-tab rather than `\d` and
+// `trim()`, because Python's `\d` matches every Unicode decimal digit while
+// JavaScript's matches only ASCII — left to the defaults, `Retry-After: ５` would be
+// five seconds to the Python client and unparseable here.
+//
+// That case cannot be written as a test on this side: `Headers` is specified over
+// ByteStrings and refuses a non-ASCII value outright, so no `Response` can carry one.
+// The test below pins that refusal — it is the reason the disagreement can only ever
+// originate on the Python side, and it is what makes the ASCII-only pattern here belt
+// and braces rather than dead weight. The Python suite carries the mirrored cases.
+// --------------------------------------------------------------------------- //
+describe("Retry-After digits and whitespace", () => {
+  it.each([["５"], ["١٢"]])(
+    "cannot even be delivered as a header value in Node (%s)",
+    (value) => {
+      expect(() => new Headers({ "Retry-After": value })).toThrow();
+    },
+  );
+
+  it("still parses a plain value delivered through real headers", async () => {
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited("12"), json(201, { jobId: "j", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await client(f).submitAll(files);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(delays).toEqual([12_000]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// A batch is not retried forever on a cheap Retry-After
+// --------------------------------------------------------------------------- //
+describe("batch retry cap", () => {
+  it("stops re-uploading long before the waiting budget runs out", async () => {
+    // The waiting budget cannot see the uploads, and every retry re-sends them. A
+    // server answering `Retry-After: 1` costs a second of budget per round, so a
+    // 30-minute budget alone would buy ~1800 rounds — 1800 re-uploads of the same
+    // files. The attempt cap is what bounds the work rather than the waiting.
+    const files = await manyImages(2);
+    const f = fetchScript(() => rateLimited("1"));
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 1_800_000,
+    });
+
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void) =>
+        realSetTimeout(cb, 0)) as unknown as typeof setTimeout);
+    try {
+      await expect(c.submitAll(files)).rejects.toBeInstanceOf(RateLimitedError);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(f.calls).toHaveLength(10); // MAX_BATCH_ATTEMPTS, not ~1800
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Running out of attempts strands paid-for jobs too
+// --------------------------------------------------------------------------- //
+describe("attempt cap and submittedJobs", () => {
+  it("hands back the jobs already created when attempts run out", async () => {
+    // There are two ways to give up mid-pile — out of waiting budget, and out of
+    // attempts. Both strand paid-for jobs, so both must hand back their ids. The
+    // budget path has its own test; this one covers the attempt cap.
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1); // two batches
+    const f = fetchScript((n) =>
+      n === 1 ? json(201, { jobId: "job_a", status: "pending" }) : rateLimited("1"),
+    );
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 1_800_000,
+    });
+
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void) =>
+        realSetTimeout(cb, 0)) as unknown as typeof setTimeout);
+    let err: unknown;
+    try {
+      err = await c.submitAll(files).catch((e: unknown) => e);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect(submittedIds(err)).toEqual(["job_a"]);
+    expect(f.calls).toHaveLength(1 + 10); // first batch, then MAX_BATCH_ATTEMPTS
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Retry-After beyond what a timer can represent
+//
+// A delay past 2**31-1 ms is not representable here: `setTimeout` silently clamps it
+// to *1 millisecond*, so an absurd header would turn "wait" into "retry immediately,
+// at full speed" for every permitted attempt. Python fails differently on the same
+// input (`time.sleep` raises OverflowError), so the two clients would also stop
+// agreeing. Both draw the line at the same number. Mirrors the Python cases.
+// --------------------------------------------------------------------------- //
+describe("Retry-After beyond the timer range", () => {
+  async function delaysFor(header: string, budgetMs: number): Promise<number[]> {
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited(header), json(201, { jobId: "j", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await new Image2PPTClient({
+        apiKey: "i2p_live_test",
+        fetch: f,
+        rateLimitMaxWaitMs: budgetMs,
+      }).submitAll(files);
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  // A budget generous enough that it cannot be what rejects these.
+  const HUGE_BUDGET = Number.MAX_SAFE_INTEGER;
+
+  it.each([["99999999999999999999"], ["2147484"]])(
+    "treats %s as a header the server never sent",
+    async (header) => {
+      expect(await delaysFor(header, HUGE_BUDGET)).toEqual([5_000]);
+    },
+  );
+
+  it("still honours a value just inside the line", async () => {
+    expect(await delaysFor("2147483", HUGE_BUDGET)).toEqual([2_147_483_000]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Every wait is bounded, not just a server-sent Retry-After
+//
+// The polling backoff is seeded from the caller's own pollIntervalMs, and a 429
+// without a Retry-After reuses that seed unchanged. With a large enough timeoutMs the
+// deadline does not bound it either — both bounds are caller-supplied, so neither
+// constrains the other. Past the timer range that stops being a wait at all:
+// setTimeout clamps to 1ms and the client hammers the server. Mirrors the Python tests.
+// --------------------------------------------------------------------------- //
+describe("every wait is bounded", () => {
+  async function delaysWhilePolling(
+    pollIntervalMs: number,
+    timeoutMs: number,
+  ): Promise<number[]> {
+    const f = fetchSequence(
+      json(429, { error: { code: "RATE_LIMITED", message: "slow" } }),
+      json(200, { jobId: "j", status: "completed" }),
+    );
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      const job = await client(f).wait("j", { pollIntervalMs, timeoutMs });
+      expect(job.isCompleted).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  it("clamps a huge poll interval to the timer range", async () => {
+    // 2**31-1: past this, setTimeout would clamp to 1ms and poll in a tight loop.
+    expect(await delaysWhilePolling(1e18, 1e18)).toEqual([2 ** 31 - 1]);
+  });
+
+  it("still lets the deadline win when it is the smaller bound", async () => {
+    const delays = await delaysWhilePolling(1e18, 30_000);
+    expect(delays).toHaveLength(1);
+    expect(delays[0]).toBeGreaterThan(0);
+    expect(delays[0]).toBeLessThanOrEqual(30_000); // the deadline, not the clamp
   });
 });

@@ -1,0 +1,46 @@
+# CI for both SDKs.
+#
+# Added alongside the upload pre-flight / auto-batching work, which brought the test
+# count from 46 to 104. Without CI those tests only run when someone remembers to run
+# them — which is not a regression guard, it is a hope. This repo is public and takes
+# outside PRs, so the guard has to be automatic.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml plus a current release. The floor is the
+        # one that actually catches things — it is what a conservative integrator pins.
+        python-version: ["3.9", "3.12"]
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --python ${{ matrix.python-version }}
+      - run: uv run pytest
+
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: npm test
+      # The published artifact is the compiled output, so a green test suite that does
+      # not compile is still a broken release.
+      - run: npm run build

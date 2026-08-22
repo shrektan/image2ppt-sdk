@@ -7,7 +7,7 @@ Branch on ``code``, not ``message`` — messages may be reworded.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class Image2PPTError(Exception):
@@ -24,6 +24,12 @@ class Image2PPTError(Exception):
         self.message = message
         self.status_code = status_code
         self.code = code
+        #: Jobs already created when this error was raised out of ``submit_all`` /
+        #: ``convert_all``. They are **running on the server with credits already
+        #: reserved** — they are not lost and not refunded by the failure. Wait on
+        #: them (``wait``/``download``) or come back to them later. Empty for any
+        #: error not raised out of a batch call.
+        self.submitted_jobs: List[Any] = []
 
     def __str__(self) -> str:
         parts = []
@@ -40,7 +46,61 @@ class AuthenticationError(Image2PPTError):
 
 
 class InvalidFileError(Image2PPTError):
-    """A file was rejected: unsupported format or over the 35MB per-file limit (400)."""
+    """A file was rejected (400), or the request carried too much file content.
+
+    Raised for an unsupported format, a single file over the 35MB per-file limit,
+    or a request whose files add up to more than the 45MB per-request limit
+    (413 ``PAYLOAD_TOO_LARGE``). The client raises the ``PAYLOAD_TOO_LARGE`` case
+    locally, before uploading anything.
+    """
+
+
+class UploadAbortedError(Image2PPTError):
+    """The upload was cut off before the body finished arriving (400 ``UPLOAD_ABORTED``).
+
+    The server is telling you it did **not** take the submission — no job was created
+    and no credits were reserved — so **resending the same files is safe**. That makes
+    this different from a transport-level ``requests.ConnectionError``, which cannot
+    rule out that the job was created and only the response was lost; the client never
+    retries that one for you (see ``Client._post_files``).
+
+    If it keeps happening, the submission is probably too large for the link. Send
+    fewer files per request, or use ``submit_all`` / ``convert_all`` to split.
+    """
+
+
+class MalformedUploadError(Image2PPTError):
+    """The body was not valid ``multipart/form-data`` (400 ``MALFORMED_UPLOAD``).
+
+    A client-side framing problem: **retrying the identical payload will not help**.
+    Using this SDK unmodified you should never see it; if you do, please report it.
+    """
+
+
+class NoFilesError(Image2PPTError):
+    """The request carried no files at all (400 ``NO_FILES``).
+
+    Using this SDK you should never see it — ``submit`` refuses an empty ``paths``
+    before opening a connection.
+    """
+
+
+class InvalidAspectRatioError(Image2PPTError):
+    """``aspect_ratio`` was not one of the accepted values (400 ``INVALID_ASPECT_RATIO``).
+
+    Accepted: ``auto`` (default), ``16:9``, ``4:3``. Nothing was created and nothing
+    was charged — fix the value and submit again.
+    """
+
+
+class PageRateExceededError(Image2PPTError):
+    """One submission holds more pages than the per-minute quota allows (400).
+
+    Distinct from ``RateLimitedError``: a 429 means "not right now, try again in N
+    seconds" and the same submission will eventually go through. ``PAGE_RATE_EXCEEDED``
+    means this submission can *never* fit the window whole, so waiting does not help
+    — split it, e.g. with ``submit_all`` / ``convert_all``.
+    """
 
 
 class TooManySlidesError(Image2PPTError):
@@ -56,6 +116,11 @@ class RateLimitedError(Image2PPTError):
 
     ``retry_after`` is the server-suggested wait in seconds (from the
     ``Retry-After`` header); retry after that long.
+
+    Both kinds of 429 land here — the per-minute page quota and the cap on
+    concurrently active jobs — and both are handled the same way: wait, then try
+    the same submission again. ``submit_all`` / ``convert_all`` do that for you;
+    if one of them gives up, ``submitted_jobs`` holds the jobs already created.
     """
 
     def __init__(
@@ -119,6 +184,12 @@ _CODE_TO_EXC: Dict[str, type] = {
     "ACCOUNT_DELETED": AuthenticationError,
     "INVALID_FILE": InvalidFileError,
     "INVALID_PDF": InvalidFileError,
+    "PAYLOAD_TOO_LARGE": InvalidFileError,
+    "UPLOAD_ABORTED": UploadAbortedError,
+    "MALFORMED_UPLOAD": MalformedUploadError,
+    "NO_FILES": NoFilesError,
+    "INVALID_ASPECT_RATIO": InvalidAspectRatioError,
+    "PAGE_RATE_EXCEEDED": PageRateExceededError,
     "TOO_MANY_SLIDES": TooManySlidesError,
     "INSUFFICIENT_CREDITS": InsufficientCreditsError,
     "RATE_LIMITED": RateLimitedError,
@@ -133,6 +204,7 @@ _STATUS_TO_EXC: Dict[int, type] = {
     404: JobNotFoundError,
     409: NotReadyError,
     410: OutputExpiredError,
+    413: InvalidFileError,
     429: RateLimitedError,
 }
 

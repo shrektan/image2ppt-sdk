@@ -1,6 +1,6 @@
 > 🌐 **English**: [api.md](./api.md) · **中文**（当前页）
 
-# image2ppt 企业 API
+# Image2PPT 开发者 API
 
 把图片和 PDF 批量转换成可编辑的 PPTX。上传一批文件，我们在后台用 AI 拆解版面、还原成可编辑的文字与形状，合成一个 PPTX 给你下载。
 
@@ -23,7 +23,7 @@
 
 ### 拿到密钥
 
-登录 image2ppt 后，从账号菜单进入「开发者 / API」页面，在「API Keys」处自助创建，得到一串形如下面的密钥：
+登录 Image2PPT 后，从账号菜单进入「开发者 / API」页面，在「API Keys」处自助创建，得到一串形如下面的密钥：
 
 ```
 i2p_live_xxxxxxxxxxxxxxxxxxxxxxxx
@@ -79,11 +79,22 @@ https://image2ppt.com
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `files` | 是 | 一个或多个文件。支持 `png` / `jpeg` / `webp` / `gif` / `pdf`，**单文件不超过 35MB**。同一个字段名 `files` 重复出现来传多个文件。 |
+| `files` | 是 | 一个或多个文件。支持 `png` / `jpeg` / `webp` / `gif` / `pdf`，**单文件不超过 35MB，同一请求的文件内容合计不超过 45MB**。同一个字段名 `files` 重复出现来传多个文件。 |
 | `locale` | 否 | 成品语言环境，`zh-CN`（默认）或 `en`。 |
 | `aspectRatio` | 否 | 幻灯片比例，`auto`（默认，随原图）/ `16:9` / `4:3`。 |
 
-**页数怎么算**：一张图片算 1 页，一个 PDF 按它的实际页数算。一次提交的**总页数不能超过 50**。
+**一次提交有两条上限，都要满足**：
+
+| 上限 | 数值 | 说明 |
+|---|---|---|
+| **总页数** | **≤ 50 页** | 一张图片算 1 页，一个 PDF 按它的实际页数算。 |
+| **总体积** | **≤ 45MB** | 这一次请求里所有文件内容加起来。单个文件另有 35MB 的上限。 |
+
+两条是独立的：**23 张高清图片只有 23 页，却很容易超过 45MB**。页数没满不代表能提交。
+
+超过总体积会返回 `413 PAYLOAD_TOO_LARGE`。**遇到它请减少单次提交的文件数量分批提交**，重试同样的内容不会成功。
+
+官方 SDK 分两种用法，行为不同：`submit()` / `convert()`（TypeScript 同名）只提交你给的这一批，会在上传前先本地核对体积和页数，超了直接报错，不会白传一遍，但**不会替你拆批**；要自动拆批请用 `submit_all()` / `convert_all()`（TypeScript 为 `submitAll()` / `convertAll()`），它们按体积和页数把文件切成若干次提交，每次一个任务。
 
 **成功响应** `201 Created`
 
@@ -118,7 +129,10 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 | 401 | `INVALID_API_KEY` | 密钥无效或缺失。 |
 | 400 | `INVALID_FILE` | 文件格式不支持，或单文件超过 35MB。 |
 | 400 | `TOO_MANY_SLIDES` | 总页数超过 50。 |
+| 400 | `UPLOAD_ABORTED` | 上传中途断开，请求体没收完。重试即可；反复出现多半是这次提交太大，先按上面的体积上限分批。 |
+| 400 | `MALFORMED_UPLOAD` | 请求体不是合法的 `multipart/form-data`。这是客户端拼装问题，重试不会好——检查边界串和各分段的头。 |
 | 402 | `INSUFFICIENT_CREDITS` | 可用积分不够覆盖这次提交。 |
+| 413 | `PAYLOAD_TOO_LARGE` | 同一请求的文件内容合计超过 45MB。 |
 | 429 | `RATE_LIMITED` | 触发限流，见下方「限流」。 |
 
 ---
@@ -135,11 +149,10 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
   "status": "processing",
   "progress": 45,
   "slideCount": 12,
-  "creditsUsed": 12,
+  "creditsUsed": 0,
   "creditsRefunded": 0,
-  "createdAt": "2026-07-07T08:00:00Z",
-  "completedAt": null,
-  "downloadUrl": null
+  "createdAt": "2026-07-07 08:00:00",
+  "completedAt": null
 }
 ```
 
@@ -152,8 +165,8 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 | `slideCount` | 总页数。 |
 | `creditsUsed` | 结算后实际扣除的积分。 |
 | `creditsRefunded` | 部分成功时退回的失败页积分，见「计费与退款」。 |
-| `createdAt` / `completedAt` | 创建时间 / 完成时间（未完成时为 `null`）。 |
-| `downloadUrl` | **仅当 `completed`** 时给出，是下载端点的相对路径；其余状态为 `null`。 |
+| `createdAt` / `completedAt` | UTC 创建时间 / 完成时间，格式为 `YYYY-MM-DD HH:MM:SS`（未完成时 `completedAt` 为 `null`）。 |
+| `downloadUrl` | **仅当 `completed` 且成品仍在保留期内**时给出，是下载端点的相对路径；其余状态不返回这个字段。 |
 | `error` | **仅当 `failed`** 时给出，形如 `{"code": "...", "message": "..."}`。 |
 
 **失败时的样子**
@@ -166,9 +179,8 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
   "slideCount": 12,
   "creditsUsed": 0,
   "creditsRefunded": 12,
-  "createdAt": "2026-07-07T08:00:00Z",
-  "completedAt": "2026-07-07T08:01:00Z",
-  "downloadUrl": null,
+  "createdAt": "2026-07-07 08:00:00",
+  "completedAt": "2026-07-07 08:01:00",
   "error": { "code": "CONVERSION_FAILED", "message": "转换失败，请稍后重试" }
 }
 ```
@@ -195,6 +207,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 |---|---|---|
 | 409 | `NOT_READY` | 任务还没完成，成品暂不可下载。等状态变成 `completed` 再来。 |
 | 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理，无法下载（见下方「保留期」）。 |
+| 416 | `RANGE_NOT_SATISFIABLE` | `Range` 请求的起点超出文件大小，请丢弃旧的续传位置后重新下载。 |
 | 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户。 |
 
 > **保留期**：成品 PPTX 在完成后**保留 7 天**，过期自动清理，之后下载会返回 `410 OUTPUT_EXPIRED`。请在保留期内取走。（历史记录仍在，只是成品文件不再保存。）
@@ -335,11 +348,15 @@ try {
 | 400 | `INVALID_ASPECT_RATIO` | 画幅比例不认识，用 `auto` 或 `16:9`、`4:3`（提交）。 |
 | 400 | `TOO_MANY_SLIDES` | 总页数超过 50（提交）。 |
 | 400 | `PAGE_RATE_EXCEEDED` | 单次提交页数就超过每分钟提交上限，永远排不进窗口（提交）。 |
+| 400 | `UPLOAD_ABORTED` | 上传中途断开，请求体没收完（提交）。重试即可；反复出现多半是这次提交太大，见 `PAYLOAD_TOO_LARGE`。 |
+| 400 | `MALFORMED_UPLOAD` | 请求体不是合法的 `multipart/form-data`（提交）。客户端拼装问题，重试不会好。 |
 | 402 | `INSUFFICIENT_CREDITS` | 可用积分不足，或余额为 0（提交）。 |
 | 403 | `API_KEY_REQUIRED` | 缺少有效的 API key（提交）。 |
 | 403 | `ACCOUNT_DELETED` | 账号已删除（提交）。 |
+| 413 | `PAYLOAD_TOO_LARGE` | 同一请求的文件内容合计超过 45MB（提交）。 |
 | 429 | `RATE_LIMITED` | 触发限流，带 `Retry-After` 头（提交）。轮询状态不限流。 |
 | 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户（查询、下载）。 |
 | 409 | `NOT_READY` | 任务未完成就来下载（下载）。 |
 | 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理（下载）。 |
+| 416 | `RANGE_NOT_SATISFIABLE` | 下载续传范围超出成品文件大小（下载）。 |
 | 5xx | `STORAGE_FAILED` 等 | 服务端处理出错，稍后重试；反复出现请联系我们。 |

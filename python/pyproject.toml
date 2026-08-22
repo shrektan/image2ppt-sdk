@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "image2ppt"
-version = "0.1.1"
+version = "0.2.0"
 description = "Official Python client for the image2ppt API — convert images and PDFs into editable PowerPoint (.pptx)."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -49,7 +49,12 @@ Documentation = "https://image2ppt.com/docs/api"
 Repository = "https://github.com/shrektan/image2ppt-sdk"
 Issues = "https://github.com/shrektan/image2ppt-sdk/issues"
 
-[project.optional-dependencies]
+# A dependency group, not an optional extra: `uv sync` installs it by default, so
+# `uv sync && uv run pytest` works verbatim. As an extra it was NOT installed by a
+# plain `uv sync`, which silently uninstalled pytest and broke the documented test
+# command. It is also not something a user of the published package should be able
+# to `pip install image2ppt[dev]`.
+[dependency-groups]
 dev = ["pytest>=7"]
 
 [tool.hatch.build.targets.wheel]
