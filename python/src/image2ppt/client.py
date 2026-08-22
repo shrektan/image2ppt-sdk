@@ -57,16 +57,20 @@ _MIN_RETRY_AFTER = 1.0
 #: value; ``.strip()`` would also eat Unicode spaces that never belong there.
 _RETRY_AFTER_SECONDS = re.compile(r"[ \t]*([0-9]+(?:\.[0-9]+)?)[ \t]*")
 
-#: Largest ``Retry-After`` this client will act on, in seconds (~24.8 days).
+#: Longest delay this client will ever wait in one go, in seconds (~24.8 days).
 #:
 #: The line is Node's timer range — a delay past 2**31-1 milliseconds is not
 #: representable there, and ``setTimeout`` silently clamps it to *1 millisecond*, so an
-#: absurd header would turn "wait" into "retry immediately, at full speed". Python
-#: fails differently on the same input (``time.sleep`` raises ``OverflowError``), which
-#: is the other half of the problem: the two clients would stop agreeing. Drawing the
-#: line at the same number in both, and treating anything past it as a header the
-#: server never sent, keeps them in step. Nothing legitimate lives out here.
-_MAX_RETRY_AFTER = (2**31 - 1) / 1000
+#: out-of-range wait turns into "retry immediately, at full speed". Python fails
+#: differently on the same input (``time.sleep`` raises ``OverflowError``), which is the
+#: other half of the problem: the two clients would stop agreeing. Drawing the line at
+#: the same number in both keeps them in step. Nothing legitimate lives out here.
+#:
+#: It bounds **every** wait, not just a server-sent ``Retry-After``: the polling backoff
+#: is seeded from the caller's own ``poll_interval``, and on repeated 429s without a
+#: ``Retry-After`` that seed is reused unchanged — so an absurd ``poll_interval`` with a
+#: large enough ``timeout`` would reach the timer the same way.
+_MAX_SLEEP = (2**31 - 1) / 1000
 
 #: How many times one batch may be re-sent after a 429 before giving up.
 #:
@@ -715,11 +719,17 @@ class Image2PPTClient:
             ) from None
 
     def _sleep_until(self, deadline: float, seconds: float, job_id: str) -> None:
-        """Sleep ``seconds``, but never past ``deadline``; raise TimeoutError if past."""
+        """Sleep ``seconds``, but never past ``deadline`` and never past ``_MAX_SLEEP``.
+
+        Raises TimeoutError if the deadline has already passed. The ``_MAX_SLEEP``
+        clamp is not redundant with the deadline: ``deadline`` is derived from the
+        caller's ``timeout``, so both bounds here can be caller-supplied and neither
+        constrains the other. See ``_MAX_SLEEP`` for what an out-of-range wait does.
+        """
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise Image2PPTTimeoutError(f"timed out waiting for job {job_id}", job_id=job_id)
-        time.sleep(min(seconds, remaining))
+        time.sleep(min(seconds, remaining, _MAX_SLEEP))
 
     def _parse_json(self, resp: requests.Response) -> Dict[str, Any]:
         """Return the JSON body on 2xx; otherwise raise the mapped exception."""
@@ -755,7 +765,7 @@ class Image2PPTClient:
         Anything unusable comes back as ``None`` so the caller falls back to its own
         wait: a missing header, an HTTP-date, a negative value (which additionally
         made ``time.sleep`` raise ``ValueError`` out of ``submit_all``), a value past
-        ``_MAX_RETRY_AFTER``, or any spelling that is not plain decimal seconds.
+        ``_MAX_SLEEP``, or any spelling that is not plain decimal seconds.
 
         The syntax is matched explicitly rather than handed to the language's number
         parser. Both parsers are lenient in their own way — ``float`` takes ``"1e3"``
@@ -772,6 +782,6 @@ class Image2PPTClient:
         if match is None:
             return None
         seconds = float(match.group(1))
-        if seconds > _MAX_RETRY_AFTER:
+        if seconds > _MAX_SLEEP:
             return None
         return max(seconds, _MIN_RETRY_AFTER)

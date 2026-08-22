@@ -143,14 +143,18 @@ on the wire, and can split a large pile of files into batches on their own.
   handed to each language's number parser. The parsers are lenient in different ways —
   JavaScript's `Number` reads `0x10` as 16, Python's `float` takes `1e3` and `nan` — so
   the same header could mean different things to the two clients. Anything that is not
-  plain seconds falls back to the documented 5s wait — as does anything past ~24.8
-  days, the point where a delay stops being representable as a timer: Node clamps such
-  a value to *1 millisecond* (turning "wait" into "retry at once, at full speed") while
-  Python raises `OverflowError`. The pattern spells out `[0-9]`
+  plain seconds falls back to the documented 5s wait. The pattern spells out `[0-9]`
   and space-or-tab rather than using `\d` and `strip()`/`trim()`, for the same reason:
   Python's `\d` matches every Unicode decimal digit and JavaScript's matches only
   ASCII, so `Retry-After: ５` would otherwise be five seconds to one client and
   unparseable to the other.
+- **Both clients** — no single wait can exceed ~24.8 days, the point where a delay
+  stops being representable as a timer: past it Node clamps to *1 millisecond* —
+  turning "wait" into "retry at once, at full speed" — while Python raises
+  `OverflowError`. This bounds every wait, not only a server-sent `Retry-After`: the
+  polling backoff is seeded from the caller's own `poll_interval` / `pollIntervalMs`
+  and a 429 without a `Retry-After` reuses that seed unchanged, so a large enough
+  `timeout` left it unbounded.
 - **Both clients** — one batch is retried at most 10 times after a 429, whatever the
   waiting budget allows. The budget bounds time spent *waiting*, which a service
   answering `Retry-After: 1` barely touches — a 30-minute budget would buy ~1800

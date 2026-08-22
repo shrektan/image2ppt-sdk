@@ -1208,3 +1208,46 @@ def test_running_out_of_attempts_still_hands_back_the_jobs_already_created(
 
     assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a"]
     assert len(session.calls) == 1 + _MAX_BATCH_ATTEMPTS
+
+
+# --------------------------------------------------------------------------- #
+# Every wait is bounded, not just a server-sent Retry-After
+#
+# The polling backoff is seeded from the caller's own poll_interval, and a 429
+# without a Retry-After reuses that seed unchanged. With a large enough timeout the
+# deadline does not bound it either — both bounds are caller-supplied, so neither
+# constrains the other. Past the timer range that stops being a wait at all: Python
+# raises OverflowError, and the Node client would clamp to 1ms and hammer the server.
+# --------------------------------------------------------------------------- #
+def test_a_huge_poll_interval_cannot_reach_the_timer(monkeypatch):
+    from image2ppt.client import _MAX_SLEEP
+
+    responses = iter([
+        FakeResponse(429, {"error": {"code": "RATE_LIMITED", "message": "slow"}}),
+        FakeResponse(200, {"jobId": "j", "status": "completed"}),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    client = make_client(lambda *a, **k: next(responses))
+
+    job = client.wait("j", poll_interval=1e18, timeout=1e18)
+
+    assert job.is_completed
+    assert slept == [_MAX_SLEEP]  # clamped, and a real wait rather than an OverflowError
+
+
+def test_a_huge_poll_interval_is_still_bounded_by_the_deadline(monkeypatch):
+    """The clamp does not override the deadline — whichever is smaller wins."""
+    responses = iter([
+        FakeResponse(429, {"error": {"code": "RATE_LIMITED", "message": "slow"}}),
+        FakeResponse(200, {"jobId": "j", "status": "completed"}),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    client = make_client(lambda *a, **k: next(responses))
+
+    job = client.wait("j", poll_interval=1e18, timeout=30)
+
+    assert job.is_completed
+    assert len(slept) == 1
+    assert 0 < slept[0] <= 30  # the deadline, not the clamp

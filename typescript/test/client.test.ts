@@ -1294,3 +1294,51 @@ describe("Retry-After beyond the timer range", () => {
     expect(await delaysFor("2147483", HUGE_BUDGET)).toEqual([2_147_483_000]);
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Every wait is bounded, not just a server-sent Retry-After
+//
+// The polling backoff is seeded from the caller's own pollIntervalMs, and a 429
+// without a Retry-After reuses that seed unchanged. With a large enough timeoutMs the
+// deadline does not bound it either — both bounds are caller-supplied, so neither
+// constrains the other. Past the timer range that stops being a wait at all:
+// setTimeout clamps to 1ms and the client hammers the server. Mirrors the Python tests.
+// --------------------------------------------------------------------------- //
+describe("every wait is bounded", () => {
+  async function delaysWhilePolling(
+    pollIntervalMs: number,
+    timeoutMs: number,
+  ): Promise<number[]> {
+    const f = fetchSequence(
+      json(429, { error: { code: "RATE_LIMITED", message: "slow" } }),
+      json(200, { jobId: "j", status: "completed" }),
+    );
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      const job = await client(f).wait("j", { pollIntervalMs, timeoutMs });
+      expect(job.isCompleted).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  it("clamps a huge poll interval to the timer range", async () => {
+    // 2**31-1: past this, setTimeout would clamp to 1ms and poll in a tight loop.
+    expect(await delaysWhilePolling(1e18, 1e18)).toEqual([2 ** 31 - 1]);
+  });
+
+  it("still lets the deadline win when it is the smaller bound", async () => {
+    const delays = await delaysWhilePolling(1e18, 30_000);
+    expect(delays).toHaveLength(1);
+    expect(delays[0]).toBeGreaterThan(0);
+    expect(delays[0]).toBeLessThanOrEqual(30_000); // the deadline, not the clamp
+  });
+});
