@@ -40,7 +40,6 @@ export {
   MAX_UPLOAD_BYTES,
   checkFileSize,
   checkSubmission,
-  formatBytes,
   planBatches,
 } from "./limits.js";
 export type { UploadItem } from "./limits.js";

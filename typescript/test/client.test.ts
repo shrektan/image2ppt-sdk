@@ -1012,3 +1012,127 @@ describe("documented 400 codes", () => {
     expect(err).toMatchObject({ code });
   });
 });
+
+// --------------------------------------------------------------------------- //
+// The rate-limit waiting budget
+//
+// `rateLimitMaxWaitMs` promises time spent *waiting*. A wall-clock deadline set at
+// the start of the call would be spent by the uploads themselves, so on a slow link
+// a large pile could exhaust it before the first 429 ever arrived — turning the
+// option into "do not wait at all", with the cutoff decided by link speed. Mirrors
+// the Python tests of the same name.
+// --------------------------------------------------------------------------- //
+describe("rate-limit waiting budget", () => {
+  /** Run `fn`, capturing every delay handed to setTimeout instead of sleeping. */
+  async function captureDelays(fn: () => Promise<void>): Promise<number[]> {
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await fn();
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  it("is not consumed by upload time", async () => {
+    const files = await manyImages(MAX_PAGES_PER_JOB + 1); // two batches
+    const f = fetchSequence(
+      json(201, { jobId: "job_a", status: "pending" }),
+      rateLimited("0"), // second batch bounces
+      json(201, { jobId: "job_b", status: "pending" }),
+    );
+    // The clock races far past the whole budget while the first batch uploads. Only
+    // waiting may take from the budget, so this must not change the outcome.
+    let ticks = 0;
+    const nowSpy = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => (ticks += 10_000_000));
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 10_000,
+    });
+
+    let delays: number[];
+    try {
+      delays = await captureDelays(async () => {
+        const jobs = await c.submitAll(files);
+        expect(jobs.map((job) => job.jobId)).toEqual(["job_a", "job_b"]);
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(delays).toEqual([1_000]); // it waited, rather than giving up on a spent clock
+  });
+
+  it("is spent by waiting and then gives up", async () => {
+    // Two waits of 4s fit in a 10s budget; the third does not.
+    const files = await manyImages(2);
+    let calls = 0;
+    const f = fetchScript(() => {
+      calls += 1;
+      // A budget that never depletes would retry forever. Fail loudly instead of
+      // hanging the suite.
+      if (calls > 3) throw new Error("retried past the waiting budget");
+      return rateLimited("4");
+    });
+    const c = new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      fetch: f,
+      rateLimitMaxWaitMs: 10_000,
+    });
+
+    const delays = await captureDelays(async () => {
+      await expect(c.submitAll(files)).rejects.toBeInstanceOf(RateLimitedError);
+    });
+
+    expect(delays).toEqual([4_000, 4_000]); // 8s spent, the third 4s would not fit
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Retry-After spellings a lenient number parser would accept
+//
+// `Number("0x10")` is 16 and Python's `float("1e3")` is 1000. Accepting "whatever
+// the parser allows" makes the two SDKs disagree about the same header, so both
+// match plain decimal seconds explicitly. Mirrors the Python parametrised test.
+// --------------------------------------------------------------------------- //
+describe("Retry-After spellings", () => {
+  async function delaysFor(header: string): Promise<number[]> {
+    const files = await manyImages(2);
+    const f = fetchSequence(rateLimited(header), json(201, { jobId: "j", status: "pending" }));
+    const delays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((cb: () => void, ms?: number) => {
+        delays.push(ms ?? 0);
+        return realSetTimeout(cb, 0);
+      }) as unknown as typeof setTimeout);
+    try {
+      await client(f).submitAll(files);
+    } finally {
+      spy.mockRestore();
+    }
+    return delays;
+  }
+
+  it.each([["0x10"], ["1e3"], ["+5"], [".5"], ["5s"], ["nan"], ["inf"], ["-1"]])(
+    "treats %s as missing and uses the documented fallback",
+    async (header) => {
+      expect(await delaysFor(header)).toEqual([5_000]);
+    },
+  );
+
+  it("accepts a value with the transport's surrounding whitespace", async () => {
+    expect(await delaysFor("  12  ")).toEqual([12_000]);
+  });
+});

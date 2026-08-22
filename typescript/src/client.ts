@@ -134,6 +134,31 @@ async function ensureWritableDir(destDir: string): Promise<void> {
 }
 
 /**
+ * Milliseconds left for waiting out rate limits — spent only by actual waiting.
+ *
+ * A wall-clock deadline fixed at the start of the call would be eaten by the uploads
+ * themselves: a large pile on a slow uplink can burn the whole allowance before the
+ * first 429 even arrives, and then `rateLimitMaxWaitMs` quietly means "do not wait at
+ * all" — with the cutoff depending on link speed rather than on anything the caller
+ * chose. The option promises time spent waiting, so only waiting takes from it.
+ */
+class WaitBudget {
+  #remainingMs: number;
+
+  constructor(remainingMs: number) {
+    this.#remainingMs = remainingMs;
+  }
+
+  /** Wait `ms` if the budget covers it; resolve false if it does not. */
+  async spend(ms: number): Promise<boolean> {
+    if (ms > this.#remainingMs) return false;
+    await sleep(ms);
+    this.#remainingMs -= ms;
+    return true;
+  }
+}
+
+/**
  * Record the jobs created so far on an error escaping a batch call.
  *
  * Every `Image2PPTError` declares `submittedJobs`; this also reaches the rarer
@@ -274,12 +299,12 @@ export class Image2PPTClient {
       throw new Error("at least one file is required");
     }
     const batches = planBatches(await this.#uploadItems(paths));
-    const deadline = performance.now() + this.rateLimitMaxWaitMs;
+    const budget = new WaitBudget(this.rateLimitMaxWaitMs);
     const jobs: Job[] = [];
     for (const batch of batches) {
       try {
         jobs.push(
-          await this.#submitBatch(batch.map((item) => item.path), options, deadline),
+          await this.#submitBatch(batch.map((item) => item.path), options, budget),
         );
       } catch (err) {
         // Whatever went wrong, the earlier batches are already jobs on the server
@@ -480,7 +505,7 @@ export class Image2PPTClient {
   async #submitBatch(
     paths: string[],
     options: SubmitOptions,
-    deadline: number,
+    budget: WaitBudget,
   ): Promise<Job> {
     for (;;) {
       try {
@@ -489,9 +514,7 @@ export class Image2PPTClient {
         if (!(err instanceof RateLimitedError)) throw err;
         const delay =
           err.retryAfter != null ? err.retryAfter * 1000 : RATE_LIMIT_FALLBACK_WAIT_MS;
-        const remaining = deadline - performance.now();
-        if (remaining <= 0 || delay > remaining) throw err;
-        await sleep(delay);
+        if (!(await budget.spend(delay))) throw err;
       }
     }
   }
@@ -570,17 +593,26 @@ export class Image2PPTClient {
   }
 }
 
+/** `Retry-After` as plain decimal seconds — the only spelling this client accepts. */
+const RETRY_AFTER_SECONDS = /^\d+(?:\.\d+)?$/;
+
 /**
  * Parse the `Retry-After` header as seconds (contract: integer seconds).
  *
  * Anything unusable comes back as `undefined` so the caller falls back to its own
- * wait: a missing header, an HTTP-date, a non-finite number, or a negative value.
- * A usable value is floored at `MIN_RETRY_AFTER_SECONDS` — see that constant for
- * why zero cannot be taken literally.
+ * wait: a missing header, an HTTP-date, a negative value, or any spelling that is not
+ * plain decimal seconds.
+ *
+ * The syntax is matched explicitly rather than handed to `Number`. Both languages'
+ * parsers are lenient in their own way — `Number` takes `"0x10"` as 16, Python's
+ * `float` takes `"1e3"` and `"nan"` — so "whatever the parser accepts" would mean the
+ * two clients disagreeing about the same header. One pattern, one answer.
+ *
+ * A usable value is floored at `MIN_RETRY_AFTER_SECONDS` — see that constant for why
+ * zero cannot be taken literally.
  */
 function parseRetryAfter(value: string | null): number | undefined {
-  if (!value) return undefined;
-  const seconds = Number(value);
-  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
-  return Math.max(seconds, MIN_RETRY_AFTER_SECONDS);
+  const raw = value?.trim();
+  if (!raw || !RETRY_AFTER_SECONDS.test(raw)) return undefined;
+  return Math.max(Number(raw), MIN_RETRY_AFTER_SECONDS);
 }

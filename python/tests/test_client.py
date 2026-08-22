@@ -635,11 +635,11 @@ def test_submit_all_does_not_retry_a_broken_connection_either(tmp_path):
 # raised, batching would only trade one failure for another. Retry-After is 0 in
 # these tests so nothing actually sleeps.
 # --------------------------------------------------------------------------- #
-def rate_limited_response():
+def rate_limited_response(retry_after="0"):
     return FakeResponse(
         429,
         {"error": {"code": "RATE_LIMITED", "message": "slow down"}},
-        headers={"Retry-After": "0"},
+        headers={"Retry-After": retry_after},
     )
 
 
@@ -876,6 +876,15 @@ def test_convert_all_leaves_no_probe_file_behind(tmp_path):
         ("Wed, 21 Oct 2026 07:28:00 GMT", None),  # HTTP-date form: not seconds
         ("", None),
         (None, None),
+        # Spellings a language's own number parser would happily take. Accepting
+        # "whatever float()/Number() allows" makes the two SDKs disagree about the
+        # same header: float takes "1e3", JavaScript's Number takes "0x10".
+        ("0x10", None),
+        ("1e3", None),
+        ("+5", None),
+        (".5", None),
+        ("5s", None),
+        ("  12  ", 12.0),  # surrounding whitespace is the transport's, not the value's
     ],
 )
 def test_retry_after_is_sanitised(header, expected):
@@ -1079,3 +1088,61 @@ def test_documented_400_codes_get_their_own_type(tmp_path, code, expected):
 
     assert exc.value.code == code
     assert isinstance(exc.value, Image2PPTError)
+
+
+# --------------------------------------------------------------------------- #
+# The rate-limit waiting budget
+#
+# ``rate_limit_max_wait`` promises time spent *waiting*. A wall-clock deadline set
+# at the start of the call would be spent by the uploads themselves, so on a slow
+# link a large pile could exhaust it before the first 429 ever arrived — turning the
+# option into "do not wait at all", with the cutoff decided by link speed.
+# --------------------------------------------------------------------------- #
+def test_upload_time_does_not_consume_the_rate_limit_budget(tmp_path, monkeypatch):
+    paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)  # two batches
+    responses = iter([
+        FakeResponse(201, {"jobId": "job_a", "status": "pending"}),
+        rate_limited_response(),  # second batch bounces
+        FakeResponse(201, {"jobId": "job_b", "status": "pending"}),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+    # The clock races far past the whole budget while the first batch uploads. Only
+    # waiting may take from the budget, so this must not change the outcome.
+    clock = iter([0.0, 10_000.0, 20_000.0, 30_000.0, 40_000.0])
+    monkeypatch.setattr("image2ppt.client.time.monotonic", lambda: next(clock, 40_000.0))
+    client, _session = client_and_session(
+        lambda *a, **k: next(responses), rate_limit_max_wait=10
+    )
+
+    jobs = client.submit_all(paths)
+
+    assert [job.job_id for job in jobs] == ["job_a", "job_b"]
+    assert slept == [1.0]  # it waited, rather than giving up on a spent wall clock
+
+
+def test_the_budget_is_spent_by_waiting_and_then_gives_up(tmp_path, monkeypatch):
+    """Two waits of 4s fit in a 10s budget; the third does not."""
+    paths = make_images(tmp_path, 2)
+    responses = iter([
+        rate_limited_response("4"),
+        rate_limited_response("4"),
+        rate_limited_response("4"),
+    ])
+    slept = []
+    monkeypatch.setattr("image2ppt.client.time.sleep", slept.append)
+
+    def handler(*_args, **_kwargs):
+        # A budget that never depletes would retry forever. Fail loudly instead of
+        # hanging the suite.
+        try:
+            return next(responses)
+        except StopIteration:
+            raise AssertionError("retried past the waiting budget") from None
+
+    client, _session = client_and_session(handler, rate_limit_max_wait=10)
+
+    with pytest.raises(RateLimitedError):
+        client.submit_all(paths)
+
+    assert slept == [4.0, 4.0]  # 8s spent, the third 4s would not fit

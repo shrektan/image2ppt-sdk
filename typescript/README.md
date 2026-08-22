@@ -80,7 +80,7 @@ console.log(files); // ['decks/part-01.pptx', 'decks/part-02.pptx']
 
 Batches hold at most 40MB of file content and at most 50 images; every PDF goes in a batch of its own, because the client does not parse PDFs and only the server knows their page count. `submitAll()` does the same splitting and hands back the jobs if you want to drive polling yourself. To see the plan without uploading anything, use `planBatches()`.
 
-**Rate limits are waited out, not thrown.** A pile big enough to need batching will hit the account's per-minute page quota (and its cap on concurrently active jobs). Both arrive as a `429` with a `Retry-After`; both are handled the same way — sleep that long, retry the same batch. Retrying a 429 is free: the server is saying it did *not* take the submission, so nothing was created and nothing was charged. Total waiting is capped by `rateLimitMaxWaitMs` (default 30 min).
+**Rate limits are waited out, not thrown.** A pile big enough to need batching will hit the account's per-minute page quota (and its cap on concurrently active jobs). Both arrive as a `429` with a `Retry-After`; both are handled the same way — sleep that long, retry the same batch. Retrying a 429 is free: the server is saying it did *not* take the submission, so nothing was created and nothing was charged. Total waiting is capped by `rateLimitMaxWaitMs` (default 30 min) — and **only waiting counts against it**, not the time the uploads themselves take, so a slow link cannot quietly turn the cap into "do not wait at all".
 
 If a batch call does fail partway, **the jobs it already created come back on the error**:
 

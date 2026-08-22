@@ -35,14 +35,16 @@ MAX_FILE_BYTES = 35 * 1024 * 1024
 #: can answer at all. Keep in sync with the documented API contract.
 MAX_UPLOAD_BYTES = 45 * 1024 * 1024
 
-#: Byte budget for one auto-planned batch. **A splitting budget, not a cap** — that
-#: is ``MAX_UPLOAD_BYTES``, and ``check_submission`` compares against it exactly.
+#: Byte budget for one auto-planned batch. **A splitting budget, not a cap** — the cap
+#: is ``MAX_UPLOAD_BYTES``, and ``check_submission`` compares against that exactly.
 #:
-#: Deliberately below the cap: starting one more batch costs nothing, while refusing
-#: a submission the server would have accepted is a bug in the guard — the same class
-#: of failure this module exists to prevent, only with the client doing the refusing.
-#: The gap absorbs the multipart framing that rides along with the files, so a planned
-#: batch does not land near the cap for reasons the planner cannot see.
+#: Deliberately below the cap, and the asymmetry is the point: starting one more batch
+#: costs nothing, while refusing a submission the server would have accepted is a bug
+#: in the guard. Nothing here needs the headroom — the planner measures the exact bytes
+#: it will send — so this is margin, not correction. **Do not turn it into a cap.**
+#: ``MAX_UPLOAD_BYTES`` is file content only; the multipart framing around it does not
+#: count against the published limit, and a pre-flight that "leaves room" for framing
+#: just makes the documented maximum unreachable.
 BATCH_TARGET_BYTES = 40 * 1024 * 1024
 
 #: Server cap on pages per job. An image is 1 page; a PDF counts as its own page

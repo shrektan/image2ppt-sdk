@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -46,6 +46,10 @@ _RATE_LIMIT_FALLBACK_WAIT = 5.0
 #: retry instead of a flood, and costs nothing when the server means it.
 _MIN_RETRY_AFTER = 1.0
 
+#: ``Retry-After`` as plain decimal seconds — the only spelling this client accepts.
+#: The other legal form is an HTTP-date, which does not match and falls back.
+_RETRY_AFTER_SECONDS = re.compile(r"\d+(?:\.\d+)?")
+
 
 def _ensure_writable_dir(dest_dir: str) -> None:
     """Create ``dest_dir`` if needed and prove a file can actually be written in it.
@@ -81,6 +85,31 @@ def _ensure_writable_dir(dest_dir: str) -> None:
         os.remove(probe)
     except OSError:
         pass  # already gone: nothing to clean up
+
+
+class _WaitBudget:
+    """Seconds left for waiting out rate limits — spent only by actual waiting.
+
+    A wall-clock deadline fixed at the start of the call would be eaten by the
+    uploads themselves: a large pile on a slow uplink can burn the whole allowance
+    before the first 429 even arrives, and then ``rate_limit_max_wait`` quietly
+    means "do not wait at all" — with the cutoff depending on link speed rather
+    than on anything the caller chose. The option promises time spent waiting, so
+    only waiting takes from it.
+    """
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, seconds: float) -> None:
+        self.remaining = seconds
+
+    def spend(self, seconds: float) -> bool:
+        """Wait ``seconds`` if the budget covers it; return False if it does not."""
+        if seconds > self.remaining:
+            return False
+        time.sleep(seconds)
+        self.remaining -= seconds
+        return True
 
 
 def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
@@ -125,9 +154,11 @@ class Image2PPTClient:
         timeout: Per-HTTP-request timeout in seconds (not the whole-job wait).
         session: Optional ``requests.Session`` to inject (for testing or pooling).
         rate_limit_max_wait: Total seconds ``submit_all`` / ``convert_all`` may
-            spend waiting out rate limits across the whole call (default 1800 =
-            30 min). Submitting a large pile *will* hit the per-minute page quota,
-            so waiting is the normal path, not an error.
+            spend **waiting out rate limits** across the whole call (default 1800 =
+            30 min). Only waiting counts against it — the time the uploads
+            themselves take does not, so a slow link cannot quietly turn this into
+            "do not wait at all". Submitting a large pile *will* hit the per-minute
+            page quota, so waiting is the normal path, not an error.
     """
 
     #: Supported input extensions -> MIME type (for labeling multipart uploads).
@@ -281,7 +312,7 @@ class Image2PPTClient:
             raise ValueError("at least one file is required")
 
         batches = plan_batches(self._upload_items(paths))
-        deadline = time.monotonic() + self.rate_limit_max_wait
+        budget = _WaitBudget(self.rate_limit_max_wait)
         jobs: List[Job] = []
         for batch in batches:
             try:
@@ -290,7 +321,7 @@ class Image2PPTClient:
                         [item.path for item in batch],
                         locale=locale,
                         aspect_ratio=aspect_ratio,
-                        deadline=deadline,
+                        budget=budget,
                     )
                 )
             except Exception as exc:
@@ -512,9 +543,9 @@ class Image2PPTClient:
         *,
         locale: Optional[str],
         aspect_ratio: Optional[str],
-        deadline: float,
+        budget: _WaitBudget,
     ) -> Job:
-        """Submit one batch, waiting out rate limits until ``deadline``.
+        """Submit one batch, waiting out rate limits while ``budget`` allows.
 
         Retrying a 429 is not the same gamble as retrying a broken upload: a 429 is
         the server saying it did *not* take the submission. Nothing was created and
@@ -533,10 +564,8 @@ class Image2PPTClient:
                     if exc.retry_after is not None
                     else _RATE_LIMIT_FALLBACK_WAIT
                 )
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or delay > remaining:
+                if not budget.spend(delay):
                     raise
-                time.sleep(delay)
 
     def _prepare_file(self, path: str) -> _PreparedFile:
         """Resolve one path to its multipart part and its exact size on the wire."""
@@ -687,17 +716,19 @@ class Image2PPTClient:
         """Parse the Retry-After header as seconds (contract: integer seconds).
 
         Anything unusable comes back as ``None`` so the caller falls back to its own
-        wait: a missing header, an HTTP-date, ``nan``/``inf``, or a negative value
-        (which additionally made ``time.sleep`` raise ``ValueError`` out of
-        ``submit_all``). A usable value is floored at ``_MIN_RETRY_AFTER`` — see that
-        constant for why zero cannot be taken literally.
+        wait: a missing header, an HTTP-date, a negative value (which additionally
+        made ``time.sleep`` raise ``ValueError`` out of ``submit_all``), or any
+        spelling that is not plain decimal seconds.
+
+        The syntax is matched explicitly rather than handed to the language's number
+        parser. Both parsers are lenient in their own way — ``float`` takes ``"1e3"``
+        and ``"nan"``, JavaScript's ``Number`` takes ``"0x10"`` — so "whatever the
+        parser accepts" would mean the two clients disagreeing about the same header.
+        One pattern, one answer.
+
+        A usable value is floored at ``_MIN_RETRY_AFTER`` — see that constant for why
+        zero cannot be taken literally.
         """
-        if not value:
+        if not value or not _RETRY_AFTER_SECONDS.fullmatch(value.strip()):
             return None
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(seconds) or seconds < 0:
-            return None
-        return max(seconds, _MIN_RETRY_AFTER)
+        return max(float(value.strip()), _MIN_RETRY_AFTER)

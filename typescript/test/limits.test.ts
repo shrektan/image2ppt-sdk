@@ -16,10 +16,12 @@ import {
   TooManySlidesError,
   type UploadItem,
   checkFileSize,
-  formatBytes,
   checkSubmission,
   planBatches,
 } from "../src/index.js";
+// Not exported from the package root — Python keeps `format_bytes` private too, and
+// the two SDKs must present the same public surface.
+import { formatBytes } from "../src/limits.js";
 
 const img = (path: string, size = 1): UploadItem => ({ path, size, isPdf: false });
 const pdf = (path: string, size = 1): UploadItem => ({ path, size, isPdf: true });

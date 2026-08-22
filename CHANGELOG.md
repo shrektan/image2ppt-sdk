@@ -133,6 +133,20 @@ on the wire, and can split a large pile of files into batches on their own.
   READMEs used to describe the check in identical words as if they could not.
 - **Python** — `__version__` said `0.1.0` while the package was `0.1.1`. Both now
   come from the same release number, with a test guarding against the drift.
+- **Both clients** — `rate_limit_max_wait` / `rateLimitMaxWaitMs` now measures what
+  its name says: time spent **waiting**. It used to be a wall-clock deadline fixed
+  when the call started, so the uploads themselves spent it — a large pile on a slow
+  link could exhaust the allowance before the first 429 even arrived, and the option
+  quietly became "do not wait at all", with the cutoff decided by link speed rather
+  than by anything the caller chose.
+- **Both clients** — `Retry-After` is now matched as plain decimal seconds rather than
+  handed to each language's number parser. The parsers are lenient in different ways —
+  JavaScript's `Number` reads `0x10` as 16, Python's `float` takes `1e3` and `nan` — so
+  the same header could mean different things to the two clients. Anything that is not
+  plain seconds falls back to the documented 5s wait.
+- **TypeScript** — `formatBytes` is no longer exported from the package root. It is an
+  error-message helper, not part of the contract, and Python keeps `format_bytes`
+  private; the two SDKs must present the same public surface.
 
 ## 0.1.1
 
