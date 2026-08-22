@@ -16,7 +16,7 @@ from PIL import Image
 
 from image2ppt import (
     MAX_FILE_BYTES,
-    MAX_FILE_CONTENT_BYTES,
+    MAX_UPLOAD_BYTES,
     MAX_PAGES_PER_JOB,
     AuthenticationError,
     Image2PPTClient,
@@ -449,7 +449,7 @@ def exploding_handler(*_args, **_kwargs):
 def test_submit_refuses_oversized_batch_without_sending_anything(tmp_path):
     """Two individually-legal files that add up past the request cap: rejected
     before a connection is opened."""
-    half = MAX_FILE_CONTENT_BYTES // 2
+    half = MAX_UPLOAD_BYTES // 2
     files = [
         sparse_file(tmp_path, "a.pdf", half),
         sparse_file(tmp_path, "b.pdf", half + 1),

@@ -27,7 +27,7 @@ import {
   MalformedUploadError,
   MAX_FILE_BYTES,
   MAX_PAGES_PER_JOB,
-  MAX_FILE_CONTENT_BYTES,
+  MAX_UPLOAD_BYTES,
   NoFilesError,
   NotReadyError,
   PageRateExceededError,
@@ -359,7 +359,7 @@ async function manyImages(count: number): Promise<string[]> {
 describe("upload size guard", () => {
   it("refuses an oversized batch without sending anything", async () => {
     // Two individually-legal files that add up past the request cap.
-    const half = Math.floor(MAX_FILE_CONTENT_BYTES / 2);
+    const half = Math.floor(MAX_UPLOAD_BYTES / 2);
     const files = [
       await sparseFile("a.png", half),
       await sparseFile("b.png", half + 1),

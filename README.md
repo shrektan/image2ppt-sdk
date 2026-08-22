@@ -35,7 +35,7 @@ console.log("done, credits used:", job.creditsUsed);
 
 ## More files than one request can hold
 
-One request carries at most 40MB of file content and 50 pages, and one file at most 35MB. Both SDKs check all three **locally, before uploading** — going over the request limit is not a polite error, the connection is simply cut before the API can answer. (The server's cap is 45MB on the whole HTTP request; the gap is the multipart envelope the files travel in.)
+One request carries at most 45MB of file content and 50 pages, and one file at most 35MB. Both SDKs check all three **locally, before uploading** — going over the request limit is not a polite error, the connection is simply cut before the API can answer.
 
 For a pile bigger than that, `convert_all()` / `convertAll()` splits it into batches and writes **one PPTX per batch** (there is no server-side merge). `convert()` is unchanged: one job, one deck. Details in each SDK's README.
 

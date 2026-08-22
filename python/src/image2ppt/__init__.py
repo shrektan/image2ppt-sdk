@@ -14,8 +14,8 @@ See https://github.com/shrektan/image2ppt-sdk for docs and examples.
 from __future__ import annotations
 
 from ._limits import (
+    BATCH_TARGET_BYTES,
     MAX_FILE_BYTES,
-    MAX_FILE_CONTENT_BYTES,
     MAX_PAGES_PER_JOB,
     MAX_UPLOAD_BYTES,
     UploadItem,
@@ -51,7 +51,7 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "MAX_FILE_BYTES",
     "MAX_UPLOAD_BYTES",
-    "MAX_FILE_CONTENT_BYTES",
+    "BATCH_TARGET_BYTES",
     "MAX_PAGES_PER_JOB",
     "UploadItem",
     "check_file_size",

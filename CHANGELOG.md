@@ -10,18 +10,17 @@ on the wire, and can split a large pile of files into batches on their own.
 
 ### Added
 - **Both clients** — a pre-flight size check on `submit()`. The files in one
-  request must add up to ≤ 40MB; over that the client raises `InvalidFileError`
+  request must add up to ≤ 45MB; over that the client raises `InvalidFileError`
   (`PAYLOAD_TOO_LARGE`) **before opening a connection**. This limit could not be
   reported properly from the server side: an oversized request is cut off by the
   network before the API can answer, so callers used to see a bare write timeout
   or broken pipe with no error code.
 
-  The number is 40MB rather than the server's 45MB because the two measure
-  different things: the server caps the whole HTTP request, this check counts file
-  bytes, and what travels on the wire is a multipart body — always larger than the
-  files it carries. `submit()` and the batch planner now share the one number
-  (`MAX_FILE_CONTENT_BYTES`); two different answers to "how much fits in one
-  request" is how a client ends up refusing what it would happily have planned.
+  The check compares against the published 45MB exactly, never less. Refusing a
+  submission the service would have accepted is the same class of bug as letting
+  through one it will not — only with the client doing the refusing. Batch planning
+  is the one place that is deliberately conservative (`BATCH_TARGET_BYTES`, 40MB),
+  because starting one more batch costs nothing.
 - **Both clients** — `submit_all()` / `submitAll()` and `convert_all()` /
   `convertAll()`: split files into batches that each fit a request (≤ 40MB of file
   content, ≤ 50 images, every PDF in a batch of its own) and create one job per
@@ -38,7 +37,7 @@ on the wire, and can split a large pile of files into batches on their own.
   was certain to be rejected server-side. The check is a lower bound, not the
   server's verdict — the SDKs do not parse PDFs — and the docs now say so.
 - **Both clients** — the limits and the batch planner are public: `MAX_FILE_BYTES`,
-  `MAX_UPLOAD_BYTES`, `MAX_FILE_CONTENT_BYTES`, `MAX_PAGES_PER_JOB`, `UploadItem`,
+  `MAX_UPLOAD_BYTES`, `BATCH_TARGET_BYTES`, `MAX_PAGES_PER_JOB`, `UploadItem`,
   `check_file_size()` / `checkFileSize()`, `check_submission()` /
   `checkSubmission()`, `plan_batches()` / `planBatches()`.
 - **Both clients** — **submissions are never retried automatically**, and the

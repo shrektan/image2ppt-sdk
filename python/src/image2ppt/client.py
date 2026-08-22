@@ -170,7 +170,7 @@ class Image2PPTClient:
         """Submit a batch of files and create a conversion job.
 
         Checked locally before anything is uploaded: the files must add up to at
-        most 40MB and at most 50 pages. Over either limit this raises without
+        most 45MB and at most 50 pages. Over either limit this raises without
         opening a connection — going over the size cap on the wire does not come
         back as a clean error, it comes back as a dead connection.
 
@@ -183,9 +183,7 @@ class Image2PPTClient:
 
         Args:
             paths: Local file paths (one or more). Supports png/jpeg/webp/gif/pdf,
-                each file <= 35MB, and <= 40MB of file content per request (the
-                server's cap is 45MB on the whole HTTP body; the gap is the
-                multipart envelope). An
+                each file <= 35MB, and <= 45MB of file content per request. An
                 image is 1 page, a PDF is its page count; the total must be
                 <= 50 pages. For more files than one request can hold, use
                 ``submit_all`` / ``convert_all``.
@@ -425,7 +423,7 @@ class Image2PPTClient:
         Arguments mirror ``submit`` and ``wait``. For the synchronous
         "give me a batch of images, hand me back a PPTX" case.
 
-        One job, one PPTX — the files must fit in a single submission (40MB of
+        One job, one PPTX — the files must fit in a single submission (45MB of
         file content, 50 pages). For more than that, ``convert_all`` splits the pile
         and writes one PPTX per batch.
         """

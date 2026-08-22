@@ -13,9 +13,9 @@
  * connection, and split a large pile of files into submittable batches.
  *
  * There are three separate caps, and they fail in different ways: one file
- * (`MAX_FILE_BYTES`), one request (`MAX_UPLOAD_BYTES`, measured on the whole HTTP
- * body — this client keeps file content under the lower `MAX_FILE_CONTENT_BYTES` so
- * the body stays inside it), and pages per job (`MAX_PAGES_PER_JOB`).
+ * (`MAX_FILE_BYTES`), the file content of one request (`MAX_UPLOAD_BYTES`), and
+ * pages per job (`MAX_PAGES_PER_JOB`). `BATCH_TARGET_BYTES` is not a fourth cap — it
+ * is how much `planBatches` puts in one batch, deliberately under the real one.
  */
 
 import { InvalidFileError, TooManySlidesError } from "./errors.js";
@@ -28,29 +28,24 @@ import { InvalidFileError, TooManySlidesError } from "./errors.js";
 export const MAX_FILE_BYTES = 35 * 1024 * 1024;
 
 /**
- * Server cap on **one request**, measured on the whole HTTP body. Over this, the
- * request is rejected (413 `PAYLOAD_TOO_LARGE`) — or cut off outright before the
- * server can answer at all. Keep in sync with the documented API contract.
+ * Server cap on the **file content** of one request — boundaries, per-part headers
+ * and filenames do not count towards it. Over this, the request is rejected
+ * (413 `PAYLOAD_TOO_LARGE`) — or, further up, cut off outright before the server can
+ * answer at all. Keep in sync with the documented API contract.
  */
 export const MAX_UPLOAD_BYTES = 45 * 1024 * 1024;
 
 /**
- * The most **file content** this client will put in one request, and the ceiling for
- * one auto-planned batch.
+ * Byte budget for one auto-planned batch. **A splitting budget, not a cap** — that is
+ * `MAX_UPLOAD_BYTES`, and `checkSubmission` compares against it exactly.
  *
- * Deliberately below `MAX_UPLOAD_BYTES`, because the two measure different things:
- * the server's cap is on the whole HTTP body, and what travels on the wire is a
- * multipart body — always larger than the file bytes it carries (boundaries,
- * per-part headers, filenames). Counting file bytes against the request cap with no
- * gap would let a submission through that lands just over it on the wire, which is
- * exactly the failure this module exists to prevent — and that failure has no error
- * code, only a dead connection.
- *
- * The same number governs `submit` and `planBatches` on purpose. Two different
- * answers to "how much fits in one request" is how a client ends up refusing what it
- * would happily have planned, or planning what it would have refused.
+ * Deliberately below the cap: starting one more batch costs nothing, while refusing a
+ * submission the server would have accepted is a bug in the guard — the same class of
+ * failure this module exists to prevent, only with the client doing the refusing. The
+ * gap absorbs the multipart framing that rides along with the files, so a planned
+ * batch does not land near the cap for reasons the planner cannot see.
  */
-export const MAX_FILE_CONTENT_BYTES = 40 * 1024 * 1024;
+export const BATCH_TARGET_BYTES = 40 * 1024 * 1024;
 
 /**
  * Server cap on pages per job. An image is 1 page; a PDF counts as its own page
@@ -125,7 +120,7 @@ export function checkFileSize(path: string, size: number): void {
  *   the client). Each counts as at least 1 page.
  * @throws TooManySlidesError The minimum page count already exceeds what one job
  *   can hold.
- * @throws InvalidFileError More file content than one request may carry
+ * @throws InvalidFileError File content over the per-request cap
  *   (`code = "PAYLOAD_TOO_LARGE"`).
  */
 export function checkSubmission(
@@ -145,11 +140,11 @@ export function checkSubmission(
       { code: "TOO_MANY_SLIDES" },
     );
   }
-  if (totalBytes > MAX_FILE_CONTENT_BYTES) {
+  if (totalBytes > MAX_UPLOAD_BYTES) {
     throw new InvalidFileError(
       `these files add up to ${formatBytes(totalBytes)}, over the ` +
-        `${formatBytes(MAX_FILE_CONTENT_BYTES)} of file content one request may ` +
-        `carry (${formatBytes(totalBytes - MAX_FILE_CONTENT_BYTES)} too much). ` +
+        `${formatBytes(MAX_UPLOAD_BYTES)} of file content one request may carry ` +
+        `(${formatBytes(totalBytes - MAX_UPLOAD_BYTES)} too much). ` +
         "Send fewer files per call, or use submitAll() / convertAll() to split them " +
         "into batches automatically",
       { code: "PAYLOAD_TOO_LARGE" },
@@ -163,7 +158,7 @@ export function checkSubmission(
  * Pure function: no file system, no network. Same input, same output.
  *
  * Rules:
- * - a batch holds at most `MAX_FILE_CONTENT_BYTES` of file content;
+ * - a batch holds at most `BATCH_TARGET_BYTES` of file content;
  * - a batch holds at most `MAX_PAGES_PER_JOB` images. That count is exact, not a
  *   lower bound like `checkSubmission`'s: a PDF always flushes the current batch
  *   and takes one of its own, so a batch being filled here only ever holds images,
@@ -205,7 +200,7 @@ export function planBatches(items: Iterable<UploadItem>): UploadItem[][] {
     // refuse to place an item.
     if (
       current.length &&
-      (currentBytes + item.size > MAX_FILE_CONTENT_BYTES ||
+      (currentBytes + item.size > BATCH_TARGET_BYTES ||
         current.length + 1 > MAX_PAGES_PER_JOB)
     ) {
       flush();

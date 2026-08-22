@@ -391,7 +391,7 @@ export class Image2PPTClient {
   /**
    * One-shot: submit → wait for completion → download to `destPath`.
    *
-   * One job, one PPTX — the files must fit in a single submission (40MB of file
+   * One job, one PPTX — the files must fit in a single submission (45MB of file
    * content, 50 pages). For more than that, `convertAll` splits the pile and writes
    * one PPTX per batch.
    */
