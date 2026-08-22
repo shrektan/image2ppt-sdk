@@ -26,6 +26,11 @@ export interface ClientOptions {
    * quota, so waiting is the normal path, not an error.
    */
   rateLimitMaxWaitMs?: number;
+  /**
+   * When the service marks this SDK version deprecated, `console.warn` once.
+   * Default true. Set to false to silence it.
+   */
+  warnOnDeprecated?: boolean;
 }
 
 export interface SubmitOptions {

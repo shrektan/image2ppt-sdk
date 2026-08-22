@@ -25,21 +25,19 @@ import type {
   WaitOptions,
 } from "./types.js";
 import { Job } from "./types.js";
+import { VERSION } from "./version.js";
 
 export const DEFAULT_BASE_URL = "https://image2ppt.com";
 
 /**
  * Sent on every request so the service knows which client version made it.
  *
- * Without it the service cannot tell a caller on an old SDK from anyone else, which
- * means it can never warn anyone that their version is about to stop working. This is
- * only the identifier half — acting on it (a deprecation header the client surfaces
- * as a warning) needs the service side first.
- *
- * Kept in step with `package.json` by a test; there is no version constant to import
- * because reading `package.json` at runtime breaks under bundlers.
+ * The service matches this string in full (`^...$`); appending another product
+ * token would make the whole header unrecognisable. It is not part of
+ * authentication and never changes the outcome of a request. Built from
+ * `VERSION`, which a test keeps in step with `package.json`.
  */
-const USER_AGENT = "image2ppt-node/0.2.0";
+const USER_AGENT = `image2ppt-node/${VERSION}`;
 
 /** Wait between rate-limited retries when the server sends no `Retry-After`. */
 const RATE_LIMIT_FALLBACK_WAIT_MS = 5_000;
@@ -183,8 +181,10 @@ export class Image2PPTClient {
   readonly baseUrl: string;
   readonly timeoutMs: number;
   readonly rateLimitMaxWaitMs: number;
+  readonly warnOnDeprecated: boolean;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
+  #deprecationWarned = false;
 
   constructor(options: ClientOptions) {
     if (!options?.apiKey) {
@@ -193,6 +193,7 @@ export class Image2PPTClient {
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = options.timeoutMs ?? 60_000;
     this.rateLimitMaxWaitMs = Math.max(0, options.rateLimitMaxWaitMs ?? 1_800_000);
+    this.warnOnDeprecated = options.warnOnDeprecated !== false;
     this.#apiKey = options.apiKey;
     const impl = options.fetch ?? globalThis.fetch;
     if (!impl) {
@@ -540,12 +541,14 @@ export class Image2PPTClient {
 
   async #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {
     try {
-      return await this.#fetch(`${this.baseUrl}${path}`, {
+      const res = await this.#fetch(`${this.baseUrl}${path}`, {
         method,
         headers: { Authorization: `Bearer ${this.#apiKey}`, "User-Agent": USER_AGENT },
         body: init.body,
         signal: AbortSignal.timeout(this.timeoutMs),
       });
+      this.#warnIfDeprecated(res);
+      return res;
     } catch (err) {
       // AbortSignal.timeout aborts the whole request (including a slow large
       // upload/download body) with a native DOMException, which is NOT an
@@ -563,6 +566,31 @@ export class Image2PPTClient {
       }
       throw err;
     }
+  }
+
+  /**
+   * Log at most one warning if this SDK version has been marked deprecated.
+   *
+   * The service puts a `Deprecation` header on successful responses of a version
+   * below the support floor. Presence is the whole signal — the value is not
+   * parsed. `Sunset` and `Link` are included in the message when present. `wait()`
+   * polls every few seconds, so this is latched per client.
+   */
+  #warnIfDeprecated(res: Response): void {
+    if (!this.warnOnDeprecated || this.#deprecationWarned) return;
+    if (!res.headers.has("Deprecation")) return;
+    this.#deprecationWarned = true;
+    const parts = [
+      `This image2ppt Node SDK (${VERSION}) has been marked deprecated.`,
+    ];
+    const url = linkUrl(res.headers.get("Link"));
+    if (url) parts.push(`See ${url} for what changed.`);
+    const sunset = res.headers.get("Sunset");
+    if (sunset) parts.push(`Support is planned to end ${sunset}.`);
+    parts.push(
+      "Pass warnOnDeprecated: false to Image2PPTClient() to silence this warning.",
+    );
+    console.warn(parts.join(" "));
   }
 
   async #parseJson(res: Response): Promise<Record<string, unknown>> {
@@ -606,6 +634,16 @@ export class Image2PPTClient {
     }
     await sleep(Math.min(ms, remaining, MAX_SLEEP_MS));
   }
+}
+
+/** Pull the URL out of a `Link: <url>; rel=...` header, or null. */
+function linkUrl(value: string | null): string | null {
+  if (!value) return null;
+  const start = value.indexOf("<");
+  const end = value.indexOf(">", start + 1);
+  if (start === -1 || end === -1) return null;
+  const url = value.slice(start + 1, end).trim();
+  return url || null;
 }
 
 /**

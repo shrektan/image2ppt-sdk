@@ -35,6 +35,7 @@ import {
   type Job as JobType,
   TooManySlidesError,
   UploadAbortedError,
+  VERSION,
 } from "../src/index.js";
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
@@ -968,27 +969,88 @@ describe("download atomicity", () => {
 // --------------------------------------------------------------------------- //
 // Client identification
 //
-// Without a User-Agent the service cannot tell which SDK version made a request, so
-// it can never warn anyone that theirs is about to stop working.
+// Copied from the service: this is the only identification contract between the
+// two repos. Appending another product token would make the whole string fail
+// and land in the "unknown client" bucket.
 // --------------------------------------------------------------------------- //
+const SDK_USER_AGENT_RE =
+  /^image2ppt-(python|node)\/(\d{1,6}\.\d{1,6}\.\d{1,6}[0-9A-Za-z.+-]{0,32})$/;
+
+const DEPRECATION_HEADERS = {
+  Deprecation: "@1793491200",
+  Sunset: "Sun, 01 Nov 2026 00:00:00 GMT",
+  Link: '<https://github.com/shrektan/image2ppt-sdk/blob/main/CHANGELOG.md>; rel="deprecation"',
+};
+
 describe("client identification", () => {
   it("sends a User-Agent naming the SDK and its version", async () => {
     const f = fetchSequence(json(200, { email: "e", credits: 1 }));
     await client(f).account();
 
     const headers = f.calls[0]?.init.headers as Record<string, string>;
-    expect(headers["User-Agent"]).toMatch(/^image2ppt-node\/\d+\.\d+\.\d+$/);
+    const ua = headers["User-Agent"];
+    expect(ua).toBe(`image2ppt-node/${VERSION}`);
+    expect(ua).toMatch(SDK_USER_AGENT_RE);
   });
 
-  it("keeps that version in step with package.json", async () => {
-    const pkg = JSON.parse(
-      await readFile(new URL("../package.json", import.meta.url), "utf8"),
-    ) as { version: string };
+  it("sends that User-Agent through an injected fetch too", async () => {
     const f = fetchSequence(json(200, { email: "e", credits: 1 }));
-    await client(f).account();
+    await new Image2PPTClient({ apiKey: "i2p_live_test", fetch: f }).account();
 
     const headers = f.calls[0]?.init.headers as Record<string, string>;
-    expect(headers["User-Agent"]).toBe(`image2ppt-node/${pkg.version}`);
+    expect(headers["User-Agent"]).toBe(`image2ppt-node/${VERSION}`);
+  });
+});
+
+describe("deprecation warning", () => {
+  it("warns once when Deprecation is present", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // A new Response each call — reusing one would consume its body the first time.
+      const f = fetchScript(() => json(200, { email: "e", credits: 1 }, DEPRECATION_HEADERS));
+      const c = client(f);
+      await c.account();
+      await c.account();
+      expect(spy).toHaveBeenCalledTimes(1);
+      const msg = String(spy.mock.calls[0]?.[0]);
+      expect(msg).toContain(VERSION);
+      expect(msg).toMatch(/deprecated/i);
+      expect(msg).toContain("CHANGELOG.md");
+      expect(msg).toContain("Sun, 01 Nov 2026 00:00:00 GMT");
+      expect(msg).toContain("warnOnDeprecated: false");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not warn when the switch is off", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const f = fetchScript(() => json(200, { email: "e", credits: 1 }, DEPRECATION_HEADERS));
+      const c = new Image2PPTClient({
+        apiKey: "i2p_live_test",
+        fetch: f,
+        warnOnDeprecated: false,
+      });
+      await c.account();
+      await c.account();
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not warn without a Deprecation header", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const f = fetchSequence(
+        json(200, { email: "e", credits: 1 }, { Sunset: "Sun, 01 Nov 2026 00:00:00 GMT" }),
+      );
+      await client(f).account();
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

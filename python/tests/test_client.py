@@ -8,7 +8,9 @@ instantly.
 from __future__ import annotations
 
 import io
+import logging
 import os
+import re
 
 import pytest
 import requests
@@ -1067,16 +1069,89 @@ def test_download_writes_the_whole_deck_on_success(tmp_path):
 # --------------------------------------------------------------------------- #
 # Client identification
 #
-# Without a User-Agent the service cannot tell which SDK version made a request, so
-# it can never warn anyone that theirs is about to stop working.
+# Copied from the service: this is the only identification contract between the
+# two repos. Appending another product token (python-requests/2.x) would make
+# the whole string fail and land in the "unknown client" bucket.
 # --------------------------------------------------------------------------- #
+_SDK_USER_AGENT_RE = re.compile(
+    r"^image2ppt-(python|node)/(\d{1,6}\.\d{1,6}\.\d{1,6}[0-9A-Za-z.+-]{0,32})$"
+)
+
+_DEPRECATION_HEADERS = {
+    "Deprecation": "@1793491200",
+    "Sunset": "Sun, 01 Nov 2026 00:00:00 GMT",
+    "Link": (
+        "<https://github.com/shrektan/image2ppt-sdk/blob/main/CHANGELOG.md>; "
+        'rel="deprecation"'
+    ),
+}
+
+
 def test_requests_identify_the_sdk_and_its_version():
     import image2ppt
 
     session = FakeSession(lambda *a, **k: FakeResponse(200, {"email": "e", "credits": 1}))
     Image2PPTClient("i2p_live_test", session=session).account()
 
+    ua = session.headers["User-Agent"]
+    assert ua == f"image2ppt-python/{image2ppt.__version__}"
+    assert _SDK_USER_AGENT_RE.match(ua)
+
+
+def test_injected_session_gets_the_same_user_agent():
+    import image2ppt
+
+    session = FakeSession(lambda *a, **k: FakeResponse())
+    Image2PPTClient("i2p_live_test", session=session)
     assert session.headers["User-Agent"] == f"image2ppt-python/{image2ppt.__version__}"
+
+
+def test_deprecation_header_warns_once(caplog):
+    import image2ppt
+
+    def handler(*a, **k):
+        return FakeResponse(200, {"email": "e", "credits": 1}, headers=_DEPRECATION_HEADERS)
+
+    client = make_client(handler)
+    with caplog.at_level(logging.WARNING, logger="image2ppt"):
+        client.account()
+        client.account()
+    messages = [r.getMessage() for r in caplog.records if r.name == "image2ppt"]
+    assert len(messages) == 1
+    msg = messages[0]
+    assert image2ppt.__version__ in msg
+    assert "deprecated" in msg.lower()
+    assert "CHANGELOG.md" in msg
+    assert "Sun, 01 Nov 2026 00:00:00 GMT" in msg
+    assert "warn_on_deprecated=False" in msg
+
+
+def test_deprecation_warning_can_be_switched_off(caplog):
+    session = FakeSession(
+        lambda *a, **k: FakeResponse(
+            200, {"email": "e", "credits": 1}, headers=_DEPRECATION_HEADERS
+        )
+    )
+    client = Image2PPTClient(
+        "i2p_live_test", session=session, warn_on_deprecated=False
+    )
+    with caplog.at_level(logging.WARNING, logger="image2ppt"):
+        client.account()
+        client.account()
+    assert [r for r in caplog.records if r.name == "image2ppt"] == []
+
+
+def test_no_warning_without_deprecation_header(caplog):
+    def handler(*a, **k):
+        return FakeResponse(
+            200,
+            {"email": "e", "credits": 1},
+            headers={"Sunset": "Sun, 01 Nov 2026 00:00:00 GMT"},
+        )
+
+    with caplog.at_level(logging.WARNING, logger="image2ppt"):
+        make_client(handler).account()
+    assert [r for r in caplog.records if r.name == "image2ppt"] == []
 
 
 # --------------------------------------------------------------------------- #
