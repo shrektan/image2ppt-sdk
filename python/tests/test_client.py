@@ -1176,4 +1176,5 @@ def test_a_batch_is_not_retried_forever_on_a_cheap_retry_after(tmp_path, monkeyp
         client.submit_all(paths)
 
     assert len(session.calls) == _MAX_BATCH_ATTEMPTS  # not ~1800
-    assert len(slept) == _MAX_BATCH_ATTEMPTS
+    # One wait between attempts, and none after the last: nothing would follow it.
+    assert len(slept) == _MAX_BATCH_ATTEMPTS - 1

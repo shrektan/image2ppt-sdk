@@ -511,19 +511,20 @@ export class Image2PPTClient {
     // budget bounds time spent waiting; the attempt count bounds the uploads, which
     // the budget cannot see — a server answering `Retry-After: 1` forever costs almost
     // no budget per round while re-sending the whole batch every time.
-    let last: RateLimitedError | undefined;
-    for (let attempt = 0; attempt < MAX_BATCH_ATTEMPTS; attempt += 1) {
+    let attemptsLeft = MAX_BATCH_ATTEMPTS;
+    for (;;) {
       try {
         return await this.submit(paths, options);
       } catch (err) {
         if (!(err instanceof RateLimitedError)) throw err;
+        attemptsLeft -= 1;
         const delay =
           err.retryAfter != null ? err.retryAfter * 1000 : RATE_LIMIT_FALLBACK_WAIT_MS;
-        if (!(await budget.spend(delay))) throw err;
-        last = err;
+        // On the last attempt, do not wait first: nothing follows the wait, so it
+        // would only delay the error the caller is already getting.
+        if (attemptsLeft <= 0 || !(await budget.spend(delay))) throw err;
       }
     }
-    throw last;
   }
 
   /** Measure files for batch planning, using the size they will occupy on the wire. */

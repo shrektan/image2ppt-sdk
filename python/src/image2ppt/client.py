@@ -577,19 +577,21 @@ class Image2PPTClient:
         ``Retry-After: 1`` forever costs almost no budget per round while re-sending
         the whole batch every time.
         """
-        for _attempt in range(_MAX_BATCH_ATTEMPTS):
+        attempts_left = _MAX_BATCH_ATTEMPTS
+        while True:
             try:
                 return self.submit(paths, locale=locale, aspect_ratio=aspect_ratio)
             except RateLimitedError as exc:
+                attempts_left -= 1
                 delay = (
                     exc.retry_after
                     if exc.retry_after is not None
                     else _RATE_LIMIT_FALLBACK_WAIT
                 )
-                if not budget.spend(delay):
+                # On the last attempt, do not wait first: nothing follows the wait,
+                # so it would only delay the error the caller is already getting.
+                if attempts_left <= 0 or not budget.spend(delay):
                     raise
-                last = exc
-        raise last
 
     def _prepare_file(self, path: str) -> _PreparedFile:
         """Resolve one path to its multipart part and its exact size on the wire."""
