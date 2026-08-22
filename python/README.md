@@ -95,7 +95,9 @@ except Image2PPTError as e:
 
 ## Rate limits
 
-Per account (all keys share the budget): ≤ 10 concurrent jobs, ≤ 60 pages/minute submitted. Over the limit returns `429` with a `Retry-After` hint. `wait()` handles 429 backoff for you automatically. If you call `submit()` directly, catch `RateLimitedError` and honor `retry_after`:
+Per account (all keys share the budget): ≤ 10 concurrent jobs, ≤ 60 pages/minute submitted. Over the limit returns `429` with a `Retry-After` hint. **Only submissions are rate limited — polling job status is not.**
+
+`submit_all()` / `convert_all()` wait these out for you: a pile big enough to need batching is a pile big enough to hit the quota, so a 429 mid-pile is the normal path, not an error. `submit()` and `convert()` do not — they submit exactly once, so catch `RateLimitedError` and honor `retry_after` yourself:
 
 ```python
 import time
