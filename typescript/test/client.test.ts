@@ -21,6 +21,7 @@ import {
   InvalidFileError,
   Job,
   JobNotFoundError,
+  MalformedUploadError,
   MAX_FILE_BYTES,
   MAX_PAGES_PER_JOB,
   MAX_UPLOAD_BYTES,
@@ -28,6 +29,7 @@ import {
   RateLimitedError,
   type Job as JobType,
   TooManySlidesError,
+  UploadAbortedError,
 } from "../src/index.js";
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
@@ -128,6 +130,35 @@ describe("submit", () => {
       statusCode: 401,
     });
     await expect(c.submit([file])).rejects.toBeInstanceOf(AuthenticationError);
+  });
+
+  it("maps UPLOAD_ABORTED to its own type", async () => {
+    // The one upload failure a caller may safely resend: the server states it
+    // took nothing. It must be distinguishable from MALFORMED_UPLOAD.
+    const file = await tempFile();
+    const c = client(
+      fetchSequence(json(400, { error: { code: "UPLOAD_ABORTED", message: "body incomplete" } })),
+    );
+    await expect(c.submit([file])).rejects.toMatchObject({
+      name: "UploadAbortedError",
+      code: "UPLOAD_ABORTED",
+      statusCode: 400,
+    });
+  });
+
+  it("maps MALFORMED_UPLOAD to its own type", async () => {
+    // Opposite advice — resending identical bytes is pointless — so it must not
+    // share a type with UPLOAD_ABORTED.
+    const file = await tempFile();
+    const c = client(
+      fetchSequence(json(400, { error: { code: "MALFORMED_UPLOAD", message: "bad multipart" } })),
+    );
+    const err = await c.submit([file]).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(MalformedUploadError);
+    expect(err).not.toBeInstanceOf(UploadAbortedError);
   });
 
   it("maps 402 to InsufficientCreditsError", async () => {

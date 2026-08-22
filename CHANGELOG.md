@@ -52,8 +52,26 @@ on the wire, and can split a large pile of files into batches on their own.
   come back on the exception as `submitted_jobs` / `submittedJobs`. Those jobs are
   running with credits already reserved; collect them instead of resubmitting.
 - **Both clients** — `PAYLOAD_TOO_LARGE` and HTTP 413 map to `InvalidFileError`.
+- **Both clients** — two new server error codes now map to their own exception
+  types instead of falling through to the base class, because their advice is
+  opposite. `UploadAbortedError` (`400 UPLOAD_ABORTED`) means the body never
+  finished arriving and the server took nothing — **resending the same files is
+  safe**, unlike a transport-level connection error, which cannot rule out that the
+  job was created and only the response was lost. `MalformedUploadError`
+  (`400 MALFORMED_UPLOAD`) means the body was not valid `multipart/form-data` —
+  **resending identical bytes will not help**.
 
 ### Fixed
+- **API docs** — four long-standing inaccuracies in this repo's copy of the API
+  reference, each of which could break real client code. `downloadUrl` was
+  documented as `null` for unfinished jobs; the field is **absent**, so
+  `job["downloadUrl"] is None` raises `KeyError` — test for the key, not for
+  `None`. Timestamps were shown as ISO-8601 with a `Z` (`2026-07-07T08:00:00Z`);
+  they are `YYYY-MM-DD HH:MM:SS` in UTC. `creditsUsed` was shown as non-zero on an
+  unfinished job; it is `0` until the job settles (credits are only reserved before
+  that). The `416 RANGE_NOT_SATISFIABLE` download error was missing entirely. The
+  copy is now a byte-for-byte mirror of the upstream contract plus one language-
+  switch line, so this class of drift cannot accumulate again.
 - **Both clients** — `convert_all()` / `convertAll()` create the destination
   directory **and prove it writable** before submitting anything, by writing and
   removing a probe file. Doing this afterwards — or only creating the directory,

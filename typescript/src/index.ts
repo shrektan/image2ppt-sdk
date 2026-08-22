@@ -23,10 +23,12 @@ export {
   InvalidFileError,
   JobFailedError,
   JobNotFoundError,
+  MalformedUploadError,
   NotReadyError,
   OutputExpiredError,
   RateLimitedError,
   TooManySlidesError,
+  UploadAbortedError,
 } from "./errors.js";
 export {
   BATCH_TARGET_BYTES,

@@ -121,6 +121,8 @@ Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `m
 |---|---|---|
 | `AuthenticationError` | 401 / 403 | `INVALID_API_KEY`, `API_KEY_REQUIRED`, `ACCOUNT_DELETED` |
 | `InvalidFileError` | 400 / 413 | `INVALID_FILE`, `PAYLOAD_TOO_LARGE` (the size check also fires locally, before upload) |
+| `UploadAbortedError` | 400 | `UPLOAD_ABORTED` — the body never finished arriving and the server took nothing, so **resending the same files is safe** |
+| `MalformedUploadError` | 400 | `MALFORMED_UPLOAD` — the body was not valid `multipart/form-data`; **resending identical bytes will not help** |
 | `TooManySlidesError` | 400 | `TOO_MANY_SLIDES` |
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retryAfter`) |

@@ -32,10 +32,12 @@ from .errors import (
     InvalidFileError,
     JobFailedError,
     JobNotFoundError,
+    MalformedUploadError,
     NotReadyError,
     OutputExpiredError,
     RateLimitedError,
     TooManySlidesError,
+    UploadAbortedError,
 )
 from .models import Job
 
@@ -56,6 +58,8 @@ __all__ = [
     "Image2PPTError",
     "AuthenticationError",
     "InvalidFileError",
+    "UploadAbortedError",
+    "MalformedUploadError",
     "TooManySlidesError",
     "InsufficientCreditsError",
     "RateLimitedError",

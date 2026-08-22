@@ -27,9 +27,11 @@ from image2ppt import (
     Job,
     JobFailedError,
     JobNotFoundError,
+    MalformedUploadError,
     NotReadyError,
     RateLimitedError,
     TooManySlidesError,
+    UploadAbortedError,
 )
 from image2ppt._compress import compress_image_for_upload
 
@@ -163,6 +165,34 @@ def test_submit_auth_error(tmp_path):
         make_client(handler).submit([str(img)])
     assert exc.value.code == "INVALID_API_KEY"
     assert exc.value.status_code == 401
+
+
+def test_submit_upload_aborted_maps_to_its_own_type(tmp_path):
+    """400 UPLOAD_ABORTED must be distinguishable — it is the one upload failure
+    the caller may safely resend (the server states it took nothing)."""
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    handler = lambda *a, **k: FakeResponse(
+        400, {"error": {"code": "UPLOAD_ABORTED", "message": "body incomplete"}}
+    )
+    with pytest.raises(UploadAbortedError) as exc:
+        make_client(handler).submit([str(img)])
+    assert exc.value.code == "UPLOAD_ABORTED"
+    assert exc.value.status_code == 400
+
+
+def test_submit_malformed_upload_maps_to_its_own_type(tmp_path):
+    """400 MALFORMED_UPLOAD is the opposite advice — resending identical bytes is
+    pointless — so it must not share a type with UPLOAD_ABORTED."""
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    handler = lambda *a, **k: FakeResponse(
+        400, {"error": {"code": "MALFORMED_UPLOAD", "message": "bad multipart"}}
+    )
+    with pytest.raises(MalformedUploadError) as exc:
+        make_client(handler).submit([str(img)])
+    assert exc.value.code == "MALFORMED_UPLOAD"
+    assert not isinstance(exc.value, UploadAbortedError)
 
 
 def test_submit_insufficient_credits(tmp_path):

@@ -55,6 +55,28 @@ class InvalidFileError(Image2PPTError):
     """
 
 
+class UploadAbortedError(Image2PPTError):
+    """The upload was cut off before the body finished arriving (400 ``UPLOAD_ABORTED``).
+
+    The server is telling you it did **not** take the submission — no job was created
+    and no credits were reserved — so **resending the same files is safe**. That makes
+    this different from a transport-level ``requests.ConnectionError``, which cannot
+    rule out that the job was created and only the response was lost; the client never
+    retries that one for you (see ``Client._post_files``).
+
+    If it keeps happening, the submission is probably too large for the link. Send
+    fewer files per request, or use ``submit_all`` / ``convert_all`` to split.
+    """
+
+
+class MalformedUploadError(Image2PPTError):
+    """The body was not valid ``multipart/form-data`` (400 ``MALFORMED_UPLOAD``).
+
+    A client-side framing problem: **retrying the identical payload will not help**.
+    Using this SDK unmodified you should never see it; if you do, please report it.
+    """
+
+
 class TooManySlidesError(Image2PPTError):
     """The submission exceeds the 50-page-per-job limit (400 TOO_MANY_SLIDES)."""
 
@@ -137,6 +159,8 @@ _CODE_TO_EXC: Dict[str, type] = {
     "INVALID_FILE": InvalidFileError,
     "INVALID_PDF": InvalidFileError,
     "PAYLOAD_TOO_LARGE": InvalidFileError,
+    "UPLOAD_ABORTED": UploadAbortedError,
+    "MALFORMED_UPLOAD": MalformedUploadError,
     "TOO_MANY_SLIDES": TooManySlidesError,
     "INSUFFICIENT_CREDITS": InsufficientCreditsError,
     "RATE_LIMITED": RateLimitedError,
