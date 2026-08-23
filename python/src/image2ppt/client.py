@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
@@ -27,12 +28,13 @@ from ._version import __version__
 
 DEFAULT_BASE_URL = "https://image2ppt.com"
 
+_LOG = logging.getLogger("image2ppt")
+
 #: Sent on every request so the service knows which client version made it.
 #:
-#: Without it the service cannot tell a caller on an old SDK from anyone else, which
-#: means it can never warn anyone that their version is about to stop working. This
-#: is only the identifier half — acting on it (a deprecation header the client
-#: surfaces as a warning) needs the service side first.
+#: The whole header has to be exactly this string: appending another product token
+#: means the request is no longer recognised as coming from an official SDK. It is
+#: not part of authentication and never changes the outcome of a request.
 _USER_AGENT = f"image2ppt-python/{__version__}"
 
 #: Wait between rate-limited retries when the server sends no ``Retry-After``.
@@ -156,6 +158,31 @@ def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
         pass  # exotic exception type with no __dict__: nothing we can do
 
 
+def _response_header(headers: Any, name: str) -> Optional[str]:
+    """Look up an HTTP header, ignoring case.
+
+    ``requests`` headers are already case-insensitive; the fake session used in
+    tests is a plain dict. One lookup covers both.
+    """
+    target = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == target:
+            return "" if value is None else str(value)
+    return None
+
+
+def _link_url(value: Optional[str]) -> Optional[str]:
+    """Pull the URL out of a ``Link: <url>; rel=...`` header, or None."""
+    if not value:
+        return None
+    start = value.find("<")
+    end = value.find(">", start + 1)
+    if start == -1 or end == -1:
+        return None
+    url = value[start + 1 : end].strip()
+    return url or None
+
+
 @dataclass(frozen=True)
 class _PreparedFile:
     """One file resolved to exactly what will go into the multipart body.
@@ -190,6 +217,9 @@ class Image2PPTClient:
             themselves take does not, so a slow link cannot quietly turn this into
             "do not wait at all". Submitting a large pile *will* hit the per-minute
             page quota, so waiting is the normal path, not an error.
+        warn_on_deprecated: When the service marks this SDK version deprecated,
+            log one warning on the ``image2ppt`` logger. Default True. Set False
+            to silence it.
     """
 
     #: Supported input extensions -> MIME type (for labeling multipart uploads).
@@ -210,12 +240,15 @@ class Image2PPTClient:
         timeout: float = 60.0,
         session: Optional[requests.Session] = None,
         rate_limit_max_wait: float = 1800.0,
+        warn_on_deprecated: bool = True,
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.rate_limit_max_wait = max(0.0, rate_limit_max_wait)
+        self.warn_on_deprecated = warn_on_deprecated
+        self._deprecation_warned = False
         self._session = session or requests.Session()
         self._session.headers.update(
             {"Authorization": f"Bearer {api_key}", "User-Agent": _USER_AGENT}
@@ -445,6 +478,7 @@ class Image2PPTClient:
             timeout=self.timeout,
         )
         try:
+            self._warn_if_deprecated(resp)
             if not resp.ok:
                 self._raise_for_error(resp)
             # Same directory as the destination, so the rename is atomic rather than
@@ -733,9 +767,47 @@ class Image2PPTClient:
 
     def _parse_json(self, resp: requests.Response) -> Dict[str, Any]:
         """Return the JSON body on 2xx; otherwise raise the mapped exception."""
+        self._warn_if_deprecated(resp)
         if not resp.ok:
             self._raise_for_error(resp)
         return resp.json()
+
+    def _warn_if_deprecated(self, resp: requests.Response) -> None:
+        """Log at most one warning if this SDK version has been marked deprecated.
+
+        A response from a version below the support floor carries a ``Deprecation``
+        header — successful ones included, which is why this is checked before the
+        status code rather than after. Presence is the whole signal, the value is not
+        parsed. ``Sunset`` and ``Link`` join the message when present. ``wait()``
+        polls every few seconds, so this is latched per client.
+
+        Everything below is inside the guard on purpose: this notice is advisory, and
+        nothing it does — reading the headers included — may turn a served response
+        into a raised exception.
+        """
+        if not self.warn_on_deprecated or self._deprecation_warned:
+            return
+        try:
+            if _response_header(resp.headers, "Deprecation") is None:
+                return
+            self._deprecation_warned = True
+            parts = [
+                f"This image2ppt Python SDK ({__version__}) has been marked deprecated."
+            ]
+            url = _link_url(_response_header(resp.headers, "Link"))
+            if url:
+                parts.append(f"See {url} for what changed.")
+            sunset = _response_header(resp.headers, "Sunset")
+            if sunset:
+                parts.append(f"Support is planned to end {sunset}.")
+            parts.append(
+                "Pass warn_on_deprecated=False to Image2PPTClient(...) to silence this warning."
+            )
+            _LOG.warning(" ".join(parts))
+        except Exception:
+            # Advisory only: neither a throwing logging handler nor an unexpected
+            # response object may fail the request.
+            pass
 
     def _raise_for_error(self, resp: requests.Response) -> None:
         """Parse the ``{"error": {code, message}}`` envelope and raise the mapped error."""

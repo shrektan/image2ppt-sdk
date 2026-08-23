@@ -15,6 +15,7 @@
  */
 
 export { DEFAULT_BASE_URL, Image2PPTClient } from "./client.js";
+export { VERSION } from "./version.js";
 export {
   AuthenticationError,
   Image2PPTError,

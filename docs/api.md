@@ -284,6 +284,54 @@ Polling job status is **not** rate limited — only submissions are.
 
 ---
 
+## Versions & upgrade notices
+
+The official SDKs (0.2.0 and later) identify themselves on every request:
+
+```
+User-Agent: image2ppt-python/0.2.0
+User-Agent: image2ppt-node/0.2.0
+```
+
+The header is only used to understand which clients and versions are in use and to
+reach you if one of them has a problem — it plays **no part in authentication or
+rate limiting and never changes the outcome of a request**.
+
+If you wrote your own client, **you do not need to do anything about it**. Every
+non-SDK caller is recorded simply as a custom client — no language, no version, and
+the string you send is **not stored**, so a custom name will not make your program
+easier for us to pick out. We would rather say that than promise visibility that
+does not exist.
+
+One request only: **please do not send `image2ppt-python/...` or
+`image2ppt-node/...`**. Those identify the official SDKs, so borrowing them distorts
+the official-SDK share and makes us send you upgrade notices about a version you are
+not running.
+
+If the official SDK you are running is older than the lowest version we still
+support, responses carry three standard headers (RFC 8594 / RFC 9745) — **on
+successful responses too**, not only on errors:
+
+```
+Deprecation: @1793491200
+Sunset: Sun, 01 Nov 2026 00:00:00 GMT
+Link: <https://github.com/shrektan/image2ppt-sdk/blob/main/CHANGELOG.md>; rel="deprecation"
+```
+
+- `Deprecation` — this version is on its way out. The value is the date it was
+  marked deprecated, written as `@<Unix timestamp>` per RFC 9745; checking whether
+  the header is present is enough, you do not need to parse it.
+- `Sunset` — when support is planned to end (present only once a date is set).
+- `Link` — what changed and how to upgrade.
+
+**These headers are advisory only.** The status code is unchanged, the request is
+processed as usual, and nothing is ever refused because of them. The official SDKs
+log a single warning when they see them (and let you switch it off). Actually
+retiring a version is a separate decision announced well in advance — never
+through this header alone.
+
+---
+
 ## Semantics
 
 ### Async & latency expectations
