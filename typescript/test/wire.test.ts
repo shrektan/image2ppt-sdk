@@ -105,19 +105,13 @@ describe("submitting over a real socket", () => {
     const submission = sdk.submit([pdf]);
     await writeFile(pdf, Buffer.alloc(10, 9));
 
-    // `fetch` wraps a body-side throw, so the reason is in the cause chain.
-    const causes: string[] = [];
-    await submission.then(
-      () => {
-        throw new Error("submit resolved; it should have refused the changed file");
-      },
-      (err: unknown) => {
-        for (let cause = err; cause instanceof Error; cause = cause.cause) {
-          causes.push(cause.message);
-        }
-      },
-    );
-    expect(causes.join(" | ")).toMatch(/changed while it was being uploaded/);
+    // `fetch` buries a body-side throw in `cause`; the client digs it back out, so
+    // the caller sees the SDK's own error rather than a bare "fetch failed".
+    await expect(submission).rejects.toMatchObject({
+      name: "Image2PPTError",
+      code: "FILE_CHANGED",
+      message: expect.stringContaining("changed while it was being uploaded"),
+    });
   });
 
   it("percent-encodes a quote in a filename instead of breaking the header", async () => {

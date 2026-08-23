@@ -145,9 +145,10 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
           yield Buffer.from(part);
         }
         if (sent !== file.size) {
-          throw new Error(
+          throw new Image2PPTError(
             `"${file.path}" changed while it was being uploaded: ` +
               `${file.size} bytes when it was measured, ${sent} readable now`,
+            { code: "FILE_CHANGED" },
           );
         }
       }
@@ -736,6 +737,11 @@ export class Image2PPTClient {
           { code: "REQUEST_TIMEOUT" },
         );
       }
+      // A throw from the request body reaches the caller as undici's bare
+      // `TypeError: fetch failed`, with the real reason demoted to `cause`. The body
+      // is this client's own code, so when it is the one that objected — a file that
+      // changed underneath the upload — its message is the one worth surfacing.
+      if (err instanceof Error && err.cause instanceof Image2PPTError) throw err.cause;
       throw err;
     }
     this.#warnIfDeprecated(res);

@@ -15,7 +15,7 @@ _UPLOAD_TARGET_BYTES = 1024 * 1024
 _UPLOAD_MAX_DIM = 2000
 _UPLOAD_QUALITY_LADDER = (90, 85, 80)
 # Only PNG / JPEG pass through as-is; WebP / GIF are transcoded to JPEG even when
-# small, since those are the two formats the upload API takes unchanged.
+# small, since those are the two formats this spec passes through unchanged.
 _PASSTHROUGH_MIMES = frozenset({"image/png", "image/jpeg"})
 IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 
