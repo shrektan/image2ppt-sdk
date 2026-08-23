@@ -27,7 +27,7 @@
   "author": "image2ppt",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17.0"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
