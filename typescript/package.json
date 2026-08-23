@@ -48,6 +48,9 @@
     "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
+  "dependencies": {
+    "sharp": "^0.34.3"
+  },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "typescript": "^5.4.0",

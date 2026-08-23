@@ -1,7 +1,7 @@
 /** The image2ppt API client. */
 
 import { randomUUID } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
@@ -15,6 +15,7 @@ import {
   RateLimitedError,
   exceptionFor,
 } from "./errors.js";
+import { compressImageForUpload } from "./compress.js";
 import { checkFileSize, checkSubmission, planBatches } from "./limits.js";
 import type { UploadItem } from "./limits.js";
 import type {
@@ -63,6 +64,68 @@ const MIME_BY_EXT: Record<string, string> = {
 
 /** Formats that count as exactly one page each. Anything else (PDF) is unknown. */
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+/** A file resolved to the exact bytes and metadata that will go on the wire. */
+interface PreparedFile {
+  path: string;
+  name: string;
+  mime: string;
+  /** Images are already compressed in memory. PDFs are streamed from `path`. */
+  buffer?: Buffer;
+  size: number;
+  isImage: boolean;
+}
+
+interface PreparedUploadItem extends UploadItem {
+  file: PreparedFile;
+}
+
+type RequestBody = NonNullable<RequestInit["body"]>;
+
+function multipartFilename(name: string): string {
+  // A filename is multipart header data, not an arbitrary byte channel.
+  return name.replace(/[\r\n"]/g, (char) => (char === '"' ? "\\\"" : "_"));
+}
+
+function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
+  body: RequestBody;
+  contentType: string;
+} {
+  const boundary = `----image2ppt-${randomUUID()}`;
+  const chunk = (value: string): Buffer => Buffer.from(value, "utf8");
+  async function* chunks(): AsyncGenerator<Buffer> {
+    for (const file of files) {
+      yield chunk(
+        `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="files"; filename="${multipartFilename(file.name)}"\r\n` +
+          `Content-Type: ${file.mime}\r\n\r\n`,
+      );
+      if (file.buffer !== undefined) {
+        yield file.buffer;
+      } else {
+        // PDFs are intentionally never buffered: retries create a fresh stream from
+        // disk while images retain their already-compressed payload.
+        for await (const part of createReadStream(file.path)) yield Buffer.from(part);
+      }
+      yield chunk("\r\n");
+    }
+    if (options.locale) {
+      yield chunk(
+        `--${boundary}\r\nContent-Disposition: form-data; name="locale"\r\n\r\n${options.locale}\r\n`,
+      );
+    }
+    if (options.aspectRatio) {
+      yield chunk(
+        `--${boundary}\r\nContent-Disposition: form-data; name="aspectRatio"\r\n\r\n${options.aspectRatio}\r\n`,
+      );
+    }
+    yield chunk(`--${boundary}--\r\n`);
+  }
+  return {
+    body: Readable.toWeb(Readable.from(chunks())) as unknown as RequestBody,
+    contentType: `multipart/form-data; boundary=${boundary}`,
+  };
+}
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -228,39 +291,7 @@ export class Image2PPTClient {
     if (!paths.length) {
       throw new Error("at least one file is required");
     }
-    const files = await Promise.all(
-      paths.map(async (path) => {
-        const name = basename(path);
-        return { path, name, mime: guessMime(name), buffer: await readFile(path) };
-      }),
-    );
-    // Pre-flight, before a single byte goes out: an oversized request is not
-    // answered with an error, it is cut off — so it must never be sent. The error
-    // names the full path, matching `planBatches` and the Python client — a bare
-    // basename is ambiguous the moment two directories hold the same filename.
-    for (const file of files) checkFileSize(file.path, file.buffer.byteLength);
-    checkSubmission(
-      files.reduce((total, file) => total + file.buffer.byteLength, 0),
-      files.filter((file) => isImageMime(file.mime)).length,
-      // A PDF's real page count is only known server-side; counting it as at least
-      // 1 is what stops "50 images + a PDF" from being sent as a submission that is
-      // certain to come back over the page limit.
-      files.filter((file) => !isImageMime(file.mime)).length,
-    );
-
-    const buildForm = (): FormData => {
-      const form = new FormData();
-      for (const file of files) {
-        form.append("files", new Blob([file.buffer], { type: file.mime }), file.name);
-      }
-      if (options.locale) form.append("locale", options.locale);
-      if (options.aspectRatio) form.append("aspectRatio", options.aspectRatio);
-      return form;
-    };
-
-    // Sent exactly once, never auto-retried: see the note above.
-    const res = await this.#request("POST", "/api/v1/jobs", { body: buildForm() });
-    return Job.fromJson(await this.#parseJson(res));
+    return this.#submitPrepared(await this.#prepareFiles(paths), options);
   }
 
   /**
@@ -299,13 +330,25 @@ export class Image2PPTClient {
     if (!paths.length) {
       throw new Error("at least one file is required");
     }
-    const batches = planBatches(await this.#uploadItems(paths));
+    const files = await this.#prepareFiles(paths);
+    const batches = planBatches(
+      files.map((file): PreparedUploadItem => ({
+        path: file.path,
+        size: file.size,
+        isPdf: !file.isImage,
+        file,
+      })),
+    );
     const budget = new WaitBudget(this.rateLimitMaxWaitMs);
     const jobs: Job[] = [];
     for (const batch of batches) {
       try {
         jobs.push(
-          await this.#submitBatch(batch.map((item) => item.path), options, budget),
+          await this.#submitBatch(
+            batch.map((item) => (item as PreparedUploadItem).file),
+            options,
+            budget,
+          ),
         );
       } catch (err) {
         // Whatever went wrong, the earlier batches are already jobs on the server
@@ -504,7 +547,7 @@ export class Image2PPTClient {
    * back to a fixed wait.
    */
   async #submitBatch(
-    paths: string[],
+    files: PreparedFile[],
     options: SubmitOptions,
     budget: WaitBudget,
   ): Promise<Job> {
@@ -515,7 +558,7 @@ export class Image2PPTClient {
     let attemptsLeft = MAX_BATCH_ATTEMPTS;
     for (;;) {
       try {
-        return await this.submit(paths, options);
+        return await this.#submitPrepared(files, options);
       } catch (err) {
         if (!(err instanceof RateLimitedError)) throw err;
         attemptsLeft -= 1;
@@ -528,25 +571,91 @@ export class Image2PPTClient {
     }
   }
 
-  /** Measure files for batch planning, using the size they will occupy on the wire. */
-  async #uploadItems(paths: string[]): Promise<UploadItem[]> {
-    return Promise.all(
-      paths.map(async (path) => ({
-        path,
-        size: (await stat(path)).size,
-        isPdf: !isImageMime(guessMime(basename(path))),
-      })),
-    );
+  /** Prepare paths once, so pre-flight, batching, and multipart share identical bytes. */
+  async #prepareFiles(paths: string[]): Promise<PreparedFile[]> {
+    return Promise.all(paths.map((path) => this.#prepareFile(path)));
   }
 
-  async #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {
+  /** Resolve one path to its exact multipart metadata and wire size. */
+  async #prepareFile(path: string): Promise<PreparedFile> {
+    const name = basename(path);
+    const mime = guessMime(name);
+    if (!isImageMime(mime)) {
+      // PDF files are only stat-ed here; their bytes are streamed while building the
+      // multipart body so a large document never occupies client memory.
+      return {
+        path,
+        name,
+        mime,
+        size: (await stat(path)).size,
+        isImage: false,
+      };
+    }
+
+    let buffer: Buffer;
+    try {
+      const raw = await readFile(path);
+      const compressed = await compressImageForUpload(raw, mime);
+      buffer = compressed.buffer;
+      const outputName =
+        compressed.mime === "image/jpeg" && !/\\.jpe?g$/i.test(name)
+          ? `${name.slice(0, Math.max(0, name.length - extname(name).length))}.jpg`
+          : name;
+      return {
+        path,
+        name: outputName,
+        mime: compressed.mime,
+        buffer,
+        size: buffer.byteLength,
+        isImage: true,
+      };
+    } catch (err) {
+      // Do not leak sharp/libvips decoder errors. Match server/Python behavior so
+      // callers consistently handle corrupt, truncated, or undecodable images as
+      // InvalidFileError.
+      throw new InvalidFileError(`could not read image "${name}"`, {
+        code: "INVALID_FILE",
+      });
+    }
+  }
+
+  /** Validate and submit a prepared payload exactly once. */
+  async #submitPrepared(files: PreparedFile[], options: SubmitOptions): Promise<Job> {
+    // Pre-flight happens after image preparation because these are the exact bytes
+    // that will be transmitted, not the potentially much larger source files.
+    for (const file of files) checkFileSize(file.path, file.size);
+    checkSubmission(
+      files.reduce((total, file) => total + file.size, 0),
+      files.filter((file) => file.isImage).length,
+      files.filter((file) => !file.isImage).length,
+    );
+    const multipart = buildMultipart(files, options);
+    const res = await this.#request("POST", "/api/v1/jobs", {
+      body: multipart.body,
+      headers: { "Content-Type": multipart.contentType },
+    });
+    return Job.fromJson(await this.#parseJson(res));
+  }
+
+  async #request(
+    method: string,
+    path: string,
+    init: { body?: RequestBody; headers?: Record<string, string> } = {},
+  ): Promise<Response> {
     let res: Response;
     try {
       res = await this.#fetch(`${this.baseUrl}${path}`, {
         method,
-        headers: { Authorization: `Bearer ${this.#apiKey}`, "User-Agent": USER_AGENT },
+        headers: {
+          Authorization: `Bearer ${this.#apiKey}`,
+          "User-Agent": USER_AGENT,
+          ...init.headers,
+        },
         body: init.body,
         signal: AbortSignal.timeout(this.timeoutMs),
+        // Node's fetch requires this for a streaming request body. It is ignored by
+        // browsers, but this SDK is intentionally server-side only.
+        duplex: "half",
       });
     } catch (err) {
       // AbortSignal.timeout aborts the whole request (including a slow large

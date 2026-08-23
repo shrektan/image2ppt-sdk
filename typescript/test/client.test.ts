@@ -8,11 +8,13 @@
  * "Retry-After sanitising"), so setting it to 0 no longer skips the wait.
  */
 
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { randomFillSync } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
 
 import {
   AuthenticationError,
@@ -68,12 +70,56 @@ function fetchSequence(...responses: Response[]): RecordingFetch {
 }
 
 /** Filenames carried by each POST, in order: [[batch1...], [batch2...]]. */
-function postedFilenames(fetchImpl: RecordingFetch): string[][] {
-  return fetchImpl.calls
-    .filter((call) => call.init.method === "POST")
-    .map((call) =>
-      (call.init.body as FormData).getAll("files").map((part) => (part as File).name),
-    );
+async function postedFilenames(fetchImpl: RecordingFetch): Promise<string[][]> {
+  return Promise.all(
+    fetchImpl.calls
+      .filter((call) => call.init.method === "POST")
+      .map(async (call) => {
+        const text = Buffer.from(await new Response(call.init.body).arrayBuffer()).toString("latin1");
+        return [...text.matchAll(/Content-Disposition: form-data; name="files"; filename="([^"]+)"/g)].map(
+          (match) => match[1]!,
+        );
+      }),
+  );
+}
+
+interface PostedFile {
+  name: string;
+  mime: string;
+  body: Buffer;
+}
+
+/** Decode the SDK's streaming multipart payload without involving a web server. */
+async function postedFiles(fetchImpl: RecordingFetch): Promise<PostedFile[][]> {
+  return Promise.all(
+    fetchImpl.calls
+      .filter((call) => call.init.method === "POST")
+      .map(async (call) => {
+        const headers = call.init.headers as Record<string, string>;
+        const boundary = headers["Content-Type"]!.match(/boundary=(.+)$/)![1]!;
+        const payload = Buffer.from(await new Response(call.init.body).arrayBuffer());
+        const marker = Buffer.from(`--${boundary}`);
+        const nextMarker = Buffer.from(`\r\n--${boundary}`);
+        const parts: PostedFile[] = [];
+        let position = payload.indexOf(marker);
+        while (position !== -1) {
+          position += marker.byteLength;
+          if (payload.subarray(position, position + 2).equals(Buffer.from("--"))) break;
+          position += 2; // CRLF after the boundary
+          const headerEnd = payload.indexOf(Buffer.from("\r\n\r\n"), position);
+          const header = payload.subarray(position, headerEnd).toString("latin1");
+          const bodyStart = headerEnd + 4;
+          const bodyEnd = payload.indexOf(nextMarker, bodyStart);
+          const filename = header.match(/filename="([^"]+)"/)?.[1];
+          const mime = header.match(/Content-Type: ([^\r\n]+)/)?.[1];
+          if (filename && mime) {
+            parts.push({ name: filename, mime, body: payload.subarray(bodyStart, bodyEnd) });
+          }
+          position = bodyEnd + 2;
+        }
+        return parts;
+      }),
+  );
 }
 
 function client(fetchImpl: typeof fetch): Image2PPTClient {
@@ -90,7 +136,30 @@ afterEach(async () => {
 
 async function tempFile(name = "a.png"): Promise<string> {
   const path = join(dir, name);
-  await writeFile(path, Buffer.from("fake-image-bytes"));
+  if (/\.png$/i.test(name)) {
+    await sharp({ create: { width: 1, height: 1, channels: 3, background: "#112233" } })
+      .png()
+      .toFile(path);
+  } else {
+    await writeFile(path, Buffer.from("fake-file-bytes"));
+  }
+  return path;
+}
+
+async function noisyPng(name: string, width: number, height: number): Promise<string> {
+  const path = join(dir, name);
+  const raw = randomFillSync(Buffer.alloc(width * height * 3));
+  await sharp(raw, { raw: { width, height, channels: 3 } })
+    .png({ compressionLevel: 0 })
+    .toFile(path);
+  return path;
+}
+
+async function flatPng(name: string, width: number, height: number): Promise<string> {
+  const path = join(dir, name);
+  await sharp({ create: { width, height, channels: 3, background: "#010203" } })
+    .png({ compressionLevel: 0 })
+    .toFile(path);
   return path;
 }
 
@@ -277,6 +346,151 @@ describe("convert", () => {
 });
 
 // --------------------------------------------------------------------------- //
+// client-side image preparation — behavior matched to the Python SDK
+// --------------------------------------------------------------------------- //
+describe("client-side image preparation", () => {
+  it("passes through a PNG within the byte and dimension budgets byte-for-byte", async () => {
+    const file = await tempFile("small.png");
+    const original = await readFile(file);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    const [part] = (await postedFiles(f))[0]!;
+    expect(part).toMatchObject({ name: "small.png", mime: "image/png" });
+    expect(part!.body.equals(original)).toBe(true);
+  });
+
+  it("turns a 3MiB in-bounds PNG into a smaller JPEG upload", async () => {
+    const file = await noisyPng("photo.png", 1024, 1024);
+    const originalSize = (await stat(file)).size;
+    expect(originalSize).toBeGreaterThan(3 * 1024 * 1024);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    const [part] = (await postedFiles(f))[0]!;
+    expect(part).toMatchObject({ name: "photo.jpg", mime: "image/jpeg" });
+    expect(part!.body.byteLength).toBeLessThan(originalSize);
+    expect((await sharp(part!.body).metadata()).format).toBe("jpeg");
+  });
+
+  it("shrinks an image whose longest edge exceeds 2000px", async () => {
+    const file = await noisyPng("wide.png", 2100, 1000);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    const [part] = (await postedFiles(f))[0]!;
+    const metadata = await sharp(part!.body).metadata();
+    expect(Math.max(metadata.width!, metadata.height!)).toBeLessThanOrEqual(2000);
+  });
+
+  it("flattens alpha PNGs onto white and removes alpha in JPEG output", async () => {
+    const file = join(dir, "alpha.png");
+    const rgba = Buffer.alloc(1024 * 1024 * 4);
+    for (let i = 0; i < rgba.length; i += 4) rgba.set([255, 0, 0, 0], i);
+    await sharp(rgba, { raw: { width: 1024, height: 1024, channels: 4 } })
+      .png({ compressionLevel: 0 })
+      .toFile(file);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    const [part] = (await postedFiles(f))[0]!;
+    const decoded = await sharp(part!.body).raw().toBuffer({ resolveWithObject: true });
+    expect(part).toMatchObject({ name: "alpha.jpg", mime: "image/jpeg" });
+    expect(decoded.info.channels).toBe(3);
+    expect([...decoded.data.subarray(0, 3)]).toEqual([255, 255, 255]);
+  });
+
+  it("uses the first JPEG quality step that fits in 1MiB", async () => {
+    const file = await noisyPng("quality.png", 1150, 1150);
+    const source = await readFile(file);
+    const q90 = await sharp(source).flatten({ background: "#ffffff" }).jpeg({ quality: 90 }).toBuffer();
+    const q85 = await sharp(source).flatten({ background: "#ffffff" }).jpeg({ quality: 85 }).toBuffer();
+    expect(q90.byteLength).toBeGreaterThan(1024 * 1024);
+    expect(q85.byteLength).toBeLessThanOrEqual(1024 * 1024);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    const [part] = (await postedFiles(f))[0]!;
+    expect(part!.body.equals(q85)).toBe(true);
+  });
+
+  it("keeps an in-bounds image when its JPEG re-encode would be larger", async () => {
+    const file = join(dir, "tiny.webp");
+    await sharp({ create: { width: 1, height: 1, channels: 3, background: "#112233" } })
+      .webp({ quality: 1 })
+      .toFile(file);
+    const original = await readFile(file);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    const [part] = (await postedFiles(f))[0]!;
+    expect(part).toMatchObject({ name: "tiny.webp", mime: "image/webp" });
+    expect(part!.body.equals(original)).toBe(true);
+  });
+
+  it("uses a resized JPEG for an oversized source even when that JPEG is larger", async () => {
+    const file = join(dir, "long.webp");
+    await sharp({ create: { width: 2001, height: 1, channels: 3, background: "#000000" } })
+      .webp({ quality: 1 })
+      .toFile(file);
+    const originalSize = (await stat(file)).size;
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    const [part] = (await postedFiles(f))[0]!;
+    expect(part).toMatchObject({ name: "long.jpg", mime: "image/jpeg" });
+    expect(part!.body.byteLength).toBeGreaterThan(originalSize);
+    expect((await sharp(part!.body).metadata()).width).toBe(2000);
+  });
+
+  it("runs pre-flight and batch planning from compressed image sizes", async () => {
+    const files = [await flatPng("one.png", 3200, 3200), await flatPng("two.png", 3200, 3200)];
+    expect((await stat(files[0]!)).size + (await stat(files[1]!)).size).toBeGreaterThan(
+      MAX_UPLOAD_BYTES,
+    );
+    const direct = fetchSequence(json(201, { jobId: "direct", status: "pending" }));
+    await client(direct).submit(files);
+    expect(await postedFilenames(direct)).toEqual([["one.jpg", "two.jpg"]]);
+
+    const batched = fetchSequence(json(201, { jobId: "batched", status: "pending" }));
+
+    const jobs = await client(batched).submitAll(files);
+
+    expect(jobs).toHaveLength(1);
+    expect(await postedFilenames(batched)).toEqual([["one.jpg", "two.jpg"]]);
+  });
+
+  it("streams PDF bytes unchanged instead of preparing an in-memory image payload", async () => {
+    const file = await sparseFile("large.pdf", 2 * 1024 * 1024);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    expect(f.calls[0]!.init.body).toBeInstanceOf(ReadableStream);
+    const [part] = (await postedFiles(f))[0]!;
+    expect(part).toMatchObject({ name: "large.pdf", mime: "application/pdf" });
+    expect(part!.body.byteLength).toBe(2 * 1024 * 1024);
+  });
+
+  it("maps undecodable image data to InvalidFileError", async () => {
+    const file = join(dir, "broken.png");
+    await writeFile(file, "not an image");
+
+    await expect(client(fetchSequence(json(201, {}))).submit([file])).rejects.toMatchObject({
+      name: "InvalidFileError",
+      code: "INVALID_FILE",
+    });
+  });
+});
+
+// --------------------------------------------------------------------------- //
 // download / account
 // --------------------------------------------------------------------------- //
 describe("download & account", () => {
@@ -362,8 +576,8 @@ describe("upload size guard", () => {
     // Two individually-legal files that add up past the request cap.
     const half = Math.floor(MAX_UPLOAD_BYTES / 2);
     const files = [
-      await sparseFile("a.png", half),
-      await sparseFile("b.png", half + 1),
+      await sparseFile("a.pdf", half),
+      await sparseFile("b.pdf", half + 1),
     ];
     const f = fetchScript(() => {
       throw new Error("no HTTP request should have been made");
@@ -392,7 +606,7 @@ describe("upload size guard", () => {
 
     await client(f).submit([file]);
 
-    expect(postedFilenames(f)).toEqual([["a.png"]]);
+    expect(await postedFilenames(f)).toEqual([["a.png"]]);
   });
 });
 
@@ -408,7 +622,7 @@ describe("submitAll", () => {
     const jobs = await client(f).submitAll(files);
 
     expect(jobs.map((job) => job.jobId)).toEqual(ids);
-    const sent = postedFilenames(f);
+    const sent = await postedFilenames(f);
     expect(sent).toHaveLength(2);
     expect(sent[0]).toHaveLength(MAX_PAGES_PER_JOB);
     expect(sent[1]).toEqual([`p${String(MAX_PAGES_PER_JOB).padStart(3, "0")}.png`]);
@@ -421,7 +635,7 @@ describe("submitAll", () => {
 
     await client(f).submitAll([img, doc]);
 
-    expect(postedFilenames(f)).toEqual([["a.png"], ["doc.pdf"]]);
+    expect(await postedFilenames(f)).toEqual([["a.png"], ["doc.pdf"]]);
   });
 
   it("behaves like submit for a single batch", async () => {
@@ -431,7 +645,7 @@ describe("submitAll", () => {
     const jobs = await client(f).submitAll(files);
 
     expect(jobs).toHaveLength(1);
-    expect(postedFilenames(f)).toHaveLength(1);
+    expect(await postedFilenames(f)).toHaveLength(1);
   });
 });
 
@@ -560,7 +774,7 @@ describe("submitAll rate limiting", () => {
     }
 
     expect(jobs.map((job) => job.jobId)).toEqual(["job_a", "job_b"]);
-    const sent = postedFilenames(f);
+    const sent = await postedFilenames(f);
     expect(sent).toHaveLength(3); // batch 1, the rejected batch 2, then batch 2 again
     expect(sent[1]).toEqual(sent[2]); // the retry carried exactly the same files
   });
@@ -581,7 +795,7 @@ describe("submitAll rate limiting", () => {
 
     expect(err).toBeInstanceOf(RateLimitedError);
     expect(submittedIds(err)).toEqual(["job_a"]);
-    expect(postedFilenames(f)).toHaveLength(2); // no pointless extra attempt
+    expect(await postedFilenames(f)).toHaveLength(2); // no pointless extra attempt
   });
 
   it("uses a default wait when the server sends no Retry-After", async () => {
@@ -724,7 +938,7 @@ describe("PDF pages in submit", () => {
 
     await client(f).submit(files);
 
-    expect(postedFilenames(f)).toHaveLength(1);
+    expect(await postedFilenames(f)).toHaveLength(1);
   });
 });
 
