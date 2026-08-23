@@ -95,10 +95,11 @@ function multipartFilename(name: string): string {
   return name.replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
 }
 
+/** `actual` below zero means the file could no longer be read at all. */
 function fileChanged(path: string, measured: number, actual: number): Image2PPTError {
   return new Image2PPTError(
     `"${path}" changed while it was being uploaded: ${measured} bytes when it was ` +
-      `measured, ${actual} now`,
+      `measured, ${actual < 0 ? "unreadable" : `${actual} bytes`} now`,
     { code: "FILE_CHANGED" },
   );
 }
@@ -158,7 +159,12 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
         // hear about it: a truncated document is a deck they paid credits for and
         // cannot use.
         if (sent !== file.size) throw fileChanged(file.path, file.size, sent);
-        const sizeAfter = (await stat(file.path)).size;
+        // Deleted mid-upload counts as changed too — a raw ENOENT here would escape
+        // the unwrap in `#request` and reach the caller as a bare "fetch failed".
+        const sizeAfter = await stat(file.path).then(
+          (stats) => stats.size,
+          () => -1,
+        );
         if (sizeAfter !== file.size) throw fileChanged(file.path, file.size, sizeAfter);
       }
       yield chunk("\r\n");

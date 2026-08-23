@@ -130,6 +130,18 @@ describe("submitting over a real socket", () => {
     });
   });
 
+  it("reports a PDF deleted mid-upload as a changed file, not as a bare fetch failure", async () => {
+    const pdf = join(dir, "doc.pdf");
+    await writeFile(pdf, Buffer.alloc(200_000, 9));
+    const submission = client().submit([pdf]);
+    await rm(pdf, { force: true });
+
+    await expect(submission).rejects.toMatchObject({
+      name: "Image2PPTError",
+      code: "FILE_CHANGED",
+    });
+  });
+
   it("percent-encodes a quote in a filename instead of breaking the header", async () => {
     const path = await png('we"ird.png', 20, 20);
 
