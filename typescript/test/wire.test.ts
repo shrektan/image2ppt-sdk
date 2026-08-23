@@ -9,7 +9,7 @@
  */
 
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -101,9 +101,10 @@ describe("submitting over a real socket", () => {
     // header would hang or truncate; the client has to refuse instead.
     const pdf = join(dir, "doc.pdf");
     await writeFile(pdf, Buffer.alloc(200_000, 9));
-    const sdk = client();
-    const submission = sdk.submit([pdf]);
-    await writeFile(pdf, Buffer.alloc(10, 9));
+    const submission = client().submit([pdf]);
+    // `truncate` shrinks in place. Rewriting the file would blank it first, and a
+    // read landing in that window would prove nothing about a shrunken file.
+    await truncate(pdf, 10);
 
     // `fetch` buries a body-side throw in `cause`; the client digs it back out, so
     // the caller sees the SDK's own error rather than a bare "fetch failed".
@@ -120,7 +121,8 @@ describe("submitting over a real socket", () => {
     const pdf = join(dir, "doc.pdf");
     await writeFile(pdf, Buffer.alloc(200_000, 9));
     const submission = client().submit([pdf]);
-    await writeFile(pdf, Buffer.alloc(400_000, 9));
+    // Append rather than rewrite, so the file only ever grows.
+    await appendFile(pdf, Buffer.alloc(200_000, 9));
 
     await expect(submission).rejects.toMatchObject({
       name: "Image2PPTError",

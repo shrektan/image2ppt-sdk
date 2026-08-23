@@ -166,8 +166,15 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
     for (const value of fields) yield chunk(value);
     yield chunk(trailer);
   }
+  const source = Readable.from(chunks());
+  // The body can refuse to finish — a file rewritten underneath the upload. That
+  // error reaches the caller through `fetch`, which rejects with it as the `cause`.
+  // The stream reports it a second time on its own, though, and an error event with
+  // no listener is an unhandled rejection: on a default Node setup that takes the
+  // caller's whole process down over a failure the SDK is already reporting properly.
+  source.on("error", () => {});
   return {
-    body: Readable.toWeb(Readable.from(chunks())) as unknown as RequestBody,
+    body: Readable.toWeb(source) as unknown as RequestBody,
     contentType: `multipart/form-data; boundary=${boundary}`,
     contentLength,
   };
