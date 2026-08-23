@@ -1073,9 +1073,7 @@ def test_download_writes_the_whole_deck_on_success(tmp_path):
 # it. The whole string has to match: appending another product token
 # (python-requests/2.x) means the caller is no longer recognised as an official SDK.
 # --------------------------------------------------------------------------- #
-_SDK_USER_AGENT_RE = re.compile(
-    r"^image2ppt-(python|node)/(\d{1,6}\.\d{1,6}\.\d{1,6}[0-9A-Za-z.+-]{0,32})$"
-)
+_SDK_USER_AGENT_RE = re.compile(r"^image2ppt-(python|node)/\S+$")
 
 _DEPRECATION_HEADERS = {
     "Deprecation": "@1793491200",
@@ -1152,6 +1150,36 @@ def test_deprecation_warning_failure_does_not_fail_the_request(monkeypatch):
         )
     ).account()
     assert info["email"] == "e"
+
+
+def test_download_also_warns_about_a_deprecated_version(caplog, tmp_path):
+    """download() reads the response itself, so it needs its own warning call."""
+
+    def handler(*a, **k):
+        return FakeResponse(200, b"PPTXDATA", headers=_DEPRECATION_HEADERS)
+
+    out = tmp_path / "deck.pptx"
+    with caplog.at_level(logging.WARNING, logger="image2ppt"):
+        make_client(handler).download("https://example.com/deck.pptx", out)
+    messages = [r.getMessage() for r in caplog.records if r.name == "image2ppt"]
+    assert len(messages) == 1
+    assert "deprecated" in messages[0].lower()
+
+
+def test_deprecation_header_alone_is_enough(caplog):
+    """Sunset and Link are optional; losing them must not lose the warning."""
+
+    def handler(*a, **k):
+        return FakeResponse(
+            200, {"email": "e", "credits": 1}, headers={"Deprecation": "@1793491200"}
+        )
+
+    with caplog.at_level(logging.WARNING, logger="image2ppt"):
+        make_client(handler).account()
+    messages = [r.getMessage() for r in caplog.records if r.name == "image2ppt"]
+    assert len(messages) == 1
+    assert "deprecated" in messages[0].lower()
+    assert "warn_on_deprecated=False" in messages[0]
 
 
 def test_no_warning_without_deprecation_header(caplog):

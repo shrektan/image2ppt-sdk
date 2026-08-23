@@ -572,16 +572,21 @@ export class Image2PPTClient {
   /**
    * Log at most one warning if this SDK version has been marked deprecated.
    *
-   * The service puts a `Deprecation` header on successful responses of a version
-   * below the support floor. Presence is the whole signal — the value is not
-   * parsed. `Sunset` and `Link` are included in the message when present. `wait()`
-   * polls every few seconds, so this is latched per client.
+   * A response from a version below the support floor carries a `Deprecation`
+   * header — successful ones included, which is why this is checked before the
+   * status code rather than after. Presence is the whole signal, the value is not
+   * parsed. `Sunset` and `Link` join the message when present. `wait()` polls every
+   * few seconds, so this is latched per client.
+   *
+   * Everything below is inside the guard on purpose: this notice is advisory, and
+   * nothing it does — reading the headers included — may turn a served response into
+   * a thrown error.
    */
   #warnIfDeprecated(res: Response): void {
     if (!this.warnOnDeprecated || this.#deprecationWarned) return;
-    if (!res.headers.has("Deprecation")) return;
-    this.#deprecationWarned = true;
     try {
+      if (!res.headers.has("Deprecation")) return;
+      this.#deprecationWarned = true;
       const parts = [
         `This image2ppt Node SDK (${VERSION}) has been marked deprecated.`,
       ];
@@ -594,7 +599,8 @@ export class Image2PPTClient {
       );
       console.warn(parts.join(" "));
     } catch {
-      // Advisory only: a throwing console.warn must not fail the request.
+      // Advisory only: neither a throwing console.warn nor an unexpected response
+      // object may fail the request.
     }
   }
 

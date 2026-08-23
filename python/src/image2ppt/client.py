@@ -775,17 +775,22 @@ class Image2PPTClient:
     def _warn_if_deprecated(self, resp: requests.Response) -> None:
         """Log at most one warning if this SDK version has been marked deprecated.
 
-        The service puts a ``Deprecation`` header on successful responses of a
-        version below the support floor. Presence is the whole signal — the value
-        is not parsed. ``Sunset`` and ``Link`` are included in the message when
-        present. ``wait()`` polls every few seconds, so this is latched per client.
+        A response from a version below the support floor carries a ``Deprecation``
+        header — successful ones included, which is why this is checked before the
+        status code rather than after. Presence is the whole signal, the value is not
+        parsed. ``Sunset`` and ``Link`` join the message when present. ``wait()``
+        polls every few seconds, so this is latched per client.
+
+        Everything below is inside the guard on purpose: this notice is advisory, and
+        nothing it does — reading the headers included — may turn a served response
+        into a raised exception.
         """
         if not self.warn_on_deprecated or self._deprecation_warned:
             return
-        if _response_header(resp.headers, "Deprecation") is None:
-            return
-        self._deprecation_warned = True
         try:
+            if _response_header(resp.headers, "Deprecation") is None:
+                return
+            self._deprecation_warned = True
             parts = [
                 f"This image2ppt Python SDK ({__version__}) has been marked deprecated."
             ]
@@ -800,7 +805,8 @@ class Image2PPTClient:
             )
             _LOG.warning(" ".join(parts))
         except Exception:
-            # Advisory only: a throwing logging handler must not fail the request.
+            # Advisory only: neither a throwing logging handler nor an unexpected
+            # response object may fail the request.
             pass
 
     def _raise_for_error(self, resp: requests.Response) -> None:

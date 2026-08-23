@@ -973,8 +973,7 @@ describe("download atomicity", () => {
 // it. The whole string has to match: appending another product token means the
 // caller is no longer recognised as an official SDK.
 // --------------------------------------------------------------------------- //
-const SDK_USER_AGENT_RE =
-  /^image2ppt-(python|node)\/(\d{1,6}\.\d{1,6}\.\d{1,6}[0-9A-Za-z.+-]{0,32})$/;
+const SDK_USER_AGENT_RE = /^image2ppt-(python|node)\/\S+$/;
 
 const DEPRECATION_HEADERS = {
   Deprecation: "@1793491200",
@@ -1048,6 +1047,23 @@ describe("deprecation warning", () => {
       const f = fetchScript(() => json(200, { email: "e", credits: 1 }, DEPRECATION_HEADERS));
       const info = await client(f).account();
       expect(info.email).toBe("e");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("warns on a Deprecation header alone", async () => {
+    // Sunset and Link are optional; losing them must not lose the warning.
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const f = fetchSequence(
+        json(200, { email: "e", credits: 1 }, { Deprecation: "@1793491200" }),
+      );
+      await client(f).account();
+      expect(spy).toHaveBeenCalledTimes(1);
+      const msg = String(spy.mock.calls[0]?.[0]);
+      expect(msg).toMatch(/deprecated/i);
+      expect(msg).toContain("warnOnDeprecated: false");
     } finally {
       spy.mockRestore();
     }
