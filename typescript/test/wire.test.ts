@@ -95,6 +95,31 @@ describe("submitting over a real socket", () => {
     expect(received[0]!.body.includes(pdfBytes)).toBe(true);
   });
 
+  it("fails loudly when a PDF shrinks between being measured and being sent", async () => {
+    // The PDF is streamed rather than buffered, so its bytes are read after the size
+    // that Content-Length was computed from. Sending a body shorter than its own
+    // header would hang or truncate; the client has to refuse instead.
+    const pdf = join(dir, "doc.pdf");
+    await writeFile(pdf, Buffer.alloc(200_000, 9));
+    const sdk = client();
+    const submission = sdk.submit([pdf]);
+    await writeFile(pdf, Buffer.alloc(10, 9));
+
+    // `fetch` wraps a body-side throw, so the reason is in the cause chain.
+    const causes: string[] = [];
+    await submission.then(
+      () => {
+        throw new Error("submit resolved; it should have refused the changed file");
+      },
+      (err: unknown) => {
+        for (let cause = err; cause instanceof Error; cause = cause.cause) {
+          causes.push(cause.message);
+        }
+      },
+    );
+    expect(causes.join(" | ")).toMatch(/changed while it was being uploaded/);
+  });
+
   it("percent-encodes a quote in a filename instead of breaking the header", async () => {
     const path = await png('we"ird.png', 20, 20);
 

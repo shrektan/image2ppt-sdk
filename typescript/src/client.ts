@@ -132,10 +132,24 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
       yield chunk(fileHeader(file));
       if (file.buffer !== undefined) {
         yield file.buffer;
-      } else {
+      } else if (file.size > 0) {
         // PDFs are intentionally never buffered: retries create a fresh stream from
-        // disk while images retain their already-compressed payload.
-        for await (const part of createReadStream(file.path)) yield Buffer.from(part);
+        // disk while images retain their already-compressed payload. The read is
+        // capped at the size measured while preparing the file and then checked
+        // against it, because that size is what `Content-Length` and the pre-flight
+        // limits were both computed from. A document rewritten underneath us has to
+        // fail here rather than send a body that contradicts its own header.
+        let sent = 0;
+        for await (const part of createReadStream(file.path, { end: file.size - 1 })) {
+          sent += (part as Buffer).byteLength;
+          yield Buffer.from(part);
+        }
+        if (sent !== file.size) {
+          throw new Error(
+            `"${file.path}" changed while it was being uploaded: ` +
+              `${file.size} bytes when it was measured, ${sent} readable now`,
+          );
+        }
       }
       yield chunk("\r\n");
     }
