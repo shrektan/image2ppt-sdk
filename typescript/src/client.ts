@@ -95,6 +95,14 @@ function multipartFilename(name: string): string {
   return name.replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
 }
 
+function fileChanged(path: string, measured: number, actual: number): Image2PPTError {
+  return new Image2PPTError(
+    `"${path}" changed while it was being uploaded: ${measured} bytes when it was ` +
+      `measured, ${actual} now`,
+    { code: "FILE_CHANGED" },
+  );
+}
+
 function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
   body: RequestBody;
   contentType: string;
@@ -144,13 +152,14 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
           sent += (part as Buffer).byteLength;
           yield Buffer.from(part);
         }
-        if (sent !== file.size) {
-          throw new Image2PPTError(
-            `"${file.path}" changed while it was being uploaded: ` +
-              `${file.size} bytes when it was measured, ${sent} readable now`,
-            { code: "FILE_CHANGED" },
-          );
-        }
+        // A file that shrank comes up short right here. One that grew would have been
+        // cut off at the cap instead — the byte count still matches, so the size on
+        // disk has to be checked once more to catch it. Either way the caller must
+        // hear about it: a truncated document is a deck they paid credits for and
+        // cannot use.
+        if (sent !== file.size) throw fileChanged(file.path, file.size, sent);
+        const sizeAfter = (await stat(file.path)).size;
+        if (sizeAfter !== file.size) throw fileChanged(file.path, file.size, sizeAfter);
       }
       yield chunk("\r\n");
     }

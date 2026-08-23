@@ -114,6 +114,20 @@ describe("submitting over a real socket", () => {
     });
   });
 
+  it("fails loudly when a PDF grows between being measured and being sent", async () => {
+    // Growing is the sneakier direction: the read stops at the measured size, so the
+    // byte count still adds up and only the document arrives cut in half.
+    const pdf = join(dir, "doc.pdf");
+    await writeFile(pdf, Buffer.alloc(200_000, 9));
+    const submission = client().submit([pdf]);
+    await writeFile(pdf, Buffer.alloc(400_000, 9));
+
+    await expect(submission).rejects.toMatchObject({
+      name: "Image2PPTError",
+      code: "FILE_CHANGED",
+    });
+  });
+
   it("percent-encodes a quote in a filename instead of breaking the header", async () => {
     const path = await png('we"ird.png', 20, 20);
 
