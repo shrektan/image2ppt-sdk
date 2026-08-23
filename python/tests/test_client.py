@@ -1069,9 +1069,9 @@ def test_download_writes_the_whole_deck_on_success(tmp_path):
 # --------------------------------------------------------------------------- #
 # Client identification
 #
-# Copied from the service: this is the only identification contract between the
-# two repos. Appending another product token (python-requests/2.x) would make
-# the whole string fail and land in the "unknown client" bucket.
+# The shape `docs/api.md` documents, pinned here so the header cannot drift out of
+# it. The whole string has to match: appending another product token
+# (python-requests/2.x) means the caller is no longer recognised as an official SDK.
 # --------------------------------------------------------------------------- #
 _SDK_USER_AGENT_RE = re.compile(
     r"^image2ppt-(python|node)/(\d{1,6}\.\d{1,6}\.\d{1,6}[0-9A-Za-z.+-]{0,32})$"

@@ -969,9 +969,9 @@ describe("download atomicity", () => {
 // --------------------------------------------------------------------------- //
 // Client identification
 //
-// Copied from the service: this is the only identification contract between the
-// two repos. Appending another product token would make the whole string fail
-// and land in the "unknown client" bucket.
+// The shape `docs/api.md` documents, pinned here so the header cannot drift out of
+// it. The whole string has to match: appending another product token means the
+// caller is no longer recognised as an official SDK.
 // --------------------------------------------------------------------------- //
 const SDK_USER_AGENT_RE =
   /^image2ppt-(python|node)\/(\d{1,6}\.\d{1,6}\.\d{1,6}[0-9A-Za-z.+-]{0,32})$/;

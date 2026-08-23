@@ -32,9 +32,9 @@ _LOG = logging.getLogger("image2ppt")
 
 #: Sent on every request so the service knows which client version made it.
 #:
-#: The service matches this string in full (``^...$``); appending another product
-#: token would make the whole header unrecognisable. It is not part of
-#: authentication and never changes the outcome of a request.
+#: The whole header has to be exactly this string: appending another product token
+#: means the request is no longer recognised as coming from an official SDK. It is
+#: not part of authentication and never changes the outcome of a request.
 _USER_AGENT = f"image2ppt-python/{__version__}"
 
 #: Wait between rate-limited retries when the server sends no ``Retry-After``.
