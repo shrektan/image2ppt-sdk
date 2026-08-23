@@ -2,7 +2,7 @@
 
 Official Node.js client for the [image2ppt](https://image2ppt.com) API. Turn a batch of images or PDF pages into one **editable** PowerPoint (`.pptx`).
 
-Zero runtime dependencies — uses the built-in `fetch` / `FormData` (Node 18+).
+Uses Node's built-in `fetch`, plus `sharp` for client-side image preparation. Requires Node 18.17+, 20.3+, or 21+ — the range `sharp` ships native binaries for.
 
 ## Install
 
@@ -57,7 +57,7 @@ console.log(email, "credits:", credits);
 - **Async.** `submit` resolves with a job id immediately; conversion runs in the background. A single page typically takes ~2 minutes; 90% of jobs finish within 3.
 - **One job = one PPTX.** All files in a submission are merged into a single deck, in upload order.
 - **Billed per page.** 1 page = 1 credit, reserved at submit and settled on completion. If some pages fail but others succeed, the job still completes with the good pages and the failed pages' credits are refunded (`creditsRefunded`).
-- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**, which here means the size on disk — this SDK uploads files as-is. (The Python SDK pre-compresses images first and counts the compressed size, so a 40MB PNG that compresses to 1MB passes there and is refused here — the two clients agree on the limits, not always on the verdict for one file.)
+- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**: image preparation happens first, then the final payload sizes drive pre-flight and batching. PDFs keep their on-disk size.
 - **The check is never stricter than the documented limit.** 45MB of file content is meant to be usable, so a submission sitting exactly on it goes through. Auto-batching is the one place that is deliberately conservative — it fills a batch only to 40MB, because starting one more batch costs nothing while refusing something the server would have accepted does not.
 - **Only the formats the API accepts.** `png`, `jpg`/`jpeg`, `webp`, `gif`, `pdf`. Anything else throws `InvalidFileError` locally — the batch calls check every file before submitting the first one, so an unsupported file at the end of the pile cannot leave you paying for the batches ahead of it.
 - **The local page check is a lower bound.** The client does not parse PDFs, so it counts each one as *at least* 1 page. That is enough to refuse combinations that can never work (50 images plus any PDF is already 51 pages), but a submission that passes locally can still come back `TOO_MANY_SLIDES` — a 30-page PDF counts as 1 here and 30 on the server.
@@ -68,7 +68,7 @@ console.log(email, "credits:", credits);
 - **A deprecated SDK version logs one warning.** If this version is below the lowest the service still supports, the response carries a `Deprecation` header and the client warns once (`console.warn`). Pass `warnOnDeprecated: false` to `Image2PPTClient` to silence it.
 - **Time units.** `pollIntervalMs` and `timeoutMs` are in **milliseconds** (idiomatic for Node's timers).
 
-> The Node SDK uploads files as-is; the server compresses them. (The Python SDK additionally pre-compresses images client-side to save bandwidth — a future addition here.)
+> Both the Node and Python SDKs pre-compress images that need processing before upload. PNG/JPEG files already at most 1MiB with a longest edge at most 2000px upload byte-for-byte unchanged. Other PNG/JPEG files, and all WebP/GIF files, may be resized, flattened onto white, and sent as JPEG; PDFs are never compressed or decoded and are streamed unchanged.
 
 ## More files than one request can hold
 

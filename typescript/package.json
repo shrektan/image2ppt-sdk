@@ -1,6 +1,6 @@
 {
   "name": "image2ppt",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Official Node.js/TypeScript client for the image2ppt API — convert images and PDFs into editable PowerPoint (.pptx).",
   "keywords": [
     "image2ppt",
@@ -27,7 +27,7 @@
   "author": "image2ppt",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -47,6 +47,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "sharp": "^0.34.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

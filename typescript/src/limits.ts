@@ -58,8 +58,8 @@ export const MAX_PAGES_PER_JOB = 50;
 /**
  * One file to upload, with the size it will occupy in the request.
  *
- * This client uploads files as they are on disk (unlike the Python client, it
- * does not compress images first), so `size` is the size on disk.
+ * `size` is the final file-content byte count on the wire. Images may have been
+ * client-compressed already; PDFs retain their on-disk size.
  *
  * `isPdf` marks a file whose page count is unknown to the client — the SDK does
  * not parse PDFs. Such a file is never mixed into a batch with others.

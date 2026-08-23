@@ -8,7 +8,7 @@ image2ppt HTTP API 的官方 SDK：Python（`python/`）+ TypeScript（`typescri
 代码会发到 PyPI / npm、推到 GitHub，任何人都能看。所以：
 
 - **绝不**粘贴主站的服务端源码、prompt、管线细节、内部架构、任何密钥或 token。
-- **零运行时依赖、自包含**。Python 只依赖 `requests` + `Pillow`，TypeScript 依赖 Node 18+ 内置能力，别引第三方运行时库，更别从主仓库 import 任何东西。
+- **依赖极简、自包含**。Python 只依赖 `requests` + `Pillow`，TypeScript 只依赖 `sharp`（上传前压图，Node 没有内置能力）+ Node 18.17+ 内置能力。除这几个之外别引第三方运行时库，更别从主仓库 import 任何东西。
 - 这里只有面向 API 使用者的东西：客户端、错误类型、数据结构、上传前压图、示例。账号和计费相关的一概没有——那些全在私有主仓库。
 
 ## 🔍 每次 review / 提交前必做：内部信息泄露自查

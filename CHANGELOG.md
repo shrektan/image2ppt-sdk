@@ -3,6 +3,41 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## 0.3.0
+
+The Node client now prepares images before uploading them, the way the Python
+client already did. Same files in, fewer bytes on the wire.
+
+### Added
+- **TypeScript** — client-side image preparation on `submit()` / `submitAll()`,
+  matched to the Python client's rules. A PNG or JPEG that is already at most 1MiB
+  with a longest edge of at most 2000px is uploaded byte-for-byte unchanged.
+  Anything else — a larger PNG/JPEG, or any WebP/GIF — is fitted inside 2000×2000,
+  flattened onto white, and sent as JPEG at the first quality of 90 / 85 / 80 that
+  fits in 1MiB. An in-bounds image whose re-encode would come out *larger* keeps
+  its original bytes, so nothing is ever made blurrier and bigger at once. PDFs are
+  never decoded or compressed; they stream from disk exactly as they are.
+- **TypeScript** — the pre-flight size check and automatic batching now measure the
+  bytes that actually go on the wire. A 40MB PNG that prepares down to 1MB is
+  accepted, where before it was refused locally. The documented limits themselves
+  are unchanged.
+
+### Changed
+- **TypeScript** — installing the client now also installs `sharp`, which carries a
+  platform-specific native binary. The supported Node range narrows to the one
+  `sharp` publishes binaries for: **18.17+, 20.3+, or 21+**. Node 19 and Node
+  20.0–20.2 are no longer supported. If the native binary is unavailable on your
+  platform, only the image calls fail — `account()`, `status()`, `waitFor()` and
+  `download()` keep working, and the error says what is missing.
+- **Both clients** — a truncated or otherwise damaged image is refused locally with
+  `InvalidFileError` instead of being uploaded and charged for. The Python client
+  already behaved this way; the Node client now does too.
+
+### Fixed
+- **TypeScript** — a file that could not be read (missing path, no permission) was
+  reported as an invalid image. It now surfaces the real filesystem error, and a
+  genuinely undecodable image says why.
+
 ## 0.2.1
 
 When the service marks an SDK version deprecated, you now get one warning in

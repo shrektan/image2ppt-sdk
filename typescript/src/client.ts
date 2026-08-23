@@ -1,7 +1,7 @@
 /** The image2ppt API client. */
 
 import { randomUUID } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
@@ -15,6 +15,8 @@ import {
   RateLimitedError,
   exceptionFor,
 } from "./errors.js";
+import { compressImageForUpload } from "./compress.js";
+import type { CompressedImage } from "./compress.js";
 import { checkFileSize, checkSubmission, planBatches } from "./limits.js";
 import type { UploadItem } from "./limits.js";
 import type {
@@ -52,6 +54,9 @@ const RATE_LIMIT_FALLBACK_WAIT_MS = 5_000;
  */
 const MIN_RETRY_AFTER_SECONDS = 1;
 
+/** How many images are read and re-encoded at the same time. See `#prepareFiles`. */
+const PREPARE_CONCURRENCY = 4;
+
 const MIME_BY_EXT: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -63,6 +68,123 @@ const MIME_BY_EXT: Record<string, string> = {
 
 /** Formats that count as exactly one page each. Anything else (PDF) is unknown. */
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+/** A file resolved to the exact bytes and metadata that will go on the wire. */
+interface PreparedFile {
+  path: string;
+  name: string;
+  mime: string;
+  /** Images are already compressed in memory. PDFs are streamed from `path`. */
+  buffer?: Buffer;
+  size: number;
+  isImage: boolean;
+}
+
+interface PreparedUploadItem extends UploadItem {
+  file: PreparedFile;
+}
+
+type RequestBody = NonNullable<RequestInit["body"]>;
+
+function multipartFilename(name: string): string {
+  // A filename is multipart header data, not an arbitrary byte channel. Percent-encode
+  // the three characters that could break out of the quoted string, which is exactly
+  // what Node's built-in FormData did before this client assembled the body itself.
+  // Backslash-escaping instead would be ambiguous: a filename may legally contain a
+  // backslash, and a parser that un-escapes would then swallow the closing quote.
+  return name.replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
+}
+
+/** `actual` below zero means the file could no longer be read at all. */
+function fileChanged(path: string, measured: number, actual: number): Image2PPTError {
+  return new Image2PPTError(
+    `"${path}" changed while it was being uploaded: ${measured} bytes when it was ` +
+      `measured, ${actual < 0 ? "unreadable" : `${actual} bytes`} now`,
+    { code: "FILE_CHANGED" },
+  );
+}
+
+function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
+  body: RequestBody;
+  contentType: string;
+  contentLength: number;
+} {
+  const boundary = `----image2ppt-${randomUUID()}`;
+  const chunk = (value: string): Buffer => Buffer.from(value, "utf8");
+  const fileHeader = (file: PreparedFile): string =>
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="files"; filename="${multipartFilename(file.name)}"\r\n` +
+    `Content-Type: ${file.mime}\r\n\r\n`;
+  const field = (name: string, value: string): string =>
+    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
+  const trailer = `--${boundary}--\r\n`;
+
+  const fields: string[] = [];
+  if (options.locale) fields.push(field("locale", options.locale));
+  if (options.aspectRatio) fields.push(field("aspectRatio", options.aspectRatio));
+
+  // The body streams, but its length is known before the first byte goes out: image
+  // payloads are already in memory, a PDF's size was measured while preparing it, and
+  // every delimiter is a fixed string. Sending `Content-Length` rather than letting
+  // the request go out chunked is what lets an oversized submission be refused up
+  // front instead of after tens of megabytes have already crossed the wire.
+  const contentLength =
+    files.reduce(
+      (total, file) => total + Buffer.byteLength(fileHeader(file), "utf8") + file.size + 2,
+      0,
+    ) +
+    fields.reduce((total, value) => total + Buffer.byteLength(value, "utf8"), 0) +
+    Buffer.byteLength(trailer, "utf8");
+
+  async function* chunks(): AsyncGenerator<Buffer> {
+    for (const file of files) {
+      yield chunk(fileHeader(file));
+      if (file.buffer !== undefined) {
+        yield file.buffer;
+      } else if (file.size > 0) {
+        // PDFs are intentionally never buffered: retries create a fresh stream from
+        // disk while images retain their already-compressed payload. The read is
+        // capped at the size measured while preparing the file and then checked
+        // against it, because that size is what `Content-Length` and the pre-flight
+        // limits were both computed from. A document rewritten underneath us has to
+        // fail here rather than send a body that contradicts its own header.
+        let sent = 0;
+        for await (const part of createReadStream(file.path, { end: file.size - 1 })) {
+          sent += (part as Buffer).byteLength;
+          yield Buffer.from(part);
+        }
+        // A file that shrank comes up short right here. One that grew would have been
+        // cut off at the cap instead — the byte count still matches, so the size on
+        // disk has to be checked once more to catch it. Either way the caller must
+        // hear about it: a truncated document is a deck they paid credits for and
+        // cannot use.
+        if (sent !== file.size) throw fileChanged(file.path, file.size, sent);
+        // Deleted mid-upload counts as changed too — a raw ENOENT here would escape
+        // the unwrap in `#request` and reach the caller as a bare "fetch failed".
+        const sizeAfter = await stat(file.path).then(
+          (stats) => stats.size,
+          () => -1,
+        );
+        if (sizeAfter !== file.size) throw fileChanged(file.path, file.size, sizeAfter);
+      }
+      yield chunk("\r\n");
+    }
+    for (const value of fields) yield chunk(value);
+    yield chunk(trailer);
+  }
+  const source = Readable.from(chunks());
+  // The body can refuse to finish — a file rewritten underneath the upload. That
+  // error reaches the caller through `fetch`, which rejects with it as the `cause`.
+  // The stream reports it a second time on its own, though, and an error event with
+  // no listener is an unhandled rejection: on a default Node setup that takes the
+  // caller's whole process down over a failure the SDK is already reporting properly.
+  source.on("error", () => {});
+  return {
+    body: Readable.toWeb(source) as unknown as RequestBody,
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    contentLength,
+  };
+}
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -228,39 +350,7 @@ export class Image2PPTClient {
     if (!paths.length) {
       throw new Error("at least one file is required");
     }
-    const files = await Promise.all(
-      paths.map(async (path) => {
-        const name = basename(path);
-        return { path, name, mime: guessMime(name), buffer: await readFile(path) };
-      }),
-    );
-    // Pre-flight, before a single byte goes out: an oversized request is not
-    // answered with an error, it is cut off — so it must never be sent. The error
-    // names the full path, matching `planBatches` and the Python client — a bare
-    // basename is ambiguous the moment two directories hold the same filename.
-    for (const file of files) checkFileSize(file.path, file.buffer.byteLength);
-    checkSubmission(
-      files.reduce((total, file) => total + file.buffer.byteLength, 0),
-      files.filter((file) => isImageMime(file.mime)).length,
-      // A PDF's real page count is only known server-side; counting it as at least
-      // 1 is what stops "50 images + a PDF" from being sent as a submission that is
-      // certain to come back over the page limit.
-      files.filter((file) => !isImageMime(file.mime)).length,
-    );
-
-    const buildForm = (): FormData => {
-      const form = new FormData();
-      for (const file of files) {
-        form.append("files", new Blob([file.buffer], { type: file.mime }), file.name);
-      }
-      if (options.locale) form.append("locale", options.locale);
-      if (options.aspectRatio) form.append("aspectRatio", options.aspectRatio);
-      return form;
-    };
-
-    // Sent exactly once, never auto-retried: see the note above.
-    const res = await this.#request("POST", "/api/v1/jobs", { body: buildForm() });
-    return Job.fromJson(await this.#parseJson(res));
+    return this.#submitPrepared(await this.#prepareFiles(paths), options);
   }
 
   /**
@@ -299,13 +389,25 @@ export class Image2PPTClient {
     if (!paths.length) {
       throw new Error("at least one file is required");
     }
-    const batches = planBatches(await this.#uploadItems(paths));
+    const files = await this.#prepareFiles(paths);
+    const batches = planBatches(
+      files.map((file): PreparedUploadItem => ({
+        path: file.path,
+        size: file.size,
+        isPdf: !file.isImage,
+        file,
+      })),
+    );
     const budget = new WaitBudget(this.rateLimitMaxWaitMs);
     const jobs: Job[] = [];
     for (const batch of batches) {
       try {
         jobs.push(
-          await this.#submitBatch(batch.map((item) => item.path), options, budget),
+          await this.#submitBatch(
+            batch.map((item) => (item as PreparedUploadItem).file),
+            options,
+            budget,
+          ),
         );
       } catch (err) {
         // Whatever went wrong, the earlier batches are already jobs on the server
@@ -504,7 +606,7 @@ export class Image2PPTClient {
    * back to a fixed wait.
    */
   async #submitBatch(
-    paths: string[],
+    files: PreparedFile[],
     options: SubmitOptions,
     budget: WaitBudget,
   ): Promise<Job> {
@@ -515,7 +617,7 @@ export class Image2PPTClient {
     let attemptsLeft = MAX_BATCH_ATTEMPTS;
     for (;;) {
       try {
-        return await this.submit(paths, options);
+        return await this.#submitPrepared(files, options);
       } catch (err) {
         if (!(err instanceof RateLimitedError)) throw err;
         attemptsLeft -= 1;
@@ -528,25 +630,119 @@ export class Image2PPTClient {
     }
   }
 
-  /** Measure files for batch planning, using the size they will occupy on the wire. */
-  async #uploadItems(paths: string[]): Promise<UploadItem[]> {
-    return Promise.all(
-      paths.map(async (path) => ({
-        path,
-        size: (await stat(path)).size,
-        isPdf: !isImageMime(guessMime(basename(path))),
-      })),
+  /**
+   * Prepare paths once, so pre-flight, batching, and multipart share identical bytes.
+   *
+   * Bounded on purpose. `submitAll` takes an arbitrarily long list, and preparing one
+   * image holds the whole source file in memory while it is decoded and re-encoded.
+   * Preparing them all at once meant a few hundred photos put a few hundred whole
+   * files in memory simultaneously — enough to take the process down before a single
+   * byte was uploaded. A small pool keeps the decoder busy and the peak flat.
+   */
+  async #prepareFiles(paths: string[]): Promise<PreparedFile[]> {
+    const prepared = new Array<PreparedFile>(paths.length);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      for (let index = next++; index < paths.length; index = next++) {
+        prepared[index] = await this.#prepareFile(paths[index]!);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PREPARE_CONCURRENCY, paths.length) }, worker),
     );
+    return prepared;
   }
 
-  async #request(method: string, path: string, init: { body?: FormData } = {}): Promise<Response> {
+  /** Resolve one path to its exact multipart metadata and wire size. */
+  async #prepareFile(path: string): Promise<PreparedFile> {
+    const name = basename(path);
+    const mime = guessMime(name);
+    if (!isImageMime(mime)) {
+      // PDF files are only stat-ed here; their bytes are streamed while building the
+      // multipart body so a large document never occupies client memory.
+      return {
+        path,
+        name,
+        mime,
+        size: (await stat(path)).size,
+        isImage: false,
+      };
+    }
+
+    // Read outside the try: a missing or unreadable path is a filesystem problem, not
+    // an invalid image, and the PDF branch above lets its own ENOENT/EACCES through.
+    const raw = await readFile(path);
+    let compressed: CompressedImage;
+    try {
+      compressed = await compressImageForUpload(raw, mime);
+    } catch (err) {
+      // An SDK error here is preparation refusing to run at all (no native decoder
+      // for this platform), not a verdict on this file. Passing it through keeps it
+      // from being reported as a bad image.
+      if (err instanceof Image2PPTError) throw err;
+      // Corrupt, truncated, or undecodable image. Surfaced as an SDK error, matching
+      // the Python client, so callers catching Image2PPTError never see a raw decoder
+      // type leak out of this SDK.
+      throw new InvalidFileError(
+        `could not read image "${name}": ${err instanceof Error ? err.message : String(err)}`,
+        { code: "INVALID_FILE" },
+      );
+    }
+    const buffer = compressed.buffer;
+    const outputName =
+      compressed.mime === "image/jpeg" && !/\.jpe?g$/i.test(name)
+        ? `${name.slice(0, Math.max(0, name.length - extname(name).length))}.jpg`
+        : name;
+    return {
+      path,
+      name: outputName,
+      mime: compressed.mime,
+      buffer,
+      size: buffer.byteLength,
+      isImage: true,
+    };
+  }
+
+  /** Validate and submit a prepared payload exactly once. */
+  async #submitPrepared(files: PreparedFile[], options: SubmitOptions): Promise<Job> {
+    // Pre-flight happens after image preparation because these are the exact bytes
+    // that will be transmitted, not the potentially much larger source files.
+    for (const file of files) checkFileSize(file.path, file.size);
+    checkSubmission(
+      files.reduce((total, file) => total + file.size, 0),
+      files.filter((file) => file.isImage).length,
+      files.filter((file) => !file.isImage).length,
+    );
+    const multipart = buildMultipart(files, options);
+    const res = await this.#request("POST", "/api/v1/jobs", {
+      body: multipart.body,
+      headers: {
+        "Content-Type": multipart.contentType,
+        "Content-Length": String(multipart.contentLength),
+      },
+    });
+    return Job.fromJson(await this.#parseJson(res));
+  }
+
+  async #request(
+    method: string,
+    path: string,
+    init: { body?: RequestBody; headers?: Record<string, string> } = {},
+  ): Promise<Response> {
     let res: Response;
     try {
       res = await this.#fetch(`${this.baseUrl}${path}`, {
         method,
-        headers: { Authorization: `Bearer ${this.#apiKey}`, "User-Agent": USER_AGENT },
+        headers: {
+          Authorization: `Bearer ${this.#apiKey}`,
+          "User-Agent": USER_AGENT,
+          ...init.headers,
+        },
         body: init.body,
         signal: AbortSignal.timeout(this.timeoutMs),
+        // Node's fetch requires this for a streaming request body. It is ignored by
+        // browsers, but this SDK is intentionally server-side only.
+        duplex: "half",
       });
     } catch (err) {
       // AbortSignal.timeout aborts the whole request (including a slow large
@@ -563,6 +759,11 @@ export class Image2PPTClient {
           { code: "REQUEST_TIMEOUT" },
         );
       }
+      // A throw from the request body reaches the caller as undici's bare
+      // `TypeError: fetch failed`, with the real reason demoted to `cause`. The body
+      // is this client's own code, so when it is the one that objected — a file that
+      // changed underneath the upload — its message is the one worth surfacing.
+      if (err instanceof Error && err.cause instanceof Image2PPTError) throw err.cause;
       throw err;
     }
     this.#warnIfDeprecated(res);
