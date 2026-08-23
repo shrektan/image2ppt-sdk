@@ -16,6 +16,7 @@ import {
   exceptionFor,
 } from "./errors.js";
 import { compressImageForUpload } from "./compress.js";
+import type { CompressedImage } from "./compress.js";
 import { checkFileSize, checkSubmission, planBatches } from "./limits.js";
 import type { UploadItem } from "./limits.js";
 import type {
@@ -53,6 +54,9 @@ const RATE_LIMIT_FALLBACK_WAIT_MS = 5_000;
  */
 const MIN_RETRY_AFTER_SECONDS = 1;
 
+/** How many images are read and re-encoded at the same time. See `#prepareFiles`. */
+const PREPARE_CONCURRENCY = 4;
+
 const MIME_BY_EXT: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -83,23 +87,49 @@ interface PreparedUploadItem extends UploadItem {
 type RequestBody = NonNullable<RequestInit["body"]>;
 
 function multipartFilename(name: string): string {
-  // A filename is multipart header data, not an arbitrary byte channel.
-  return name.replace(/[\r\n"]/g, (char) => (char === '"' ? "\\\"" : "_"));
+  // A filename is multipart header data, not an arbitrary byte channel. Percent-encode
+  // the three characters that could break out of the quoted string, which is exactly
+  // what Node's built-in FormData did before this client assembled the body itself.
+  // Backslash-escaping instead would be ambiguous: a filename may legally contain a
+  // backslash, and a parser that un-escapes would then swallow the closing quote.
+  return name.replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
 }
 
 function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
   body: RequestBody;
   contentType: string;
+  contentLength: number;
 } {
   const boundary = `----image2ppt-${randomUUID()}`;
   const chunk = (value: string): Buffer => Buffer.from(value, "utf8");
+  const fileHeader = (file: PreparedFile): string =>
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="files"; filename="${multipartFilename(file.name)}"\r\n` +
+    `Content-Type: ${file.mime}\r\n\r\n`;
+  const field = (name: string, value: string): string =>
+    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
+  const trailer = `--${boundary}--\r\n`;
+
+  const fields: string[] = [];
+  if (options.locale) fields.push(field("locale", options.locale));
+  if (options.aspectRatio) fields.push(field("aspectRatio", options.aspectRatio));
+
+  // The body streams, but its length is known before the first byte goes out: image
+  // payloads are already in memory, a PDF's size was measured while preparing it, and
+  // every delimiter is a fixed string. Sending `Content-Length` rather than letting
+  // the request go out chunked is what lets an oversized submission be refused up
+  // front instead of after tens of megabytes have already crossed the wire.
+  const contentLength =
+    files.reduce(
+      (total, file) => total + Buffer.byteLength(fileHeader(file), "utf8") + file.size + 2,
+      0,
+    ) +
+    fields.reduce((total, value) => total + Buffer.byteLength(value, "utf8"), 0) +
+    Buffer.byteLength(trailer, "utf8");
+
   async function* chunks(): AsyncGenerator<Buffer> {
     for (const file of files) {
-      yield chunk(
-        `--${boundary}\r\n` +
-          `Content-Disposition: form-data; name="files"; filename="${multipartFilename(file.name)}"\r\n` +
-          `Content-Type: ${file.mime}\r\n\r\n`,
-      );
+      yield chunk(fileHeader(file));
       if (file.buffer !== undefined) {
         yield file.buffer;
       } else {
@@ -109,21 +139,13 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
       }
       yield chunk("\r\n");
     }
-    if (options.locale) {
-      yield chunk(
-        `--${boundary}\r\nContent-Disposition: form-data; name="locale"\r\n\r\n${options.locale}\r\n`,
-      );
-    }
-    if (options.aspectRatio) {
-      yield chunk(
-        `--${boundary}\r\nContent-Disposition: form-data; name="aspectRatio"\r\n\r\n${options.aspectRatio}\r\n`,
-      );
-    }
-    yield chunk(`--${boundary}--\r\n`);
+    for (const value of fields) yield chunk(value);
+    yield chunk(trailer);
   }
   return {
     body: Readable.toWeb(Readable.from(chunks())) as unknown as RequestBody,
     contentType: `multipart/form-data; boundary=${boundary}`,
+    contentLength,
   };
 }
 
@@ -571,9 +593,27 @@ export class Image2PPTClient {
     }
   }
 
-  /** Prepare paths once, so pre-flight, batching, and multipart share identical bytes. */
+  /**
+   * Prepare paths once, so pre-flight, batching, and multipart share identical bytes.
+   *
+   * Bounded on purpose. `submitAll` takes an arbitrarily long list, and preparing one
+   * image holds the whole source file in memory while it is decoded and re-encoded.
+   * Preparing them all at once meant a few hundred photos put a few hundred whole
+   * files in memory simultaneously — enough to take the process down before a single
+   * byte was uploaded. A small pool keeps the decoder busy and the peak flat.
+   */
   async #prepareFiles(paths: string[]): Promise<PreparedFile[]> {
-    return Promise.all(paths.map((path) => this.#prepareFile(path)));
+    const prepared = new Array<PreparedFile>(paths.length);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      for (let index = next++; index < paths.length; index = next++) {
+        prepared[index] = await this.#prepareFile(paths[index]!);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PREPARE_CONCURRENCY, paths.length) }, worker),
+    );
+    return prepared;
   }
 
   /** Resolve one path to its exact multipart metadata and wire size. */
@@ -592,31 +632,38 @@ export class Image2PPTClient {
       };
     }
 
-    let buffer: Buffer;
+    // Read outside the try: a missing or unreadable path is a filesystem problem, not
+    // an invalid image, and the PDF branch above lets its own ENOENT/EACCES through.
+    const raw = await readFile(path);
+    let compressed: CompressedImage;
     try {
-      const raw = await readFile(path);
-      const compressed = await compressImageForUpload(raw, mime);
-      buffer = compressed.buffer;
-      const outputName =
-        compressed.mime === "image/jpeg" && !/\\.jpe?g$/i.test(name)
-          ? `${name.slice(0, Math.max(0, name.length - extname(name).length))}.jpg`
-          : name;
-      return {
-        path,
-        name: outputName,
-        mime: compressed.mime,
-        buffer,
-        size: buffer.byteLength,
-        isImage: true,
-      };
+      compressed = await compressImageForUpload(raw, mime);
     } catch (err) {
-      // Do not leak sharp/libvips decoder errors. Match server/Python behavior so
-      // callers consistently handle corrupt, truncated, or undecodable images as
-      // InvalidFileError.
-      throw new InvalidFileError(`could not read image "${name}"`, {
-        code: "INVALID_FILE",
-      });
+      // An SDK error here is preparation refusing to run at all (no native decoder
+      // for this platform), not a verdict on this file. Passing it through keeps it
+      // from being reported as a bad image.
+      if (err instanceof Image2PPTError) throw err;
+      // Corrupt, truncated, or undecodable image. Surfaced as an SDK error, matching
+      // the Python client, so callers catching Image2PPTError never see a raw decoder
+      // type leak out of this SDK.
+      throw new InvalidFileError(
+        `could not read image "${name}": ${err instanceof Error ? err.message : String(err)}`,
+        { code: "INVALID_FILE" },
+      );
     }
+    const buffer = compressed.buffer;
+    const outputName =
+      compressed.mime === "image/jpeg" && !/\.jpe?g$/i.test(name)
+        ? `${name.slice(0, Math.max(0, name.length - extname(name).length))}.jpg`
+        : name;
+    return {
+      path,
+      name: outputName,
+      mime: compressed.mime,
+      buffer,
+      size: buffer.byteLength,
+      isImage: true,
+    };
   }
 
   /** Validate and submit a prepared payload exactly once. */
@@ -632,7 +679,10 @@ export class Image2PPTClient {
     const multipart = buildMultipart(files, options);
     const res = await this.#request("POST", "/api/v1/jobs", {
       body: multipart.body,
-      headers: { "Content-Type": multipart.contentType },
+      headers: {
+        "Content-Type": multipart.contentType,
+        "Content-Length": String(multipart.contentLength),
+      },
     });
     return Job.fromJson(await this.#parseJson(res));
   }

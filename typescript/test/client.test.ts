@@ -19,7 +19,6 @@ import sharp from "sharp";
 import {
   AuthenticationError,
   Image2PPTClient,
-  Image2PPTError,
   Image2PPTTimeoutError,
   InsufficientCreditsError,
   InvalidAspectRatioError,
@@ -487,6 +486,51 @@ describe("client-side image preparation", () => {
       name: "InvalidFileError",
       code: "INVALID_FILE",
     });
+  });
+
+  it("refuses a truncated image rather than uploading a half-decoded one", async () => {
+    // Pillow refuses these on the Python side. Uploading the grey remainder would cost
+    // the caller a credit for a slide that is half missing.
+    const file = join(dir, "cut.jpg");
+    await sharp({ create: { width: 800, height: 800, channels: 3, background: "#3366aa" } })
+      .jpeg()
+      .toFile(file);
+    await truncate(file, Math.floor((await stat(file)).size / 2));
+
+    await expect(client(fetchSequence(json(201, {}))).submit([file])).rejects.toMatchObject({
+      name: "InvalidFileError",
+      code: "INVALID_FILE",
+    });
+  });
+
+  it("lets a filesystem error stay a filesystem error", async () => {
+    await expect(
+      client(fetchSequence(json(201, {}))).submit([join(dir, "not-there.png")]),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps a .jpeg name as it is instead of rewriting the extension", async () => {
+    const file = join(dir, "photo.jpeg");
+    await sharp({ create: { width: 40, height: 40, channels: 3, background: "#112233" } })
+      .jpeg()
+      .toFile(file);
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit([file]);
+
+    expect(await postedFilenames(f)).toEqual([["photo.jpeg"]]);
+  });
+
+  it("preserves upload order with more files than the preparation pool", async () => {
+    // Preparation runs a few images at a time; the results still have to line up with
+    // the paths the caller passed, in order.
+    const names = Array.from({ length: 9 }, (_, index) => `order-${index}.png`);
+    const files = await Promise.all(names.map((name) => tempFile(name)));
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await client(f).submit(files);
+
+    expect(await postedFilenames(f)).toEqual([names]);
   });
 });
 

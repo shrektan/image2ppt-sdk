@@ -2,7 +2,7 @@
 
 Official Node.js client for the [image2ppt](https://image2ppt.com) API. Turn a batch of images or PDF pages into one **editable** PowerPoint (`.pptx`).
 
-Uses Node's built-in `fetch` (Node 18.17+) and `sharp` for client-side image preparation.
+Uses Node's built-in `fetch`, plus `sharp` for client-side image preparation. Requires Node 18.17+, 20.3+, or 21+ — the range `sharp` ships native binaries for.
 
 ## Install
 
