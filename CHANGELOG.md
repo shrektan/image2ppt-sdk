@@ -15,6 +15,9 @@ your logs — and a switch to turn it off.
   planned to end (`Sunset`, when present), and how to silence the reminder.
   Polling a job every few seconds does **not** repeat it. Default on; turn it off
   with `warn_on_deprecated=False` (Python) or `warnOnDeprecated: false` (Node).
+  The reminder can never change what a request returns — a logging handler or a
+  `console.warn` replacement that throws is swallowed, and a served response is
+  still a served response.
 - **TypeScript** — a `VERSION` constant, kept in step with `package.json` by a
   test. The `User-Agent` is built from it, so the two numbers cannot drift the
   way they once did on the Python side.
