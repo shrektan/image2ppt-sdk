@@ -1160,7 +1160,7 @@ def test_download_also_warns_about_a_deprecated_version(caplog, tmp_path):
 
     out = tmp_path / "deck.pptx"
     with caplog.at_level(logging.WARNING, logger="image2ppt"):
-        make_client(handler).download("https://example.com/deck.pptx", out)
+        make_client(handler).download("job_abc", out)
     messages = [r.getMessage() for r in caplog.records if r.name == "image2ppt"]
     assert len(messages) == 1
     assert "deprecated" in messages[0].lower()
