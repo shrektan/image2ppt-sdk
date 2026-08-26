@@ -23,6 +23,8 @@ export {
   InsufficientCreditsError,
   InvalidAspectRatioError,
   InvalidFileError,
+  JobAlreadyFinishedError,
+  JobCancelledError,
   JobFailedError,
   JobNotFoundError,
   MalformedUploadError,
@@ -48,6 +50,7 @@ export { Job } from "./types.js";
 export type {
   Account,
   AspectRatio,
+  CancellationResult,
   ClientOptions,
   ConvertOptions,
   JobError,

@@ -44,6 +44,19 @@ job = client.wait(job.job_id, poll_interval=5, timeout=1800)
 client.download(job.job_id, "out.pptx")
 ```
 
+Cancel a job you no longer need:
+
+```python
+result = client.cancel(job.job_id)
+if result.finalizing:
+    print("cancellation accepted; running pages are still winding down")
+```
+
+Cancellation is graceful: pages already running finish and are billed if successful;
+pages that have not started are skipped and refunded. The call is idempotent. A job
+with retained pages finishes as `completed`; without any deliverable it finishes as
+`failed`, and `wait()` raises `JobCancelledError` (a subclass of `JobFailedError`).
+
 Check your balance:
 
 ```python
@@ -129,8 +142,10 @@ Every exception subclasses `Image2PPTError` and carries `status_code`, `code`, a
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retry_after`) |
 | `JobNotFoundError` | 404 | `JOB_NOT_FOUND` |
+| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — cancellation arrived after natural completion |
 | `NotReadyError` | 409 | `NOT_READY` |
 | `OutputExpiredError` | 410 | `OUTPUT_EXPIRED` |
+| `JobCancelledError` | — | `JOB_CANCELLED` — cancellation settled with no deliverable; subclasses `JobFailedError` |
 | `JobFailedError` | — | job's `error.code` (raised by `wait()`; `e.job` is the snapshot) |
 | `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeout`; job may still be running) |
 

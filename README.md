@@ -15,6 +15,9 @@ You send a batch of images or PDF pages; image2ppt reconstructs the layout with 
 
 Both SDKs are **server-side** clients. Never ship your API key to a browser or mobile app — anyone can read it there. Call image2ppt from your backend.
 
+Both also support graceful job cancellation: pages already running finish and remain
+deliverable, while pages that have not started are skipped and refunded.
+
 ## Quick look
 
 ```python

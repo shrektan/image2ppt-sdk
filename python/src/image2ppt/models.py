@@ -7,6 +7,25 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
+class CancellationResult:
+    """Result of requesting graceful cancellation for a conversion job."""
+
+    job_id: str
+    cancellation_requested: bool
+    finalizing: bool
+    raw: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CancellationResult":
+        return cls(
+            job_id=data["jobId"],
+            cancellation_requested=bool(data["cancellationRequested"]),
+            finalizing=bool(data["finalizing"]),
+            raw=data,
+        )
+
+
+@dataclass
 class Job:
     """A snapshot of a conversion job's state.
 
@@ -24,6 +43,7 @@ class Job:
     credits_refunded: Optional[int] = None  # partial success: refunded failed pages
     created_at: Optional[str] = None
     completed_at: Optional[str] = None
+    cancellation_requested: bool = False
     download_url: Optional[str] = None  # completed only; relative path
     error: Optional[Dict[str, Any]] = None  # failed only; {code, message}
     raw: Optional[Dict[str, Any]] = None  # raw response body, for forward-compat fields
@@ -56,6 +76,7 @@ class Job:
             credits_refunded=data.get("creditsRefunded"),
             created_at=data.get("createdAt"),
             completed_at=data.get("completedAt"),
+            cancellation_requested=bool(data.get("cancellationRequested", False)),
             download_url=data.get("downloadUrl"),
             error=data.get("error"),
             raw=data,

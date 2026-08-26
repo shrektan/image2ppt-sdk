@@ -28,6 +28,8 @@ from image2ppt import (
     InvalidAspectRatioError,
     InvalidFileError,
     Job,
+    JobAlreadyFinishedError,
+    JobCancelledError,
     JobFailedError,
     JobNotFoundError,
     MalformedUploadError,
@@ -238,6 +240,31 @@ def test_submit_corrupt_image_raises_invalid_file(tmp_path):
 # --------------------------------------------------------------------------- #
 # get_job / wait
 # --------------------------------------------------------------------------- #
+def test_cancel_requests_graceful_cancellation():
+    def handler(method, url, **kwargs):
+        assert method == "POST"
+        assert url.endswith("/api/v1/jobs/j/cancel")
+        assert kwargs["timeout"] == 60.0
+        return FakeResponse(
+            202,
+            {"jobId": "j", "cancellationRequested": True, "finalizing": True},
+        )
+
+    result = make_client(handler).cancel("j")
+    assert result.job_id == "j"
+    assert result.cancellation_requested
+    assert result.finalizing
+
+
+def test_cancel_finished_job_maps_to_its_own_error():
+    handler = lambda *a, **k: FakeResponse(
+        409,
+        {"error": {"code": "JOB_ALREADY_FINISHED", "message": "already finished"}},
+    )
+    with pytest.raises(JobAlreadyFinishedError):
+        make_client(handler).cancel("j")
+
+
 def test_get_job():
     handler = lambda *a, **k: FakeResponse(200, {"jobId": "j", "status": "processing", "progress": 40})
     job = make_client(handler).get_job("j")
@@ -268,6 +295,22 @@ def test_wait_raises_on_failed():
     assert exc.value.code == "CONVERSION_FAILED"
     assert exc.value.job is not None
     assert exc.value.job.credits_refunded == 3
+
+
+def test_wait_raises_job_cancelled_error_without_a_deliverable():
+    handler = lambda *a, **k: FakeResponse(
+        200,
+        {
+            "jobId": "j",
+            "status": "failed",
+            "cancellationRequested": True,
+            "error": {"code": "JOB_CANCELLED", "message": "cancelled"},
+        },
+    )
+    with pytest.raises(JobCancelledError) as exc:
+        make_client(handler).wait("j", poll_interval=0)
+    assert isinstance(exc.value, JobFailedError)
+    assert exc.value.code == "JOB_CANCELLED"
 
 
 def test_wait_backs_off_on_429(monkeypatch):
@@ -379,11 +422,21 @@ def test_error_envelope_non_json():
 # Job model
 # --------------------------------------------------------------------------- #
 def test_job_from_dict_maps_camelcase():
-    job = Job.from_dict({"jobId": "j", "status": "completed", "creditsUsed": 5, "creditsRefunded": 1})
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "completed",
+            "creditsUsed": 5,
+            "creditsRefunded": 1,
+            "cancellationRequested": True,
+        }
+    )
     assert job.job_id == "j"
     assert job.is_completed
     assert job.credits_used == 5
     assert job.credits_refunded == 1
+    assert job.cancellation_requested
+    assert not Job.from_dict({"jobId": "old", "status": "processing"}).cancellation_requested
 
 
 # --------------------------------------------------------------------------- #

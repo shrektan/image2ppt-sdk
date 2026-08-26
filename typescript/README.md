@@ -45,6 +45,20 @@ const done = await client.wait(job.jobId, { pollIntervalMs: 5000, timeoutMs: 1_8
 await client.download(done.jobId, "out.pptx");
 ```
 
+Cancel a job you no longer need:
+
+```ts
+const result = await client.cancel(job.jobId);
+if (result.finalizing) {
+  console.log("cancellation accepted; running pages are still winding down");
+}
+```
+
+Cancellation is graceful: pages already running finish and are billed if successful;
+pages that have not started are skipped and refunded. The call is idempotent. A job
+with retained pages finishes as `completed`; without any deliverable it finishes as
+`failed`, and `wait()` throws `JobCancelledError` (a subclass of `JobFailedError`).
+
 Check your balance:
 
 ```ts
@@ -137,8 +151,10 @@ Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `m
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retryAfter`) |
 | `JobNotFoundError` | 404 | `JOB_NOT_FOUND` |
+| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — cancellation arrived after natural completion |
 | `NotReadyError` | 409 | `NOT_READY` |
 | `OutputExpiredError` | 410 | `OUTPUT_EXPIRED` |
+| `JobCancelledError` | — | `JOB_CANCELLED` — cancellation settled with no deliverable; subclasses `JobFailedError` |
 | `JobFailedError` | — | job's `error.code` (thrown by `wait()`; `.job` is the snapshot) |
 | `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeoutMs`; job may still be running) |
 

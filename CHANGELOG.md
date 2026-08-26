@@ -3,6 +3,19 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## Unreleased
+
+### Added
+
+- **Both clients** — `cancel()` requests graceful server-side cancellation for a
+  conversion job. Pages already running finish and remain deliverable; pages that
+  have not started are skipped and refunded. Calls are idempotent and return whether
+  the job is still winding down.
+- **Both clients** — job snapshots expose `cancellation_requested` /
+  `cancellationRequested`. A cancellation that settles without a deliverable raises
+  `JobCancelledError` from `wait()`; it subclasses `JobFailedError` for compatibility.
+  Cancelling a job that finished naturally raises `JobAlreadyFinishedError`.
+
 ## 0.3.0
 
 The Node client now prepares images before uploading them, the way the Python

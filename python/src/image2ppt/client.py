@@ -19,11 +19,12 @@ from .errors import (
     Image2PPTError,
     Image2PPTTimeoutError,
     InvalidFileError,
+    JobCancelledError,
     JobFailedError,
     RateLimitedError,
     exception_for,
 )
-from .models import Job
+from .models import CancellationResult, Job
 from ._version import __version__
 
 DEFAULT_BASE_URL = "https://image2ppt.com"
@@ -404,6 +405,20 @@ class Image2PPTClient:
         )
         return Job.from_dict(self._parse_json(resp))
 
+    def cancel(self, job_id: str) -> CancellationResult:
+        """Request graceful cancellation of a conversion job.
+
+        Pages already running finish and remain in the deliverable; pages that
+        have not started are skipped and refunded. Repeating the call is safe.
+        When ``finalizing`` is true, keep polling with ``get_job`` until the job
+        reaches a terminal state.
+        """
+        resp = self._session.post(
+            f"{self.base_url}/api/v1/jobs/{job_id}/cancel",
+            timeout=self.timeout,
+        )
+        return CancellationResult.from_dict(self._parse_json(resp))
+
     def wait(
         self,
         job_id: str,
@@ -449,7 +464,10 @@ class Image2PPTClient:
                 return job
             if job.is_failed:
                 err = job.error or {}
-                raise JobFailedError(
+                error_class = (
+                    JobCancelledError if err.get("code") == "JOB_CANCELLED" else JobFailedError
+                )
+                raise error_class(
                     err.get("message") or "conversion failed",
                     code=err.get("code"),
                     job=job,

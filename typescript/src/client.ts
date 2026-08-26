@@ -11,6 +11,7 @@ import {
   Image2PPTError,
   Image2PPTTimeoutError,
   InvalidFileError,
+  JobCancelledError,
   JobFailedError,
   RateLimitedError,
   exceptionFor,
@@ -21,6 +22,7 @@ import { checkFileSize, checkSubmission, planBatches } from "./limits.js";
 import type { UploadItem } from "./limits.js";
 import type {
   Account,
+  CancellationResult,
   ClientOptions,
   ConvertOptions,
   SubmitOptions,
@@ -427,6 +429,21 @@ export class Image2PPTClient {
   }
 
   /**
+   * Request graceful cancellation of a conversion job.
+   *
+   * Pages already running finish and remain in the deliverable; pages that have
+   * not started are skipped and refunded. Repeating the call is safe. When
+   * `finalizing` is true, keep polling with `getJob` until the job is terminal.
+   */
+  async cancel(jobId: string): Promise<CancellationResult> {
+    const res = await this.#request(
+      "POST",
+      `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`,
+    );
+    return (await this.#parseJson(res)) as unknown as CancellationResult;
+  }
+
+  /**
    * Poll until the job reaches a terminal state; return the completed `Job`.
    *
    * Backs off from `pollIntervalMs` to 15s. On a 429 it waits the `Retry-After`
@@ -466,7 +483,8 @@ export class Image2PPTClient {
       if (job.isCompleted) return job;
       if (job.isFailed) {
         const err = job.error ?? undefined;
-        throw new JobFailedError(err?.message ?? "conversion failed", {
+        const ErrorClass = err?.code === "JOB_CANCELLED" ? JobCancelledError : JobFailedError;
+        throw new ErrorClass(err?.message ?? "conversion failed", {
           code: err?.code,
           job,
         });

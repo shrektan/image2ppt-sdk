@@ -31,6 +31,8 @@ from .errors import (
     InsufficientCreditsError,
     InvalidAspectRatioError,
     InvalidFileError,
+    JobAlreadyFinishedError,
+    JobCancelledError,
     JobFailedError,
     JobNotFoundError,
     MalformedUploadError,
@@ -42,12 +44,13 @@ from .errors import (
     TooManySlidesError,
     UploadAbortedError,
 )
-from .models import Job
+from .models import CancellationResult, Job
 from ._version import __version__
 
 __all__ = [
     "Image2PPTClient",
     "Job",
+    "CancellationResult",
     "DEFAULT_BASE_URL",
     "MAX_FILE_BYTES",
     "MAX_UPLOAD_BYTES",
@@ -69,6 +72,8 @@ __all__ = [
     "InsufficientCreditsError",
     "RateLimitedError",
     "JobNotFoundError",
+    "JobAlreadyFinishedError",
+    "JobCancelledError",
     "NotReadyError",
     "OutputExpiredError",
     "JobFailedError",

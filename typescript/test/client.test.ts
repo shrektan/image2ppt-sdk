@@ -24,6 +24,9 @@ import {
   InvalidAspectRatioError,
   InvalidFileError,
   Job,
+  JobAlreadyFinishedError,
+  JobCancelledError,
+  JobFailedError,
   JobNotFoundError,
   MalformedUploadError,
   MAX_FILE_BYTES,
@@ -245,6 +248,34 @@ describe("submit", () => {
 // --------------------------------------------------------------------------- //
 // getJob / wait
 // --------------------------------------------------------------------------- //
+describe("cancel", () => {
+  it("requests graceful cancellation and returns the winding-down state", async () => {
+    const f = fetchSequence(
+      json(202, { jobId: "j/1", cancellationRequested: true, finalizing: true }),
+    );
+    const result = await client(f).cancel("j/1");
+
+    expect(result).toEqual({
+      jobId: "j/1",
+      cancellationRequested: true,
+      finalizing: true,
+    });
+    expect(f.calls[0]?.url).toBe("https://image2ppt.com/api/v1/jobs/j%2F1/cancel");
+    expect(f.calls[0]?.init.method).toBe("POST");
+  });
+
+  it("maps a naturally finished job to JobAlreadyFinishedError", async () => {
+    const c = client(
+      fetchSequence(
+        json(409, {
+          error: { code: "JOB_ALREADY_FINISHED", message: "already finished" },
+        }),
+      ),
+    );
+    await expect(c.cancel("j")).rejects.toBeInstanceOf(JobAlreadyFinishedError);
+  });
+});
+
 describe("wait", () => {
   it("polls until completed", async () => {
     const c = client(
@@ -275,6 +306,26 @@ describe("wait", () => {
       name: "JobFailedError",
       code: "CONVERSION_FAILED",
     });
+  });
+
+  it("throws JobCancelledError when cancellation settles without a deliverable", async () => {
+    const c = client(
+      fetchSequence(
+        json(200, {
+          jobId: "j",
+          status: "failed",
+          cancellationRequested: true,
+          error: { code: "JOB_CANCELLED", message: "cancelled" },
+        }),
+      ),
+    );
+    const error = await c.wait("j", { pollIntervalMs: 0 }).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(error).toBeInstanceOf(JobCancelledError);
+    expect(error).toBeInstanceOf(JobFailedError);
+    expect(error).toMatchObject({ code: "JOB_CANCELLED" });
   });
 
   it("backs off on 429 then continues", async () => {
@@ -587,6 +638,14 @@ describe("Job", () => {
     expect(job.isCompleted).toBe(true);
     expect(job.isTerminal).toBe(true);
     expect(job.creditsUsed).toBe(5);
+  });
+
+  it("maps the cancellation marker and defaults it for old responses", () => {
+    expect(
+      Job.fromJson({ jobId: "new", status: "processing", cancellationRequested: true })
+        .cancellationRequested,
+    ).toBe(true);
+    expect(Job.fromJson({ jobId: "old", status: "processing" }).cancellationRequested).toBe(false);
   });
 });
 
