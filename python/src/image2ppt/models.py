@@ -43,10 +43,10 @@ class Job:
     credits_refunded: Optional[int] = None  # partial success: refunded failed pages
     created_at: Optional[str] = None
     completed_at: Optional[str] = None
-    cancellation_requested: bool = False
     download_url: Optional[str] = None  # completed only; relative path
     error: Optional[Dict[str, Any]] = None  # failed only; {code, message}
     raw: Optional[Dict[str, Any]] = None  # raw response body, for forward-compat fields
+    cancellation_requested: bool = False
 
     @property
     def is_completed(self) -> bool:

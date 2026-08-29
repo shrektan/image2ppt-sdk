@@ -243,16 +243,16 @@ def test_submit_corrupt_image_raises_invalid_file(tmp_path):
 def test_cancel_requests_graceful_cancellation():
     def handler(method, url, **kwargs):
         assert method == "POST"
-        assert url.endswith("/api/v1/jobs/j/cancel")
+        assert url.endswith("/api/v1/jobs/j%2F1/cancel")
         assert kwargs["timeout"] == 60.0
         return FakeResponse(
             202,
-            {"jobId": "j", "cancellationRequested": True, "finalizing": True},
+            {"jobId": "j/1", "cancellationRequested": True, "finalizing": True},
         )
 
     client, session = client_and_session(handler)
-    result = client.cancel("j")
-    assert result.job_id == "j"
+    result = client.cancel("j/1")
+    assert result.job_id == "j/1"
     assert result.cancellation_requested
     assert result.finalizing
     assert session.headers["Authorization"] == "Bearer i2p_live_test"
@@ -516,6 +516,30 @@ def test_job_from_dict_maps_camelcase():
     assert job.credits_refunded == 1
     assert job.cancellation_requested
     assert not Job.from_dict({"jobId": "old", "status": "processing"}).cancellation_requested
+
+
+def test_job_preserves_legacy_positional_constructor_order():
+    error = {"code": "FAILED"}
+    raw = {"legacy": True}
+    job = Job(
+        "j",
+        "completed",
+        1,
+        100,
+        2,
+        1,
+        1,
+        "created",
+        "completed",
+        "/download",
+        error,
+        raw,
+    )
+
+    assert job.download_url == "/download"
+    assert job.error is error
+    assert job.raw is raw
+    assert not job.cancellation_requested
 
 
 # --------------------------------------------------------------------------- #
