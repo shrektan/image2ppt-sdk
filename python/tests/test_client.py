@@ -250,10 +250,13 @@ def test_cancel_requests_graceful_cancellation():
             {"jobId": "j", "cancellationRequested": True, "finalizing": True},
         )
 
-    result = make_client(handler).cancel("j")
+    client, session = client_and_session(handler)
+    result = client.cancel("j")
     assert result.job_id == "j"
     assert result.cancellation_requested
     assert result.finalizing
+    assert session.headers["Authorization"] == "Bearer i2p_live_test"
+    assert session.headers["User-Agent"].startswith("image2ppt-python/")
 
 
 def test_cancel_finished_job_maps_to_its_own_error():
@@ -263,6 +266,82 @@ def test_cancel_finished_job_maps_to_its_own_error():
     )
     with pytest.raises(JobAlreadyFinishedError):
         make_client(handler).cancel("j")
+
+
+def test_cancel_maps_not_found_and_server_failures():
+    with pytest.raises(JobNotFoundError) as missing:
+        make_client(
+            lambda *a, **k: FakeResponse(
+                404, {"error": {"code": "JOB_NOT_FOUND", "message": "missing"}}
+            )
+        ).cancel("missing")
+    assert missing.value.code == "JOB_NOT_FOUND"
+
+    with pytest.raises(Image2PPTError) as failed:
+        make_client(
+            lambda *a, **k: FakeResponse(
+                500,
+                {"error": {"code": "JOB_CANCEL_FAILED", "message": "try later"}},
+            )
+        ).cancel("j")
+    assert failed.value.status_code == 500
+    assert failed.value.code == "JOB_CANCEL_FAILED"
+
+
+def test_cancel_does_not_retry_an_ambiguous_network_failure():
+    def handler(*args, **kwargs):
+        raise requests.ConnectionError("connection reset")
+
+    client, session = client_and_session(handler)
+    with pytest.raises(requests.ConnectionError, match="connection reset"):
+        client.cancel("j")
+    assert len(session.calls) == 1
+
+
+def test_cancel_wait_then_downloads_the_partial_deck(tmp_path):
+    responses = iter(
+        [
+            FakeResponse(
+                202,
+                {"jobId": "j", "cancellationRequested": True, "finalizing": True},
+            ),
+            FakeResponse(
+                200,
+                {"jobId": "j", "status": "processing", "cancellationRequested": True},
+            ),
+            FakeResponse(
+                200,
+                {
+                    "jobId": "j",
+                    "status": "completed",
+                    "slideCount": 3,
+                    "creditsUsed": 1,
+                    "creditsRefunded": 2,
+                    "cancellationRequested": True,
+                    "downloadUrl": "/api/v1/jobs/j/download",
+                },
+            ),
+            FakeResponse(200, content=b"PARTIAL-PPTX"),
+        ]
+    )
+    client, session = client_and_session(lambda *a, **k: next(responses))
+
+    client.cancel("j")
+    done = client.wait("j", poll_interval=0)
+    assert done.is_completed
+    assert done.cancellation_requested
+    assert done.credits_used == 1
+    assert done.credits_refunded == 2
+    dest = tmp_path / "partial.pptx"
+    client.download(done.job_id, str(dest))
+
+    assert dest.read_bytes() == b"PARTIAL-PPTX"
+    assert [(method, url) for method, url, _ in session.calls] == [
+        ("POST", "https://image2ppt.com/api/v1/jobs/j/cancel"),
+        ("GET", "https://image2ppt.com/api/v1/jobs/j"),
+        ("GET", "https://image2ppt.com/api/v1/jobs/j"),
+        ("GET", "https://image2ppt.com/api/v1/jobs/j/download"),
+    ]
 
 
 def test_get_job():

@@ -23,7 +23,7 @@ Sign in at [image2ppt.com](https://image2ppt.com), open **Developer / API** from
 One shot — submit, wait, download:
 
 ```ts
-import { Image2PPTClient } from "image2ppt";
+import { Image2PPTClient, JobCancelledError } from "image2ppt";
 
 const client = new Image2PPTClient({ apiKey: process.env.IMAGE2PPT_API_KEY! });
 
@@ -51,6 +51,15 @@ Cancel a job you no longer need:
 const result = await client.cancel(job.jobId);
 if (result.finalizing) {
   console.log("cancellation accepted; running pages are still winding down");
+}
+
+try {
+  const done = await client.wait(job.jobId);
+  // At least one page completed: the partial deck remains downloadable.
+  await client.download(done.jobId, "partial.pptx");
+} catch (error) {
+  if (!(error instanceof JobCancelledError)) throw error;
+  // No page completed, so the reservation was refunded and there is no deck.
 }
 ```
 

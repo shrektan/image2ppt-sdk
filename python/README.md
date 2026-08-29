@@ -21,7 +21,7 @@ Sign in at [image2ppt.com](https://image2ppt.com), open **Developer / API** from
 One shot — submit, wait, download:
 
 ```python
-from image2ppt import Image2PPTClient
+from image2ppt import Image2PPTClient, JobCancelledError
 
 client = Image2PPTClient(api_key="i2p_live_your_key")
 
@@ -50,6 +50,14 @@ Cancel a job you no longer need:
 result = client.cancel(job.job_id)
 if result.finalizing:
     print("cancellation accepted; running pages are still winding down")
+
+try:
+    done = client.wait(job.job_id)
+    # At least one page completed: the partial deck remains downloadable.
+    client.download(done.job_id, "partial.pptx")
+except JobCancelledError:
+    # No page completed, so the reservation was refunded and there is no deck.
+    pass
 ```
 
 Cancellation is graceful: pages already running finish and are billed if successful;

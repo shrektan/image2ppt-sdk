@@ -262,6 +262,10 @@ describe("cancel", () => {
     });
     expect(f.calls[0]?.url).toBe("https://image2ppt.com/api/v1/jobs/j%2F1/cancel");
     expect(f.calls[0]?.init.method).toBe("POST");
+    expect(f.calls[0]?.init.headers).toMatchObject({
+      Authorization: "Bearer i2p_live_test",
+      "User-Agent": `image2ppt-node/${VERSION}`,
+    });
   });
 
   it("maps a naturally finished job to JobAlreadyFinishedError", async () => {
@@ -273,6 +277,72 @@ describe("cancel", () => {
       ),
     );
     await expect(c.cancel("j")).rejects.toBeInstanceOf(JobAlreadyFinishedError);
+  });
+
+  it("maps not-found and server failures without hiding their public codes", async () => {
+    await expect(
+      client(
+        fetchSequence(json(404, { error: { code: "JOB_NOT_FOUND", message: "missing" } })),
+      ).cancel("missing"),
+    ).rejects.toBeInstanceOf(JobNotFoundError);
+
+    await expect(
+      client(
+        fetchSequence(
+          json(500, { error: { code: "JOB_CANCEL_FAILED", message: "try later" } }),
+        ),
+      ).cancel("j"),
+    ).rejects.toMatchObject({
+      name: "Image2PPTError",
+      statusCode: 500,
+      code: "JOB_CANCEL_FAILED",
+    });
+  });
+
+  it("does not retry an ambiguous network failure", async () => {
+    const f = fetchScript(() => {
+      throw new TypeError("fetch failed");
+    });
+    await expect(client(f).cancel("j")).rejects.toThrow("fetch failed");
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("supports cancel, wait for the partial deck, then download", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "image2ppt-cancel-flow-"));
+    const dest = join(dir, "partial.pptx");
+    const f = fetchSequence(
+      json(202, { jobId: "j", cancellationRequested: true, finalizing: true }),
+      json(200, { jobId: "j", status: "processing", cancellationRequested: true }),
+      json(200, {
+        jobId: "j",
+        status: "completed",
+        slideCount: 3,
+        creditsUsed: 1,
+        creditsRefunded: 2,
+        cancellationRequested: true,
+        downloadUrl: "/api/v1/jobs/j/download",
+      }),
+      new Response("PARTIAL-PPTX", { status: 200 }),
+    );
+    const c = client(f);
+
+    await c.cancel("j");
+    const done = await c.wait("j", { pollIntervalMs: 0 });
+    expect(done).toMatchObject({
+      isCompleted: true,
+      cancellationRequested: true,
+      creditsUsed: 1,
+      creditsRefunded: 2,
+    });
+    await c.download(done.jobId, dest);
+
+    expect(await readFile(dest, "utf8")).toBe("PARTIAL-PPTX");
+    expect(f.calls.map((call) => [call.init.method, call.url])).toEqual([
+      ["POST", "https://image2ppt.com/api/v1/jobs/j/cancel"],
+      ["GET", "https://image2ppt.com/api/v1/jobs/j"],
+      ["GET", "https://image2ppt.com/api/v1/jobs/j"],
+      ["GET", "https://image2ppt.com/api/v1/jobs/j/download"],
+    ]);
   });
 });
 
