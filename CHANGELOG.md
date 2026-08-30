@@ -3,7 +3,10 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
-## Unreleased
+## 0.4.0
+
+Both clients can now ask the service to stop a conversion job that is already
+running, and still keep whatever it managed to finish.
 
 ### Added
 
@@ -21,6 +24,19 @@ here. The two clients share a single version number.
 - **Python** — `get_job()` and `download()` now percent-encode the job id, so a job
   id containing a reserved path character reaches the right endpoint. The Node client
   already did.
+
+### Deployment Notes
+
+**Data impact**: None — the SDKs are thin HTTP clients with no server-side logic
+and no persisted state.
+**Environment changes**: None — runtime dependencies are unchanged (Python:
+`requests` + `Pillow`; Node: `sharp`), and the minimum Python / Node versions are
+unchanged.
+**Manual operations**: None for consumers. `pip install -U image2ppt` /
+`npm install image2ppt@latest` is all that is needed to pick up `cancel()`.
+**Rollback plan**: PyPI and npm do not allow republishing a version number. If
+0.4.0 turns out to be broken, yank/deprecate it and ship 0.4.1; do not attempt to
+overwrite 0.4.0.
 
 ## 0.3.0
 
