@@ -54,6 +54,15 @@ export interface Account {
   credits: number;
 }
 
+/** Result of requesting graceful cancellation for a conversion job. */
+export interface CancellationResult {
+  readonly jobId: string;
+  /** Whether the service accepted the cancellation request. */
+  readonly cancellationRequested: boolean;
+  /** True while the job is still winding down; keep polling `getJob` until terminal. */
+  readonly finalizing: boolean;
+}
+
 /** A snapshot of a conversion job's state. */
 export class Job {
   readonly jobId: string;
@@ -65,6 +74,8 @@ export class Job {
   readonly creditsRefunded: number | null;
   readonly createdAt: string | null;
   readonly completedAt: string | null;
+  /** Optional in the public shape so pre-cancellation structural `Job` values still type-check. */
+  readonly cancellationRequested?: boolean;
   readonly downloadUrl: string | null;
   readonly error: JobError | null;
   /** Raw response body, for forward-compatible access to new fields. */
@@ -81,6 +92,7 @@ export class Job {
     this.creditsRefunded = d.creditsRefunded ?? null;
     this.createdAt = d.createdAt ?? null;
     this.completedAt = d.completedAt ?? null;
+    this.cancellationRequested = d.cancellationRequested ?? false;
     this.downloadUrl = d.downloadUrl ?? null;
     this.error = d.error ?? null;
     this.raw = data;

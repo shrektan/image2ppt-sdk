@@ -5,6 +5,41 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from .errors import Image2PPTError
+
+
+@dataclass
+class CancellationResult:
+    """Result of requesting graceful cancellation for a conversion job."""
+
+    job_id: str
+    cancellation_requested: bool
+    finalizing: bool
+    raw: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CancellationResult":
+        """Build the result, or raise ``Image2PPTError`` if the envelope is malformed.
+
+        These three fields are the whole documented response, so a body missing one
+        is not something a caller can act on. It still has to arrive as an
+        ``Image2PPTError``: the READMEs tell callers that catching that one class
+        covers the client, and a bare ``KeyError`` would walk straight through it.
+        """
+        if not isinstance(data, dict):
+            raise Image2PPTError("malformed cancellation response, expected a JSON object")
+        missing = [k for k in ("jobId", "cancellationRequested", "finalizing") if k not in data]
+        if missing:
+            raise Image2PPTError(
+                f"malformed cancellation response, missing {', '.join(missing)}"
+            )
+        return cls(
+            job_id=data["jobId"],
+            cancellation_requested=bool(data["cancellationRequested"]),
+            finalizing=bool(data["finalizing"]),
+            raw=data,
+        )
+
 
 @dataclass
 class Job:
@@ -27,6 +62,7 @@ class Job:
     download_url: Optional[str] = None  # completed only; relative path
     error: Optional[Dict[str, Any]] = None  # failed only; {code, message}
     raw: Optional[Dict[str, Any]] = None  # raw response body, for forward-compat fields
+    cancellation_requested: bool = False
 
     @property
     def is_completed(self) -> bool:
@@ -56,6 +92,7 @@ class Job:
             credits_refunded=data.get("creditsRefunded"),
             created_at=data.get("createdAt"),
             completed_at=data.get("completedAt"),
+            cancellation_requested=bool(data.get("cancellationRequested", False)),
             download_url=data.get("downloadUrl"),
             error=data.get("error"),
             raw=data,

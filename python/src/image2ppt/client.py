@@ -9,6 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import quote
 
 import requests
 from PIL import Image, UnidentifiedImageError
@@ -19,11 +20,12 @@ from .errors import (
     Image2PPTError,
     Image2PPTTimeoutError,
     InvalidFileError,
+    JobCancelledError,
     JobFailedError,
     RateLimitedError,
     exception_for,
 )
-from .models import Job
+from .models import CancellationResult, Job
 from ._version import __version__
 
 DEFAULT_BASE_URL = "https://image2ppt.com"
@@ -399,10 +401,24 @@ class Image2PPTClient:
     def get_job(self, job_id: str) -> Job:
         """Fetch the current job state as a ``Job`` snapshot. Raises JobNotFoundError."""
         resp = self._session.get(
-            f"{self.base_url}/api/v1/jobs/{job_id}",
+            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}",
             timeout=self.timeout,
         )
         return Job.from_dict(self._parse_json(resp))
+
+    def cancel(self, job_id: str) -> CancellationResult:
+        """Request graceful cancellation of a conversion job.
+
+        Pages already running finish and remain in the deliverable; pages that
+        have not started are skipped and refunded. Repeating the call is safe.
+        When ``finalizing`` is true, keep polling with ``get_job`` until the job
+        reaches a terminal state.
+        """
+        resp = self._session.post(
+            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/cancel",
+            timeout=self.timeout,
+        )
+        return CancellationResult.from_dict(self._parse_json(resp))
 
     def wait(
         self,
@@ -449,7 +465,10 @@ class Image2PPTClient:
                 return job
             if job.is_failed:
                 err = job.error or {}
-                raise JobFailedError(
+                error_class = (
+                    JobCancelledError if err.get("code") == "JOB_CANCELLED" else JobFailedError
+                )
+                raise error_class(
                     err.get("message") or "conversion failed",
                     code=err.get("code"),
                     job=job,
@@ -473,7 +492,7 @@ class Image2PPTClient:
         it doesn't exist, OutputExpiredError (410) if the deliverable was reaped.
         """
         resp = self._session.get(
-            f"{self.base_url}/api/v1/jobs/{job_id}/download",
+            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/download",
             stream=True,
             timeout=self.timeout,
         )

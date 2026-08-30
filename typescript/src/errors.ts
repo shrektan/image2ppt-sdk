@@ -103,6 +103,9 @@ export class InsufficientCreditsError extends Image2PPTError {}
 /** The job id doesn't exist, or isn't owned by this key's account (404). */
 export class JobNotFoundError extends Image2PPTError {}
 
+/** The job finished naturally before a cancellation request was accepted (409). */
+export class JobAlreadyFinishedError extends Image2PPTError {}
+
 /** The job hasn't finished yet, so the deliverable can't be downloaded (409). */
 export class NotReadyError extends Image2PPTError {}
 
@@ -140,6 +143,9 @@ export class JobFailedError extends Image2PPTError {
   }
 }
 
+/** A graceful cancellation settled without any deliverable pages. */
+export class JobCancelledError extends JobFailedError {}
+
 /**
  * `wait` exceeded its `timeout` before the job reached a terminal state. This does
  * not mean the job failed — it may still be running. Re-`wait` on the `jobId` later.
@@ -171,6 +177,7 @@ const CODE_TO_CLASS: Record<string, new (m: string, i?: ErrorInit) => Image2PPTE
   INSUFFICIENT_CREDITS: InsufficientCreditsError,
   RATE_LIMITED: RateLimitedError,
   JOB_NOT_FOUND: JobNotFoundError,
+  JOB_ALREADY_FINISHED: JobAlreadyFinishedError,
   NOT_READY: NotReadyError,
   OUTPUT_EXPIRED: OutputExpiredError,
 };

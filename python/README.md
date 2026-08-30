@@ -21,7 +21,7 @@ Sign in at [image2ppt.com](https://image2ppt.com), open **Developer / API** from
 One shot — submit, wait, download:
 
 ```python
-from image2ppt import Image2PPTClient
+from image2ppt import Image2PPTClient, JobCancelledError
 
 client = Image2PPTClient(api_key="i2p_live_your_key")
 
@@ -44,6 +44,27 @@ job = client.wait(job.job_id, poll_interval=5, timeout=1800)
 client.download(job.job_id, "out.pptx")
 ```
 
+Cancel a job you no longer need:
+
+```python
+result = client.cancel(job.job_id)
+if result.finalizing:
+    print("cancellation accepted; running pages are still winding down")
+
+try:
+    done = client.wait(job.job_id)
+    # At least one page completed: the partial deck remains downloadable.
+    client.download(done.job_id, "partial.pptx")
+except JobCancelledError:
+    # No page completed, so the reservation was refunded and there is no deck.
+    pass
+```
+
+Cancellation is graceful: pages already running finish and are billed if successful;
+pages that have not started are skipped and refunded. The call is idempotent. A job
+with retained pages finishes as `completed`; without any deliverable it finishes as
+`failed`, and `wait()` raises `JobCancelledError` (a subclass of `JobFailedError`).
+
 Check your balance:
 
 ```python
@@ -56,7 +77,7 @@ print(info["email"], "credits:", info["credits"])
 - **Async.** `submit` returns a job id immediately; conversion runs in the background. A single page typically takes ~2 minutes; 90% of jobs finish within 3.
 - **One job = one PPTX.** All files in a submission are merged into a single deck, in upload order.
 - **Billed per page.** 1 page = 1 credit, reserved at submit and settled on completion. If some pages fail but others succeed, the job still `completed`s with the good pages and the failed pages' credits are refunded (`credits_refunded`).
-- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**: for an image that is its size *after* client-side compression, so a 40MB PNG that compresses to 1MB is fine. (The Node SDK has no client-side compression, so it counts the size on disk and would refuse that same PNG — the two clients agree on the limits, not always on the verdict for one file.)
+- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**: for an image that is its size *after* client-side compression, so a 40MB PNG that compresses to 1MB is fine. (The Node SDK compresses before upload the same way, so both clients reach the same verdict on the same file.)
 - **The check is never stricter than the documented limit.** 45MB of file content is meant to be usable, so a submission sitting exactly on it goes through. Auto-batching is the one place that is deliberately conservative — it fills a batch only to 40MB, because starting one more batch costs nothing while refusing something the server would have accepted does not.
 - **Only the formats the API accepts.** `png`, `jpg`/`jpeg`, `webp`, `gif`, `pdf`. Anything else raises `InvalidFileError` locally — the batch calls check every file before submitting the first one, so an unsupported file at the end of the pile cannot leave you paying for the batches ahead of it.
 - **The local page check is a lower bound.** The client does not parse PDFs, so it counts each one as *at least* 1 page. That is enough to refuse combinations that can never work (50 images plus any PDF is already 51 pages), but a submission that passes locally can still come back `TOO_MANY_SLIDES` — a 30-page PDF counts as 1 here and 30 on the server.
@@ -129,9 +150,12 @@ Every exception subclasses `Image2PPTError` and carries `status_code`, `code`, a
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retry_after`) |
 | `JobNotFoundError` | 404 | `JOB_NOT_FOUND` |
+| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — cancellation arrived after natural completion |
 | `NotReadyError` | 409 | `NOT_READY` |
 | `OutputExpiredError` | 410 | `OUTPUT_EXPIRED` |
+| `JobCancelledError` | — | `JOB_CANCELLED` — cancellation settled with no deliverable; subclasses `JobFailedError` |
 | `JobFailedError` | — | job's `error.code` (raised by `wait()`; `e.job` is the snapshot) |
+| `Image2PPTError` (base) | 5xx | `JOB_CANCEL_FAILED` — the service could not accept the cancellation; **retrying is safe**. Other 5xx codes land here too; branch on `e.code`. |
 | `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeout`; job may still be running) |
 
 ```python

@@ -15,6 +15,8 @@
 3. 每隔几秒调 `GET /api/v1/jobs/{任务号}` 查进度，直到状态变成 `completed`。
 4. 调 `GET /api/v1/jobs/{任务号}/download` 下载成品 PPTX。
 
+如果不再需要结果，可随时调 `POST /api/v1/jobs/{任务号}/cancel` 请求停止后续页面。
+
 转换是**异步**的：提交后立刻返回任务号，真正的转换在后台跑。别在提交那一步干等结果。
 
 ---
@@ -151,6 +153,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
   "slideCount": 12,
   "creditsUsed": 0,
   "creditsRefunded": 0,
+  "cancellationRequested": false,
   "createdAt": "2026-07-07 08:00:00",
   "completedAt": null
 }
@@ -165,6 +168,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 | `slideCount` | 总页数。 |
 | `creditsUsed` | 结算后实际扣除的积分。 |
 | `creditsRefunded` | 部分成功时退回的失败页积分，见「计费与退款」。 |
+| `cancellationRequested` | 服务器是否已接受取消请求。为兼容旧客户端，任务状态仍使用原有四种取值。 |
 | `createdAt` / `completedAt` | UTC 创建时间 / 完成时间，格式为 `YYYY-MM-DD HH:MM:SS`（未完成时 `completedAt` 为 `null`）。 |
 | `downloadUrl` | **仅当 `completed` 且成品仍在保留期内**时给出，是下载端点的相对路径；其余状态不返回这个字段。 |
 | `error` | **仅当 `failed`** 时给出，形如 `{"code": "...", "message": "..."}`。 |
@@ -195,7 +199,42 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 
 ---
 
-### 3. 下载成品 `GET /api/v1/jobs/{jobId}/download`
+### 3. 取消任务 `POST /api/v1/jobs/{jobId}/cancel`
+
+请求服务器停止这个任务的后续工作。这个动作是**收尾式取消**，不是硬切：
+
+- 已经开始转换的页面会继续完成，成功页面会保存在最终 PPTX 中并正常计费。
+- 尚未开始的页面不会再运行，对应积分退回。
+- 请求可以安全重试，不会重复取消或重复结算。
+
+**任务仍在收尾** `202 Accepted`
+
+```json
+{
+  "jobId": "job_abc123",
+  "cancellationRequested": true,
+  "finalizing": true
+}
+```
+
+`finalizing: true` 表示仍有页面或 PPTX 装包正在收尾。继续轮询任务状态，直到变成 `completed` 或 `failed`。如果取消在本次请求内已经结算完，则返回 `200 OK` 且 `finalizing: false`。
+
+取消后可能有两种终局：
+
+- 至少保留了一页成功结果：任务为 `completed`，可下载部分 PPTX；未产出的页面通过 `creditsRefunded` 退款。
+- 没有可交付页面：任务为 `failed`，`error.code` 为 `JOB_CANCELLED`，积分全额退回。
+
+**可能的错误**
+
+| HTTP | code | 含义 |
+|---|---|---|
+| 404 | `JOB_NOT_FOUND` | 任务号不存在、不是 API 任务，或不属于本账户。 |
+| 409 | `JOB_ALREADY_FINISHED` | 取消请求到达前任务已经自然结束。 |
+| 500 | `JOB_CANCEL_FAILED` | 服务端暂时无法接受取消请求，可安全重试。 |
+
+---
+
+### 4. 下载成品 `GET /api/v1/jobs/{jobId}/download`
 
 任务完成后，从这里下载 PPTX。
 
@@ -214,7 +253,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 
 ---
 
-### 4. 查询账户 `GET /api/v1/account`
+### 5. 查询账户 `GET /api/v1/account`
 
 **成功响应** `200 OK`
 
@@ -300,6 +339,7 @@ Link: <https://github.com/shrektan/image2ppt-sdk/blob/main/CHANGELOG.md>; rel="d
 - 完成时**结算**：实际扣除体现在 `creditsUsed`。
 - **部分成功**：如果个别页转换失败、其余成功，任务仍然是 `completed`，成品里**包含成功的页**，失败页的积分**自动退回**，体现在 `creditsRefunded`（此时 `creditsRefunded > 0`）。
 - **整体失败**：任务变成 `failed`，锁定的积分全额退回。
+- **主动取消**：已开始页面完成后按同一规则结算；未开始页面不再运行并退款。若没有可交付页面，状态为 `failed` 且错误码为 `JOB_CANCELLED`。
 
 一句话：你只为**成功产出的页**付费。
 
@@ -307,7 +347,7 @@ Link: <https://github.com/shrektan/image2ppt-sdk/blob/main/CHANGELOG.md>; rel="d
 
 ## 官方 SDK
 
-我们提供 Python 和 Node.js/TypeScript 两个官方客户端，都封装了提交、轮询、下载、429 退避和错误映射。源码、示例和完整说明在 GitHub：<https://github.com/shrektan/image2ppt-sdk>。
+我们提供 Python 和 Node.js/TypeScript 两个官方客户端，都封装了提交、轮询、取消、下载、429 退避和错误映射。源码、示例和完整说明在 GitHub：<https://github.com/shrektan/image2ppt-sdk>。
 
 > SDK 只在**服务端**使用。别把 API 密钥放进浏览器或任何用户能看到的地方——谁都能读出来。
 
@@ -386,8 +426,10 @@ try {
 | 403 | `ACCOUNT_DELETED` | 账号已删除（提交）。 |
 | 413 | `PAYLOAD_TOO_LARGE` | 同一请求的文件内容合计超过 45MB（提交）。 |
 | 429 | `RATE_LIMITED` | 触发限流，带 `Retry-After` 头（提交）。轮询状态不限流。 |
-| 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户（查询、下载）。 |
+| 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户（查询、取消、下载）。 |
+| 409 | `JOB_ALREADY_FINISHED` | 取消请求到达前任务已经自然结束（取消）。 |
 | 409 | `NOT_READY` | 任务未完成就来下载（下载）。 |
+| — | `JOB_CANCELLED` | 取消已结算且没有可交付页面（任务状态里的 `error.code`）。 |
 | 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理（下载）。 |
 | 416 | `RANGE_NOT_SATISFIABLE` | 下载续传范围超出成品文件大小（下载）。 |
-| 5xx | `STORAGE_FAILED` 等 | 服务端处理出错，稍后重试；反复出现请联系我们。 |
+| 5xx | `JOB_CANCEL_FAILED`、`STORAGE_FAILED` 等 | 服务端处理出错，稍后重试；反复出现请联系我们。 |

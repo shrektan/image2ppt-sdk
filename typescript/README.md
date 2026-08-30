@@ -23,7 +23,7 @@ Sign in at [image2ppt.com](https://image2ppt.com), open **Developer / API** from
 One shot — submit, wait, download:
 
 ```ts
-import { Image2PPTClient } from "image2ppt";
+import { Image2PPTClient, JobCancelledError } from "image2ppt";
 
 const client = new Image2PPTClient({ apiKey: process.env.IMAGE2PPT_API_KEY! });
 
@@ -44,6 +44,29 @@ console.log("job:", job.jobId, "reserved:", job.creditsReserved);
 const done = await client.wait(job.jobId, { pollIntervalMs: 5000, timeoutMs: 1_800_000 });
 await client.download(done.jobId, "out.pptx");
 ```
+
+Cancel a job you no longer need:
+
+```ts
+const result = await client.cancel(job.jobId);
+if (result.finalizing) {
+  console.log("cancellation accepted; running pages are still winding down");
+}
+
+try {
+  const done = await client.wait(job.jobId);
+  // At least one page completed: the partial deck remains downloadable.
+  await client.download(done.jobId, "partial.pptx");
+} catch (error) {
+  if (!(error instanceof JobCancelledError)) throw error;
+  // No page completed, so the reservation was refunded and there is no deck.
+}
+```
+
+Cancellation is graceful: pages already running finish and are billed if successful;
+pages that have not started are skipped and refunded. The call is idempotent. A job
+with retained pages finishes as `completed`; without any deliverable it finishes as
+`failed`, and `wait()` throws `JobCancelledError` (a subclass of `JobFailedError`).
 
 Check your balance:
 
@@ -137,9 +160,12 @@ Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `m
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retryAfter`) |
 | `JobNotFoundError` | 404 | `JOB_NOT_FOUND` |
+| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — cancellation arrived after natural completion |
 | `NotReadyError` | 409 | `NOT_READY` |
 | `OutputExpiredError` | 410 | `OUTPUT_EXPIRED` |
+| `JobCancelledError` | — | `JOB_CANCELLED` — cancellation settled with no deliverable; subclasses `JobFailedError` |
 | `JobFailedError` | — | job's `error.code` (thrown by `wait()`; `.job` is the snapshot) |
+| `Image2PPTError` (base) | 5xx | `JOB_CANCEL_FAILED` — the service could not accept the cancellation; **retrying is safe**. Other 5xx codes land here too; branch on `.code`. |
 | `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeoutMs`; job may still be running) |
 
 ```ts

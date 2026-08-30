@@ -28,6 +28,8 @@ from image2ppt import (
     InvalidAspectRatioError,
     InvalidFileError,
     Job,
+    JobAlreadyFinishedError,
+    JobCancelledError,
     JobFailedError,
     JobNotFoundError,
     MalformedUploadError,
@@ -238,12 +240,150 @@ def test_submit_corrupt_image_raises_invalid_file(tmp_path):
 # --------------------------------------------------------------------------- #
 # get_job / wait
 # --------------------------------------------------------------------------- #
+def test_cancel_requests_graceful_cancellation():
+    def handler(method, url, **kwargs):
+        assert method == "POST"
+        assert url.endswith("/api/v1/jobs/j%2F1/cancel")
+        assert kwargs["timeout"] == 60.0
+        return FakeResponse(
+            202,
+            {"jobId": "j/1", "cancellationRequested": True, "finalizing": True},
+        )
+
+    client, session = client_and_session(handler)
+    result = client.cancel("j/1")
+    assert result.job_id == "j/1"
+    assert result.cancellation_requested
+    assert result.finalizing
+    assert session.headers["Authorization"] == "Bearer i2p_live_test"
+    assert session.headers["User-Agent"].startswith("image2ppt-python/")
+
+
+def test_cancel_rejects_a_malformed_response_as_an_sdk_error():
+    """A 2xx whose body is missing a documented field must arrive as Image2PPTError.
+    The README tells callers that catching that one class covers the client, and a
+    bare KeyError would walk straight through it. TypeScript raises here too."""
+    handler = lambda *a, **k: FakeResponse(200, {"jobId": "j", "cancellationRequested": True})
+    with pytest.raises(Image2PPTError, match="finalizing"):
+        make_client(handler).cancel("j")
+
+    # A 2xx body that isn't an object at all has to land in the same place. A bare
+    # number is the case that makes the point: the membership test raises TypeError
+    # on it, which is not an Image2PPTError and so is not catchable per the README.
+    with pytest.raises(Image2PPTError, match="JSON object"):
+        make_client(lambda *a, **k: FakeResponse(200, 5)).cancel("j")
+
+
+def test_cancel_finished_job_maps_to_its_own_error():
+    handler = lambda *a, **k: FakeResponse(
+        409,
+        {"error": {"code": "JOB_ALREADY_FINISHED", "message": "already finished"}},
+    )
+    with pytest.raises(JobAlreadyFinishedError):
+        make_client(handler).cancel("j")
+
+
+def test_cancel_maps_not_found_and_server_failures():
+    with pytest.raises(JobNotFoundError) as missing:
+        make_client(
+            lambda *a, **k: FakeResponse(
+                404, {"error": {"code": "JOB_NOT_FOUND", "message": "missing"}}
+            )
+        ).cancel("missing")
+    assert missing.value.code == "JOB_NOT_FOUND"
+
+    with pytest.raises(Image2PPTError) as failed:
+        make_client(
+            lambda *a, **k: FakeResponse(
+                500,
+                {"error": {"code": "JOB_CANCEL_FAILED", "message": "try later"}},
+            )
+        ).cancel("j")
+    assert failed.value.status_code == 500
+    assert failed.value.code == "JOB_CANCEL_FAILED"
+
+
+def test_cancel_does_not_retry_an_ambiguous_network_failure():
+    def handler(*args, **kwargs):
+        raise requests.ConnectionError("connection reset")
+
+    client, session = client_and_session(handler)
+    with pytest.raises(requests.ConnectionError, match="connection reset"):
+        client.cancel("j")
+    assert len(session.calls) == 1
+
+
+def test_cancel_wait_then_downloads_the_partial_deck(tmp_path):
+    responses = iter(
+        [
+            FakeResponse(
+                202,
+                {"jobId": "j", "cancellationRequested": True, "finalizing": True},
+            ),
+            FakeResponse(
+                200,
+                {"jobId": "j", "status": "processing", "cancellationRequested": True},
+            ),
+            FakeResponse(
+                200,
+                {
+                    "jobId": "j",
+                    "status": "completed",
+                    "slideCount": 3,
+                    "creditsUsed": 1,
+                    "creditsRefunded": 2,
+                    "cancellationRequested": True,
+                    "downloadUrl": "/api/v1/jobs/j/download",
+                },
+            ),
+            FakeResponse(200, content=b"PARTIAL-PPTX"),
+        ]
+    )
+    client, session = client_and_session(lambda *a, **k: next(responses))
+
+    client.cancel("j")
+    done = client.wait("j", poll_interval=0)
+    assert done.is_completed
+    assert done.cancellation_requested
+    assert done.credits_used == 1
+    assert done.credits_refunded == 2
+    dest = tmp_path / "partial.pptx"
+    client.download(done.job_id, str(dest))
+
+    assert dest.read_bytes() == b"PARTIAL-PPTX"
+    assert [(method, url) for method, url, _ in session.calls] == [
+        ("POST", "https://image2ppt.com/api/v1/jobs/j/cancel"),
+        ("GET", "https://image2ppt.com/api/v1/jobs/j"),
+        ("GET", "https://image2ppt.com/api/v1/jobs/j"),
+        ("GET", "https://image2ppt.com/api/v1/jobs/j/download"),
+    ]
+
+
 def test_get_job():
     handler = lambda *a, **k: FakeResponse(200, {"jobId": "j", "status": "processing", "progress": 40})
     job = make_client(handler).get_job("j")
     assert job.status == "processing"
     assert job.progress == 40
     assert not job.is_terminal
+
+
+def test_get_job_and_download_encode_the_job_id(tmp_path):
+    """The whole cancel -> wait -> download chain has to survive a job id with a
+    slash in it, not just cancel(): a half-encoded chain silently hits the wrong
+    path. TypeScript encodes all three, so Python must too."""
+    seen = []
+
+    def handler(method, url, **kwargs):
+        seen.append(url)
+        if url.endswith("/download"):
+            return FakeResponse(200, content=b"PPTXBYTES")
+        return FakeResponse(200, {"jobId": "j/1", "status": "processing", "progress": 40})
+
+    client = make_client(handler)
+    client.get_job("j/1")
+    client.download("j/1", str(tmp_path / "out.pptx"))
+    assert seen[0].endswith("/api/v1/jobs/j%2F1")
+    assert seen[1].endswith("/api/v1/jobs/j%2F1/download")
 
 
 def test_wait_polls_until_completed():
@@ -268,6 +408,22 @@ def test_wait_raises_on_failed():
     assert exc.value.code == "CONVERSION_FAILED"
     assert exc.value.job is not None
     assert exc.value.job.credits_refunded == 3
+
+
+def test_wait_raises_job_cancelled_error_without_a_deliverable():
+    handler = lambda *a, **k: FakeResponse(
+        200,
+        {
+            "jobId": "j",
+            "status": "failed",
+            "cancellationRequested": True,
+            "error": {"code": "JOB_CANCELLED", "message": "cancelled"},
+        },
+    )
+    with pytest.raises(JobCancelledError) as exc:
+        make_client(handler).wait("j", poll_interval=0)
+    assert isinstance(exc.value, JobFailedError)
+    assert exc.value.code == "JOB_CANCELLED"
 
 
 def test_wait_backs_off_on_429(monkeypatch):
@@ -379,11 +535,45 @@ def test_error_envelope_non_json():
 # Job model
 # --------------------------------------------------------------------------- #
 def test_job_from_dict_maps_camelcase():
-    job = Job.from_dict({"jobId": "j", "status": "completed", "creditsUsed": 5, "creditsRefunded": 1})
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "completed",
+            "creditsUsed": 5,
+            "creditsRefunded": 1,
+            "cancellationRequested": True,
+        }
+    )
     assert job.job_id == "j"
     assert job.is_completed
     assert job.credits_used == 5
     assert job.credits_refunded == 1
+    assert job.cancellation_requested
+    assert not Job.from_dict({"jobId": "old", "status": "processing"}).cancellation_requested
+
+
+def test_job_preserves_legacy_positional_constructor_order():
+    error = {"code": "FAILED"}
+    raw = {"legacy": True}
+    job = Job(
+        "j",
+        "completed",
+        1,
+        100,
+        2,
+        1,
+        1,
+        "created",
+        "completed",
+        "/download",
+        error,
+        raw,
+    )
+
+    assert job.download_url == "/download"
+    assert job.error is error
+    assert job.raw is raw
+    assert not job.cancellation_requested
 
 
 # --------------------------------------------------------------------------- #

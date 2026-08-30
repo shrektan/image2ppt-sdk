@@ -139,6 +139,10 @@ class JobNotFoundError(Image2PPTError):
     """The job id doesn't exist, or isn't owned by this key's account (404)."""
 
 
+class JobAlreadyFinishedError(Image2PPTError):
+    """The job finished naturally before cancellation was accepted (409)."""
+
+
 class NotReadyError(Image2PPTError):
     """The job hasn't finished yet, so the deliverable can't be downloaded (409)."""
 
@@ -162,6 +166,10 @@ class JobFailedError(Image2PPTError):
     ) -> None:
         super().__init__(message, code=code)
         self.job = job
+
+
+class JobCancelledError(JobFailedError):
+    """A graceful cancellation settled without any deliverable pages."""
 
 
 class Image2PPTTimeoutError(Image2PPTError):
@@ -194,6 +202,7 @@ _CODE_TO_EXC: Dict[str, type] = {
     "INSUFFICIENT_CREDITS": InsufficientCreditsError,
     "RATE_LIMITED": RateLimitedError,
     "JOB_NOT_FOUND": JobNotFoundError,
+    "JOB_ALREADY_FINISHED": JobAlreadyFinishedError,
     "NOT_READY": NotReadyError,
     "OUTPUT_EXPIRED": OutputExpiredError,
 }

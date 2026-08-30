@@ -18,6 +18,9 @@ ready to ship.
 3. Poll `GET /api/v1/jobs/{jobId}` every few seconds until `status` is `completed`.
 4. Call `GET /api/v1/jobs/{jobId}/download` to fetch the finished PPTX.
 
+If you no longer need the result, call `POST /api/v1/jobs/{jobId}/cancel` to stop
+pages that have not started yet.
+
 Conversion is **asynchronous**: submitting returns a job id immediately and the
 real work runs in the background. Don't block on the submit call waiting for the
 result.
@@ -172,6 +175,7 @@ Poll this endpoint for progress.
   "slideCount": 12,
   "creditsUsed": 0,
   "creditsRefunded": 0,
+  "cancellationRequested": false,
   "createdAt": "2026-07-07 08:00:00",
   "completedAt": null
 }
@@ -186,6 +190,7 @@ Poll this endpoint for progress.
 | `slideCount` | Total pages. |
 | `creditsUsed` | Credits actually charged after settlement. |
 | `creditsRefunded` | Credits refunded for failed pages on partial success — see [Billing & refunds](#billing--refunds). |
+| `cancellationRequested` | Whether the service accepted a cancellation request. The four-state `status` enum is unchanged for backward compatibility. |
 | `createdAt` / `completedAt` | UTC creation / completion time in `YYYY-MM-DD HH:MM:SS` format (`completedAt` is `null` until complete). |
 | `downloadUrl` | Given **only when `completed` and the output is still retained** — a relative path to the download endpoint; omitted otherwise. |
 | `error` | Given **only when `failed`** — `{"code": "...", "message": "..."}`. |
@@ -217,7 +222,47 @@ Poll this endpoint for progress.
 
 ---
 
-### 3. Download the result — `GET /api/v1/jobs/{jobId}/download`
+### 3. Cancel a job — `POST /api/v1/jobs/{jobId}/cancel`
+
+Ask the service to stop future work on this job. Cancellation is a **graceful
+drain**, not a hard kill:
+
+- Pages already running finish; successful pages remain in the final PPTX and are billed.
+- Pages that have not started are skipped and refunded.
+- Repeating the request is safe; it never cancels or settles twice.
+
+**Still winding down** — `202 Accepted`
+
+```json
+{
+  "jobId": "job_abc123",
+  "cancellationRequested": true,
+  "finalizing": true
+}
+```
+
+`finalizing: true` means running pages or PPTX assembly are still winding down.
+Keep polling job status until it becomes `completed` or `failed`. If cancellation
+settles within this request, the response is `200 OK` with `finalizing: false`.
+
+Cancellation can end in two ways:
+
+- At least one successful page remains: the job is `completed`, a partial PPTX is
+  downloadable, and unproduced pages appear in `creditsRefunded`.
+- Nothing is deliverable: the job is `failed`, `error.code` is `JOB_CANCELLED`, and
+  all held credits are refunded.
+
+**Possible errors**
+
+| HTTP | code | Meaning |
+|---|---|---|
+| 404 | `JOB_NOT_FOUND` | Job id does not exist, is not an API job, or belongs to another account. |
+| 409 | `JOB_ALREADY_FINISHED` | The job finished naturally before cancellation was accepted. |
+| 500 | `JOB_CANCEL_FAILED` | The service could not accept cancellation; retrying is safe. |
+
+---
+
+### 4. Download the result — `GET /api/v1/jobs/{jobId}/download`
 
 Once the job is complete, download the PPTX here.
 
@@ -240,7 +285,7 @@ Once the job is complete, download the PPTX here.
 
 ---
 
-### 4. Get account — `GET /api/v1/account`
+### 5. Get account — `GET /api/v1/account`
 
 **Success** — `200 OK`
 
@@ -357,6 +402,9 @@ separate submissions.
   failed pages are **refunded automatically** (`creditsRefunded > 0`).
 - **Total failure**: the job becomes `failed` and all held credits are refunded in
   full.
+- **Cancellation**: pages already running settle under the same rules; pages that
+  have not started are skipped and refunded. With no deliverable pages, status is
+  `failed` and the error code is `JOB_CANCELLED`.
 
 In short: you only pay for **pages that were successfully produced**.
 
@@ -365,7 +413,7 @@ In short: you only pay for **pages that were successfully produced**.
 ## Official SDKs
 
 We provide official Python and Node.js/TypeScript clients that wrap submission,
-polling, download, 429 backoff, and error mapping. Source, examples, and full docs
+polling, cancellation, download, 429 backoff, and error mapping. Source, examples, and full docs
 are on GitHub: <https://github.com/shrektan/image2ppt-sdk>.
 
 > Use the SDK **server-side only**. Never put an API key in a browser or anywhere a
@@ -447,8 +495,10 @@ and full details on each exception are in the GitHub repo's README and examples.
 | 400 | `MALFORMED_UPLOAD` | The body is not valid `multipart/form-data` (submit). |
 | 413 | `PAYLOAD_TOO_LARGE` | Total file content in one request exceeds 45MB (submit). |
 | 429 | `RATE_LIMITED` | Rate limit hit, with a `Retry-After` header (submit). Status polling is not rate limited. |
-| 404 | `JOB_NOT_FOUND` | Job id doesn't exist or isn't owned by this account (status, download). |
+| 404 | `JOB_NOT_FOUND` | Job id doesn't exist or isn't owned by this account (status, cancel, download). |
+| 409 | `JOB_ALREADY_FINISHED` | The job finished naturally before cancellation was accepted (cancel). |
 | 409 | `NOT_READY` | Download requested before the job completed (download). |
+| — | `JOB_CANCELLED` | Cancellation settled with no deliverable pages (`error.code` in job status). |
 | 410 | `OUTPUT_EXPIRED` | Result cleaned up after its retention window (download). |
 | 416 | `RANGE_NOT_SATISFIABLE` | Resume range starts beyond the result file size (download). |
-| 5xx | `STORAGE_FAILED`, etc. | Server-side error; retry later. If it persists, contact us. |
+| 5xx | `JOB_CANCEL_FAILED`, `STORAGE_FAILED`, etc. | Server-side error; retry later. If it persists, contact us. |
