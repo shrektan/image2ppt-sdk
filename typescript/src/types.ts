@@ -73,7 +73,8 @@ export class Job {
   readonly creditsRefunded: number | null;
   readonly createdAt: string | null;
   readonly completedAt: string | null;
-  readonly cancellationRequested: boolean;
+  /** Optional in the public shape so pre-cancellation structural `Job` values still type-check. */
+  readonly cancellationRequested?: boolean;
   readonly downloadUrl: string | null;
   readonly error: JobError | null;
   /** Raw response body, for forward-compatible access to new fields. */
