@@ -165,6 +165,7 @@ Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `m
 | `OutputExpiredError` | 410 | `OUTPUT_EXPIRED` |
 | `JobCancelledError` | — | `JOB_CANCELLED` — cancellation settled with no deliverable; subclasses `JobFailedError` |
 | `JobFailedError` | — | job's `error.code` (thrown by `wait()`; `.job` is the snapshot) |
+| `Image2PPTError` (base) | 5xx | `JOB_CANCEL_FAILED` — the service could not accept the cancellation; **retrying is safe**. Other 5xx codes land here too; branch on `.code`. |
 | `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeoutMs`; job may still be running) |
 
 ```ts

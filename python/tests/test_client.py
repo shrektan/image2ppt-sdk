@@ -259,6 +259,15 @@ def test_cancel_requests_graceful_cancellation():
     assert session.headers["User-Agent"].startswith("image2ppt-python/")
 
 
+def test_cancel_rejects_a_malformed_response_as_an_sdk_error():
+    """A 2xx whose body is missing a documented field must arrive as Image2PPTError.
+    The README tells callers that catching that one class covers the client, and a
+    bare KeyError would walk straight through it. TypeScript raises here too."""
+    handler = lambda *a, **k: FakeResponse(200, {"jobId": "j", "cancellationRequested": True})
+    with pytest.raises(Image2PPTError, match="finalizing"):
+        make_client(handler).cancel("j")
+
+
 def test_cancel_finished_job_maps_to_its_own_error():
     handler = lambda *a, **k: FakeResponse(
         409,

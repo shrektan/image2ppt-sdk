@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from .errors import Image2PPTError
+
 
 @dataclass
 class CancellationResult:
@@ -17,6 +19,18 @@ class CancellationResult:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CancellationResult":
+        """Build the result, or raise ``Image2PPTError`` if the envelope is malformed.
+
+        These three fields are the whole documented response, so a body missing one
+        is not something a caller can act on. It still has to arrive as an
+        ``Image2PPTError``: the READMEs tell callers that catching that one class
+        covers the client, and a bare ``KeyError`` would walk straight through it.
+        """
+        missing = [k for k in ("jobId", "cancellationRequested", "finalizing") if k not in data]
+        if missing:
+            raise Image2PPTError(
+                f"malformed cancellation response, missing {', '.join(missing)}"
+            )
         return cls(
             job_id=data["jobId"],
             cancellation_requested=bool(data["cancellationRequested"]),

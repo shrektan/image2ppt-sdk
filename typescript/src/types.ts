@@ -56,10 +56,11 @@ export interface Account {
 
 /** Result of requesting graceful cancellation for a conversion job. */
 export interface CancellationResult {
-  jobId: string;
-  readonly cancellationRequested: true;
-  /** True while running pages or final assembly are still winding down. */
-  finalizing: boolean;
+  readonly jobId: string;
+  /** Whether the service accepted the cancellation request. */
+  readonly cancellationRequested: boolean;
+  /** True while the job is still winding down; keep polling `getJob` until terminal. */
+  readonly finalizing: boolean;
 }
 
 /** A snapshot of a conversion job's state. */

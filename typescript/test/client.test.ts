@@ -268,6 +268,17 @@ describe("cancel", () => {
     });
   });
 
+  it("rejects a malformed cancellation response instead of reporting it settled", async () => {
+    // A 2xx body missing `finalizing` used to cast through as undefined, which the
+    // documented `if (result.finalizing)` check reads as "settled" — so the caller
+    // stops polling a job that is still draining. Python raises here too.
+    const f = fetchSequence(json(200, { jobId: "j", cancellationRequested: true }));
+    await expect(client(f).cancel("j")).rejects.toMatchObject({
+      name: "Image2PPTError",
+      message: expect.stringContaining("finalizing"),
+    });
+  });
+
   it("maps a naturally finished job to JobAlreadyFinishedError", async () => {
     const c = client(
       fetchSequence(
