@@ -401,7 +401,7 @@ class Image2PPTClient:
     def get_job(self, job_id: str) -> Job:
         """Fetch the current job state as a ``Job`` snapshot. Raises JobNotFoundError."""
         resp = self._session.get(
-            f"{self.base_url}/api/v1/jobs/{job_id}",
+            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}",
             timeout=self.timeout,
         )
         return Job.from_dict(self._parse_json(resp))
@@ -414,9 +414,8 @@ class Image2PPTClient:
         When ``finalizing`` is true, keep polling with ``get_job`` until the job
         reaches a terminal state.
         """
-        encoded_job_id = quote(job_id, safe="")
         resp = self._session.post(
-            f"{self.base_url}/api/v1/jobs/{encoded_job_id}/cancel",
+            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/cancel",
             timeout=self.timeout,
         )
         return CancellationResult.from_dict(self._parse_json(resp))
@@ -493,7 +492,7 @@ class Image2PPTClient:
         it doesn't exist, OutputExpiredError (410) if the deliverable was reaped.
         """
         resp = self._session.get(
-            f"{self.base_url}/api/v1/jobs/{job_id}/download",
+            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/download",
             stream=True,
             timeout=self.timeout,
         )

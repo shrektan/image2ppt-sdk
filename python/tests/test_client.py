@@ -352,6 +352,25 @@ def test_get_job():
     assert not job.is_terminal
 
 
+def test_get_job_and_download_encode_the_job_id(tmp_path):
+    """The whole cancel -> wait -> download chain has to survive a job id with a
+    slash in it, not just cancel(): a half-encoded chain silently hits the wrong
+    path. TypeScript encodes all three, so Python must too."""
+    seen = []
+
+    def handler(method, url, **kwargs):
+        seen.append(url)
+        if url.endswith("/download"):
+            return FakeResponse(200, content=b"PPTXBYTES")
+        return FakeResponse(200, {"jobId": "j/1", "status": "processing", "progress": 40})
+
+    client = make_client(handler)
+    client.get_job("j/1")
+    client.download("j/1", str(tmp_path / "out.pptx"))
+    assert seen[0].endswith("/api/v1/jobs/j%2F1")
+    assert seen[1].endswith("/api/v1/jobs/j%2F1/download")
+
+
 def test_wait_polls_until_completed():
     seq = iter([
         {"jobId": "j", "status": "processing", "progress": 10},
