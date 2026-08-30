@@ -16,6 +16,12 @@ here. The two clients share a single version number.
   `JobCancelledError` from `wait()`; it subclasses `JobFailedError` for compatibility.
   Cancelling a job that finished naturally raises `JobAlreadyFinishedError`.
 
+### Fixed
+
+- **Python** — `get_job()` and `download()` now percent-encode the job id, so a job
+  id containing a reserved path character reaches the right endpoint. The Node client
+  already did.
+
 ## 0.3.0
 
 The Node client now prepares images before uploading them, the way the Python
