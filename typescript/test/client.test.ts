@@ -277,6 +277,16 @@ describe("cancel", () => {
       name: "Image2PPTError",
       message: expect.stringContaining("finalizing"),
     });
+
+    // A 2xx body that isn't an object at all has to land in the same place. A null
+    // body is the case that makes the point: `"jobId" in null` throws a raw
+    // TypeError, which is not an Image2PPTError and so is not catchable per the README.
+    await expect(
+      client(fetchSequence(json(200, null))).cancel("j"),
+    ).rejects.toMatchObject({
+      name: "Image2PPTError",
+      message: expect.stringContaining("JSON object"),
+    });
   });
 
   it("maps a naturally finished job to JobAlreadyFinishedError", async () => {

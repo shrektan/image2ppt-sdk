@@ -267,6 +267,12 @@ def test_cancel_rejects_a_malformed_response_as_an_sdk_error():
     with pytest.raises(Image2PPTError, match="finalizing"):
         make_client(handler).cancel("j")
 
+    # A 2xx body that isn't an object at all has to land in the same place. A bare
+    # number is the case that makes the point: the membership test raises TypeError
+    # on it, which is not an Image2PPTError and so is not catchable per the README.
+    with pytest.raises(Image2PPTError, match="JSON object"):
+        make_client(lambda *a, **k: FakeResponse(200, 5)).cancel("j")
+
 
 def test_cancel_finished_job_maps_to_its_own_error():
     handler = lambda *a, **k: FakeResponse(

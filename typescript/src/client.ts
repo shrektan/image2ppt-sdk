@@ -440,20 +440,25 @@ export class Image2PPTClient {
       "POST",
       `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`,
     );
-    const body = (await this.#parseJson(res)) as Record<string, unknown>;
     // Read the three documented fields rather than casting the body through, so a
     // malformed envelope surfaces as an Image2PPTError instead of silently handing
     // back `finalizing: undefined` — which reads as "settled" and stops polling a
-    // job that is still draining. Mirrors the Python CancellationResult model.
+    // job that is still draining. Mirrors the Python CancellationResult model,
+    // shape check included, so the same bad body fails the same way in both clients.
+    const body: unknown = await this.#parseJson(res);
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      throw new Image2PPTError("malformed cancellation response, expected a JSON object");
+    }
+    const d = body as Record<string, unknown>;
     for (const key of ["jobId", "cancellationRequested", "finalizing"]) {
-      if (!(key in body)) {
+      if (!(key in d)) {
         throw new Image2PPTError(`malformed cancellation response, missing ${key}`);
       }
     }
     return {
-      jobId: String(body.jobId),
-      cancellationRequested: Boolean(body.cancellationRequested),
-      finalizing: Boolean(body.finalizing),
+      jobId: d.jobId as string,
+      cancellationRequested: Boolean(d.cancellationRequested),
+      finalizing: Boolean(d.finalizing),
     };
   }
 

@@ -26,6 +26,8 @@ class CancellationResult:
         ``Image2PPTError``: the READMEs tell callers that catching that one class
         covers the client, and a bare ``KeyError`` would walk straight through it.
         """
+        if not isinstance(data, dict):
+            raise Image2PPTError("malformed cancellation response, expected a JSON object")
         missing = [k for k in ("jobId", "cancellationRequested", "finalizing") if k not in data]
         if missing:
             raise Image2PPTError(
