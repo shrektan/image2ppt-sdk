@@ -26,6 +26,26 @@ engine is a hosted service — SDK changes here are about the client experience
 Keep the two SDKs behaviorally in sync: same methods, same error semantics, same
 retry/backoff behavior. If you change one, mirror it in the other.
 
+## Paid live integration test
+
+The normal test suites never call the hosted API and never spend credits. Python
+also has one opt-in cancellation contract test: it creates 25 temporary images,
+submits one job, waits until work has started, requests graceful cancellation,
+then verifies that the downloaded PPTX contains only retained pages.
+
+Run it only with a dedicated, limited-credit test key kept outside this
+repository and CI logs:
+
+```bash
+cd python
+IMAGE2PPT_RUN_PAID_E2E=1 IMAGE2PPT_E2E_API_KEY="$IMAGE2PPT_E2E_API_KEY" \\
+  uv run pytest -m paid_e2e
+```
+
+The test does not print or persist the API key or job identifier. If it fails
+before cancellation is accepted, it makes one best-effort cancellation request
+in cleanup so the remaining pages are not needlessly processed.
+
 ## Pull requests
 
 - Keep changes focused; one concern per PR.

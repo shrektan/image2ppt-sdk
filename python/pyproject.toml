@@ -65,3 +65,6 @@ include = ["src", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "paid_e2e: calls the hosted API and may use credits; skipped unless explicitly enabled",
+]
