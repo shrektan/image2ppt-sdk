@@ -17,8 +17,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
 
 import {
+  APIConnectionError,
+  APITimeoutError,
   AuthenticationError,
   Image2PPTClient,
+  Image2PPTError,
   Image2PPTTimeoutError,
   InsufficientCreditsError,
   InvalidAspectRatioError,
@@ -28,6 +31,7 @@ import {
   JobCancelledError,
   JobFailedError,
   JobNotFoundError,
+  MalformedResponseError,
   MalformedUploadError,
   MAX_FILE_BYTES,
   MAX_PAGES_PER_JOB,
@@ -36,6 +40,7 @@ import {
   NotReadyError,
   PageRateExceededError,
   RateLimitedError,
+  ServerError,
   type Job as JobType,
   TooManySlidesError,
   UploadAbortedError,
@@ -274,17 +279,18 @@ describe("cancel", () => {
     // stops polling a job that is still draining. Python raises here too.
     const f = fetchSequence(json(200, { jobId: "j", cancellationRequested: true }));
     await expect(client(f).cancel("j")).rejects.toMatchObject({
-      name: "Image2PPTError",
+      name: "MalformedResponseError",
       message: expect.stringContaining("finalizing"),
     });
 
     // A 2xx body that isn't an object at all has to land in the same place. A null
     // body is the case that makes the point: `"jobId" in null` throws a raw
-    // TypeError, which is not an Image2PPTError and so is not catchable per the README.
+    // TypeError, which would escape as a platform error the caller cannot catch
+    // through Image2PPTError — the one thing the README promises never happens.
     await expect(
       client(fetchSequence(json(200, null))).cancel("j"),
     ).rejects.toMatchObject({
-      name: "Image2PPTError",
+      name: "MalformedResponseError",
       message: expect.stringContaining("JSON object"),
     });
   });
@@ -314,7 +320,7 @@ describe("cancel", () => {
         ),
       ).cancel("j"),
     ).rejects.toMatchObject({
-      name: "Image2PPTError",
+      name: "ServerError",
       statusCode: 500,
       code: "JOB_CANCEL_FAILED",
     });
@@ -324,7 +330,7 @@ describe("cancel", () => {
     const f = fetchScript(() => {
       throw new TypeError("fetch failed");
     });
-    await expect(client(f).cancel("j")).rejects.toThrow("fetch failed");
+    await expect(client(f).cancel("j")).rejects.toBeInstanceOf(APIConnectionError);
     expect(f.calls).toHaveLength(1);
   });
 
@@ -715,7 +721,7 @@ describe("error mapping", () => {
 
   it("falls back for a non-JSON error body", async () => {
     const c = client(fetchSequence(new Response("<html>gateway error</html>", { status: 500 })));
-    await expect(c.account()).rejects.toMatchObject({ name: "Image2PPTError", statusCode: 500 });
+    await expect(c.account()).rejects.toMatchObject({ name: "ServerError", statusCode: 500 });
   });
 });
 
@@ -876,12 +882,15 @@ describe("convertAll", () => {
 // --------------------------------------------------------------------------- //
 describe("no automatic submit retry", () => {
   it("does not retry a broken connection", async () => {
+    // The failure is now reported as an SDK error rather than escaping as undici's
+    // raw TypeError, but the invariant this test guards is unchanged and is the
+    // whole point: exactly one attempt.
     const file = await tempFile();
     const f = fetchScript(() => {
       throw new TypeError("fetch failed");
     });
 
-    await expect(client(f).submit([file])).rejects.toBeInstanceOf(TypeError);
+    await expect(client(f).submit([file])).rejects.toBeInstanceOf(APIConnectionError);
     expect(f.calls).toHaveLength(1); // tried exactly once
   });
 
@@ -918,7 +927,7 @@ describe("no automatic submit retry", () => {
 
     const err = await client(f).submitAll(files).catch((e: unknown) => e);
 
-    expect(err).toBeInstanceOf(TypeError);
+    expect(err).toBeInstanceOf(APIConnectionError);
     expect(f.calls).toHaveLength(2); // batch 1, then batch 2 once
     expect(submittedIds(err)).toEqual(["job_a"]);
   });

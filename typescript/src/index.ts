@@ -17,6 +17,8 @@
 export { DEFAULT_BASE_URL, Image2PPTClient } from "./client.js";
 export { VERSION } from "./version.js";
 export {
+  APIConnectionError,
+  APITimeoutError,
   AuthenticationError,
   Image2PPTError,
   Image2PPTTimeoutError,
@@ -27,15 +29,18 @@ export {
   JobCancelledError,
   JobFailedError,
   JobNotFoundError,
+  MalformedResponseError,
   MalformedUploadError,
   NoFilesError,
   NotReadyError,
   OutputExpiredError,
   PageRateExceededError,
   RateLimitedError,
+  ServerError,
   TooManySlidesError,
   UploadAbortedError,
 } from "./errors.js";
+export type { ErrorInit } from "./errors.js";
 export {
   BATCH_TARGET_BYTES,
   MAX_FILE_BYTES,
@@ -46,7 +51,7 @@ export {
   planBatches,
 } from "./limits.js";
 export type { UploadItem } from "./limits.js";
-export { Job } from "./types.js";
+export { Job, PageError, PageResult } from "./types.js";
 export type {
   Account,
   AspectRatio,
@@ -56,6 +61,7 @@ export type {
   JobError,
   JobStatus,
   Locale,
+  PageStatus,
   SubmitOptions,
   WaitOptions,
 } from "./types.js";
