@@ -61,9 +61,15 @@ except JobCancelledError:
 ```
 
 Cancellation is graceful: pages already running finish and are billed if successful;
-pages that have not started are skipped and refunded. The call is idempotent. A job
-with retained pages finishes as `completed`; without any deliverable it finishes as
-`failed`, and `wait()` raises `JobCancelledError` (a subclass of `JobFailedError`).
+pages that have not started are skipped and refunded. A page being dispatched at the
+very moment the cancellation arrives may still run to completion and be billed — this
+is a drain, not a hard stop. The call is idempotent. A job with retained pages finishes
+as `completed`; without any deliverable it finishes as `failed`, and `wait()` raises
+`JobCancelledError` (a subclass of `JobFailedError`).
+
+If the request comes too late — the job already finished, or it is past the point where
+cancelling could still change the outcome — you get `JobAlreadyFinishedError` instead.
+Fetch the job with `get_job()` and work with the result it already has.
 
 Check your balance:
 
@@ -72,11 +78,76 @@ info = client.account()
 print(info["email"], "credits:", info["credits"])
 ```
 
+## Which pages made it — `job.page_results`
+
+Once a job is terminal, it reports what happened to **every** page, in page order, one
+entry per page. `credits_refunded` tells you *how many* pages did not convert;
+`page_results` tells you *which ones*, and what to do about them.
+
+```python
+job = client.wait(job_id)
+
+if job.page_results is None:
+    print("this job reported no per-page ledger")
+else:
+    for page in job.page_results:
+        if page.status == "converted":
+            continue
+        if page.error.code == "PAGE_NOT_ATTEMPTED":
+            print(f"page {page.page_number} is NOT in the deck at all")
+        else:
+            print(f"page {page.page_number} is in the deck as the original image")
+        if page.error.retryable:
+            print("  resubmitting this one is worth a try")
+```
+
+**A failed page ends up one of two ways, and the difference is what you act on.**
+`PAGE_NOT_ATTEMPTED` means the page never started and **is not in the delivered deck at
+all** — the deck is short by that page, and its credit was refunded. Every other failure
+code means the page **is** in the deck, as the original image rather than editable
+content.
+
+The per-page `error.code` values the contract defines today are exactly
+`CONVERSION_FAILED`, `CONVERSION_TIMEOUT`, and `PAGE_NOT_ATTEMPTED`. Treat a code you do
+not recognise as `CONVERSION_FAILED`. Note this is a *finer* set than the job-level
+`job.error["code"]`, which still has only its two long-standing values — the two levels
+differ deliberately, and the [API reference](../docs/api.md) explains why.
+
+`error.retryable` says whether resubmitting the same image could succeed. Every code
+above carries `True` today — **branch on the field anyway** rather than hardcoding it,
+since a code added later may carry `False`.
+
+**`None` and `[]` are different facts.** `page_results` is `None` when the job reported
+no ledger at all: it is still running (while it is, "this page failed" and "this page
+has not had its turn" are indistinguishable), or it is one of the small number of jobs
+submitted before September 2026. An empty list would mean a job with no pages. Check
+`is not None` before iterating.
+
+## What language error messages come back in
+
+Error `message` text follows the request's `Accept-Language` header. This client sends
+none by default, so you get English. Set `accept_language` to change that:
+
+```python
+client = Image2PPTClient(api_key="i2p_live_your_key", accept_language="zh-CN")
+```
+
+It is sent verbatim on every request, and it is a free-form HTTP header value — the
+full `Accept-Language` syntax works (`"fr-CH, fr;q=0.9, en;q=0.8"`).
+
+> **`accept_language` is not `locale`.** `locale` is a per-submission option that decides
+> **what language the generated PPTX is written in**. `accept_language` is a client-level
+> option that decides **what language error messages come back in**. They are unrelated,
+> they take different kinds of value, and setting one does nothing to the other — you can
+> ask for a Chinese deck while reading English errors, or the reverse.
+
+Whatever the language, `code` never changes with it. Keep branching on `code`.
+
 ## How it works
 
 - **Async.** `submit` returns a job id immediately; conversion runs in the background. A single page typically takes ~2 minutes; 90% of jobs finish within 3.
 - **One job = one PPTX.** All files in a submission are merged into a single deck, in upload order.
-- **Billed per page.** 1 page = 1 credit, reserved at submit and settled on completion. If some pages fail but others succeed, the job still `completed`s with the good pages and the failed pages' credits are refunded (`credits_refunded`).
+- **Billed per page.** 1 page = 1 credit, reserved at submit and settled on completion. If some pages fail but others succeed, the job still `completed`s with the good pages and the failed pages' credits are refunded (`credits_refunded`) — `page_results` says which pages those were.
 - **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**: for an image that is its size *after* client-side compression, so a 40MB PNG that compresses to 1MB is fine. (The Node SDK compresses before upload the same way, so both clients reach the same verdict on the same file.)
 - **The check is never stricter than the documented limit.** 45MB of file content is meant to be usable, so a submission sitting exactly on it goes through. Auto-batching is the one place that is deliberately conservative — it fills a batch only to 40MB, because starting one more batch costs nothing while refusing something the server would have accepted does not.
 - **Only the formats the API accepts.** `png`, `jpg`/`jpeg`, `webp`, `gif`, `pdf`. Anything else raises `InvalidFileError` locally — the batch calls check every file before submitting the first one, so an unsupported file at the end of the pile cannot leave you paying for the batches ahead of it.
@@ -135,7 +206,7 @@ while True:
 
 ## Errors
 
-Every exception subclasses `Image2PPTError` and carries `status_code`, `code`, and `message`. Branch on `code`, not `message`.
+Every exception subclasses `Image2PPTError` and carries `status_code`, `code`, and `message`. Branch on `code`, not `message`. **A raw `requests` exception never reaches you** — a dropped connection, a per-request timeout, and a response body this client cannot parse all arrive as the SDK types below, with the original exception kept as `__cause__`.
 
 | Exception | HTTP | code |
 |---|---|---|
@@ -150,24 +221,48 @@ Every exception subclasses `Image2PPTError` and carries `status_code`, `code`, a
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retry_after`) |
 | `JobNotFoundError` | 404 | `JOB_NOT_FOUND` |
-| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — cancellation arrived after natural completion |
+| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — the cancellation came too late to change anything: the job had already finished, or was past the point where cancelling could still change the outcome |
 | `NotReadyError` | 409 | `NOT_READY` |
 | `OutputExpiredError` | 410 | `OUTPUT_EXPIRED` |
 | `JobCancelledError` | — | `JOB_CANCELLED` — cancellation settled with no deliverable; subclasses `JobFailedError` |
 | `JobFailedError` | — | job's `error.code` (raised by `wait()`; `e.job` is the snapshot) |
-| `Image2PPTError` (base) | 5xx | `JOB_CANCEL_FAILED` — the service could not accept the cancellation; **retrying is safe**. Other 5xx codes land here too; branch on `e.code`. |
+| `ServerError` | 5xx | `JOB_CANCEL_FAILED` — the service could not accept the cancellation; **retrying is safe**. Every other 5xx lands here too; branch on `e.code`. |
+| `APIConnectionError` | — | — (the request never completed: connection refused or reset, DNS or TLS failure, a body that stopped arriving) |
+| `APITimeoutError` | — | `REQUEST_TIMEOUT` — one HTTP request ran past the client's `timeout`; subclasses `APIConnectionError` |
+| `MalformedResponseError` | — | — (a 2xx that is not JSON, or a body missing a field the contract guarantees) |
 | `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeout`; job may still be running) |
 
+> **Changed in 0.5.0:** a 5xx used to arrive as the base `Image2PPTError` and now arrives as `ServerError`. `ServerError` subclasses `Image2PPTError`, so **`except Image2PPTError` code is unaffected**; only code that checked for the base class *exactly* sees a difference.
+
+**Two different timeouts, and they are not interchangeable.** `APITimeoutError` means a single HTTP request ran past the client's per-request `timeout` — nothing came back. `Image2PPTTimeoutError` means `wait()` hit its own overall deadline after any number of perfectly healthy polls; no request failed at all, the job is just taking longer. Re-`wait()` on the job id for the second one.
+
 ```python
-from image2ppt import Image2PPTError, JobFailedError
+from image2ppt import APIConnectionError, Image2PPTError, JobFailedError
 
 try:
     job = client.convert(paths, "out.pptx")
 except JobFailedError as e:
     print("conversion failed:", e.code, e.message)
+except APIConnectionError as e:
+    # Covers APITimeoutError too. The underlying exception is e.__cause__.
+    print("could not reach the service:", e.message)
 except Image2PPTError as e:
     print("request error:", e.status_code, e.code, e.message)
 ```
+
+### Which failures are worth retrying
+
+Every exception carries `is_transient`, and it is the same question `wait()` asks itself before polling again: **would repeating this exact read plausibly work?**
+
+```python
+except Image2PPTError as e:
+    if e.is_transient:
+        time.sleep(5)  # a 5xx, a rate limit, or a network blip
+```
+
+It is `True` for `ServerError` (any 5xx), `RateLimitedError`, `APIConnectionError` and `APITimeoutError`; `False` for everything else — including `MalformedResponseError`, on purpose: a response this client cannot parse means something other than the API answered, or the contract moved, and neither gets better by asking again.
+
+**It says nothing about submitting.** `submit()` is never retried on this signal, even for a transport failure that `is_transient` marks `True`. A lost response cannot be told apart from a rejected request, so retrying could create the same job twice and charge for it twice. Only a `RateLimitedError` is retried on the submit path — a 429 is the service explicitly saying it took nothing.
 
 ## Full API reference
 

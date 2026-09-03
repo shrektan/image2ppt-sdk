@@ -53,6 +53,18 @@ def main() -> int:
 
     client.download(job.job_id, "out.pptx")
     print(f"saved out.pptx — {job.credits_used} credits used, {job.credits_refunded} refunded")
+
+    # Which pages actually made it. Absent (None) for a job that reported no
+    # per-page ledger; an entry per page otherwise.
+    for page in job.page_results or []:
+        if page.status == "converted":
+            continue
+        if page.error.code == "PAGE_NOT_ATTEMPTED":
+            where = "not in the deck at all"
+        else:
+            where = "in the deck as the original image, not editable"
+        retry = "worth resubmitting" if page.error.retryable else "resubmitting will not help"
+        print(f"  page {page.page_number}: {where} ({page.error.code}, {retry})")
     return 0
 
 
