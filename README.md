@@ -18,6 +18,10 @@ Both SDKs are **server-side** clients. Never ship your API key to a browser or m
 Both also support graceful job cancellation: pages already running finish and remain
 deliverable, while pages that have not started are skipped and refunded.
 
+When a job finishes, both SDKs report the outcome **page by page** — not just how
+many pages were lost, but which ones, why, and whether the page made it into the
+deck at all. See each SDK's README.
+
 ## Quick look
 
 ```python
