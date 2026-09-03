@@ -89,7 +89,17 @@ export class APIConnectionError extends Image2PPTError {
  * out of its own overall deadline while the job was still running perfectly
  * well; nothing failed, and there is nothing to retry.
  */
-export class APITimeoutError extends APIConnectionError {}
+export class APITimeoutError extends APIConnectionError {
+  /**
+   * `code` defaults here rather than at each `throw`, the way the Python class
+   * does it. Every construction site meant the same thing by it, and one that
+   * forgot would have produced an `APITimeoutError` with no code at all for a
+   * caller branching on codes.
+   */
+  constructor(message: string, init: ErrorInit = {}) {
+    super(message, { code: "REQUEST_TIMEOUT", ...init });
+  }
+}
 
 /**
  * The server answered, but this client cannot make sense of the answer.

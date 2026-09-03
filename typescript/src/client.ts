@@ -137,11 +137,11 @@ function fileChanged(path: string, measured: number, actual: number): Image2PPTE
 class IdleWatchdog {
   readonly #controller = new AbortController();
   readonly #timeoutMs: number;
-  readonly #describe: () => string;
+  readonly #describe: string;
   #timer: ReturnType<typeof setTimer> | undefined;
   #stopped = false;
 
-  constructor(timeoutMs: number, describe: () => string) {
+  constructor(timeoutMs: number, describe: string) {
     this.#timeoutMs = timeoutMs;
     this.#describe = describe;
     this.kick();
@@ -157,9 +157,7 @@ class IdleWatchdog {
     if (this.#timer !== undefined) clearTimer(this.#timer);
     this.#timer = setTimer(() => {
       this.#stopped = true;
-      this.#controller.abort(
-        new APITimeoutError(this.#describe(), { code: "REQUEST_TIMEOUT" }),
-      );
+      this.#controller.abort(new APITimeoutError(this.#describe));
     }, this.#timeoutMs);
     // The watchdog must never be the reason a process stays alive: a caller who
     // has stopped awaiting this request should not be held open by its timer.
@@ -214,14 +212,14 @@ function buildMultipart(
     // Every yield goes through here so the idle watchdog sees the upload moving.
     // A body that stops being produced — or that the connection stops accepting —
     // stops kicking, which is exactly when the request should be given up on.
-    function* moving(part: Buffer): Generator<Buffer> {
+    const moving = (part: Buffer): Buffer => {
       onChunk();
-      yield part;
-    }
+      return part;
+    };
     for (const file of files) {
-      yield* moving(chunk(fileHeader(file)));
+      yield moving(chunk(fileHeader(file)));
       if (file.buffer !== undefined) {
-        yield* moving(file.buffer);
+        yield moving(file.buffer);
       } else if (file.size > 0) {
         // PDFs are intentionally never buffered: retries create a fresh stream from
         // disk while images retain their already-compressed payload. The read is
@@ -232,7 +230,7 @@ function buildMultipart(
         let sent = 0;
         for await (const part of createReadStream(file.path, { end: file.size - 1 })) {
           sent += (part as Buffer).byteLength;
-          yield* moving(Buffer.from(part));
+          yield moving(Buffer.from(part));
         }
         // A file that shrank comes up short right here. One that grew would have been
         // cut off at the cap instead — the byte count still matches, so the size on
@@ -248,10 +246,10 @@ function buildMultipart(
         );
         if (sizeAfter !== file.size) throw fileChanged(file.path, file.size, sizeAfter);
       }
-      yield* moving(chunk("\r\n"));
+      yield moving(chunk("\r\n"));
     }
-    for (const value of fields) yield* moving(chunk(value));
-    yield* moving(chunk(trailer));
+    for (const value of fields) yield moving(chunk(value));
+    yield moving(chunk(trailer));
   }
   const source = Readable.from(chunks());
   // The body can refuse to finish — a file rewritten underneath the upload. That
@@ -302,27 +300,44 @@ function downloadCutOff(err: unknown, jobId: string): Error {
 }
 
 /**
- * The response body as Node chunks, reporting progress and owning its failures.
+ * The response body, reporting progress and owning its failures.
  *
- * The download is consumed outside the `fetch` call, so nothing there could wrap a
- * body that died mid-stream — it used to reach the caller as whatever the stream
- * threw. Reading it here gives that failure a home, and gives the idle watchdog the
- * per-chunk signal that lets a slow-but-moving download run as long as it needs to.
- * Errors from the *disk* side are left alone: they are not transport failures and
- * must not be dressed up as one.
+ * Written as a `pipeline` transform stage, so it is handed the source as an async
+ * iterable and yields onward to the file. The download is consumed outside the
+ * `fetch` call, so nothing there could wrap a body that died mid-stream — it used
+ * to reach the caller as whatever the stream threw. Reading it here gives that
+ * failure a home, and gives the idle watchdog the per-chunk signal that lets a
+ * slow-but-moving download run as long as it needs to.
+ *
+ * A disk error is not rewritten into a transport one — `pipeline` reports the
+ * failure the write stream raised. A *stalled* disk is a different matter and is
+ * not distinguished: this stage only kicks the watchdog when a body chunk is read,
+ * and `pipeline` stops pulling from the body while the write stream is applying
+ * backpressure. So a destination that has stopped accepting bytes without failing
+ * will eventually trip the idle timeout, and the message will talk about the
+ * request rather than the disk. Rare, and the transfer really has stopped either
+ * way, but the reason it names may be the wrong one.
+ *
+ * `failure` is where the wrapped error is left for the caller to pick up.
+ * `pipeline` rejects with whichever error came *first*, and when the body dies that
+ * is the raw stream error the source stage raised, an instant before this one
+ * rethrows it wrapped — so the wrapped error would otherwise be dropped on the
+ * floor. A failure from the disk side never sets it and stays as it happened.
  */
 async function* readingBody(
-  body: ReadableStream<Uint8Array>,
+  body: AsyncIterable<Uint8Array>,
   jobId: string,
   onChunk: () => void,
+  failure: { error?: Error },
 ): AsyncGenerator<Buffer> {
   try {
-    for await (const chunk of Readable.fromWeb(body)) {
+    for await (const chunk of body) {
       onChunk();
       yield chunk as Buffer;
     }
   } catch (err) {
-    throw downloadCutOff(err, jobId);
+    failure.error = downloadCutOff(err, jobId);
+    throw failure.error;
   }
 }
 
@@ -677,10 +692,25 @@ export class Image2PPTClient {
             // Stream to disk in chunks so a large PPTX never sits fully in memory
             // (mirrors the Python client's iter_content streaming). A deck of any
             // size downloads fine as long as bytes keep arriving — see `timeoutMs`.
-            await pipeline(
-              Readable.from(readingBody(res.body, jobId, () => watchdog.kick())),
-              createWriteStream(partial),
-            );
+            //
+            // `readingBody` goes in as a transform *stage*, not wrapped in
+            // `Readable.from`: that wrapper defaults to object mode, so it would sit
+            // in the middle holding up to sixteen buffered chunks — around a megabyte
+            // of deck that need never be in memory — and add a push/read/backpressure
+            // round trip to every chunk on the way past.
+            const bodyFailure: { error?: Error } = {};
+            try {
+              await pipeline(
+                Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]),
+                (source) => readingBody(source, jobId, () => watchdog.kick(), bodyFailure),
+                createWriteStream(partial),
+              );
+            } catch (err) {
+              // The body is now the source stage, so its raw error is the one
+              // `pipeline` reports. Prefer the wrapped one when there is one — see
+              // `readingBody`. Anything else (the disk) passes through untouched.
+              throw bodyFailure.error ?? err;
+            }
           } else {
             // No body stream (shouldn't happen for a 200 download): buffer as a
             // fallback, wrapped the same way so a failure here is an SDK error too.
@@ -931,7 +961,6 @@ export class Image2PPTClient {
     method: string,
     path: string,
     options: {
-      headers?: Record<string, string>;
       /**
        * Builds the request body. A callback rather than a value because the body
        * streams and needs the watchdog, which does not exist until the request does.
@@ -946,8 +975,7 @@ export class Image2PPTClient {
   ): Promise<T> {
     const watchdog = new IdleWatchdog(
       this.timeoutMs,
-      () =>
-        `request to ${path} went ${this.timeoutMs}ms with no data moving ` +
+      `request to ${path} went ${this.timeoutMs}ms with no data moving ` +
         "(timeoutMs is an idle timeout, not a limit on how long a transfer may take)",
     );
     try {
@@ -966,7 +994,6 @@ export class Image2PPTClient {
                   "Content-Length": String(payload.contentLength),
                 }
               : {}),
-            ...options.headers,
           },
           body: payload?.body,
           signal: watchdog.signal,
@@ -1009,7 +1036,6 @@ export class Image2PPTClient {
       (err.name === "TimeoutError" || err.name === "AbortError")
     ) {
       return new APITimeoutError(`request to ${path} was aborted: ${err.message}`, {
-        code: "REQUEST_TIMEOUT",
         cause: err,
       });
     }
