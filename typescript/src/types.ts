@@ -16,6 +16,46 @@ export type JobStatus = "pending" | "processing" | "completed" | "failed";
  */
 export type PageStatus = "converted" | "failed";
 
+/**
+ * A response envelope as an object, with every field the contract guarantees.
+ *
+ * One helper for all three envelopes — a job, a cancellation result, a page entry.
+ * The check used to be hand-written at each of them, and the copies drifted apart
+ * from each other and from the Python client's, which is exactly the kind of
+ * disagreement two clients for one API cannot afford.
+ *
+ * **A field counts as missing when the key is absent or its value is null.** The
+ * two mean the same thing to a caller: there is no value to act on.
+ *
+ * The test is `== null`, which catches null and undefined and nothing else. A
+ * falsiness test would look almost identical and be wrong: `cancellationRequested`
+ * and `finalizing` are booleans whose `false` is a real answer the service sends,
+ * and rejecting it would fail the response that says "no, the job is not still
+ * winding down".
+ *
+ * `what` names the envelope for the message ("job response").
+ */
+function isJsonObject(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireFields(
+  data: unknown,
+  keys: readonly string[],
+  what: string,
+): Record<string, any> {
+  if (!isJsonObject(data)) {
+    throw new MalformedResponseError(`malformed ${what}, expected a JSON object`);
+  }
+  const d = data as Record<string, any>;
+  for (const key of keys) {
+    if (d[key] == null) {
+      throw new MalformedResponseError(`malformed ${what}, missing ${key}`);
+    }
+  }
+  return d;
+}
+
 export interface JobError {
   /**
    * Job-level failure reason: `JOB_CANCELLED` or `CONVERSION_FAILED`.
@@ -82,31 +122,33 @@ export class PageResult {
   readonly raw: Record<string, unknown>;
 
   constructor(data: Record<string, unknown>) {
-    if (typeof data !== "object" || data === null || Array.isArray(data)) {
-      throw new MalformedResponseError(
-        "malformed pageResults entry, expected a JSON object",
-      );
-    }
-    const d = data as Record<string, any>;
     // `pageNumber` and `status` are guaranteed by the contract and are the two
     // fields a caller has to have: without them an entry says nothing about which
     // page it is or how that page ended. Their *types* are checked too rather than
-    // cast through — a page number of `"one"` would otherwise arrive as a number
-    // that is not one, and silently miscompare against every real page.
-    if (!Number.isFinite(d.pageNumber)) {
+    // cast through — a page number of `"3"` would otherwise be quietly converted,
+    // covering up a wrong type instead of reporting it.
+    const d = requireFields(data, ["pageNumber", "status"], "pageResults entry");
+    // A whole number, not merely a finite one: pages are counted, and `1.5` names
+    // no page. `Number.isInteger` also rejects a numeric *string*, which is the
+    // half of this the Python client had to be brought into line with.
+    if (!Number.isInteger(d.pageNumber)) {
       throw new MalformedResponseError(
         `malformed pageResults entry, pageNumber is not a number: ${JSON.stringify(d.pageNumber)}`,
       );
     }
     if (typeof d.status !== "string") {
       throw new MalformedResponseError(
-        `malformed pageResults entry, missing or non-string status`,
+        `malformed pageResults entry, status is not a string: ${JSON.stringify(d.status)}`,
       );
     }
     this.pageNumber = d.pageNumber;
     this.status = d.status as PageStatus;
-    this.error =
-      d.error != null && typeof d.error === "object" ? new PageError(d.error) : undefined;
+    // An `error` that is present but is not an object says nothing this model could
+    // report, so it reads as absent rather than throwing: the entry itself is what
+    // the contract guarantees, and a surprise *inside* `error` should not cost the
+    // caller the rest of the ledger. Building a fully-defaulted `PageError` from it
+    // instead would put a `CONVERSION_FAILED` on the page that nobody sent.
+    this.error = isJsonObject(d.error) ? new PageError(d.error) : undefined;
     this.raw = data;
   }
 }
@@ -205,6 +247,29 @@ export interface CancellationResult {
 }
 
 /**
+ * Read the three documented fields of a cancellation response.
+ *
+ * `CancellationResult` is an interface, so this is the shape check its two class
+ * siblings get in their constructors. Casting the body through instead would hand
+ * back `finalizing: undefined`, which reads as "settled" and stops a caller polling
+ * a job that is still draining.
+ *
+ * `false` is a real answer for both booleans and passes — see `requireFields`.
+ */
+export function parseCancellationResult(data: unknown): CancellationResult {
+  const d = requireFields(
+    data,
+    ["jobId", "cancellationRequested", "finalizing"],
+    "cancellation response",
+  );
+  return {
+    jobId: d.jobId as string,
+    cancellationRequested: Boolean(d.cancellationRequested),
+    finalizing: Boolean(d.finalizing),
+  };
+}
+
+/**
  * `pageResults` as a list, or `null` when the response did not carry the field.
  *
  * The `?? null` the other optional Job fields use, except that a value which *is*
@@ -258,19 +323,12 @@ export class Job {
   readonly raw: Record<string, unknown>;
 
   constructor(data: Record<string, unknown>) {
-    if (typeof data !== "object" || data === null || Array.isArray(data)) {
-      throw new MalformedResponseError("malformed job response, expected a JSON object");
-    }
-    const d = data as Record<string, any>;
-    // The contract guarantees both, and a job without them is not a job: a snapshot
-    // with `jobId`/`status` undefined used to sail through here, and `wait()` would
-    // then poll that nonsense object until its half-hour deadline ran out. The same
-    // standard `cancel()` has always held its own response to.
-    for (const key of ["jobId", "status"]) {
-      if (d[key] == null) {
-        throw new MalformedResponseError(`malformed job response, missing ${key}`);
-      }
-    }
+    // The contract guarantees `jobId` and `status`, and a job without them is not a
+    // job: a snapshot with either one undefined used to sail through here, and
+    // `wait()` would then poll that nonsense object until its half-hour deadline ran
+    // out. The same standard `cancel()` has always held its own response to — which
+    // is why all three envelopes now go through one check.
+    const d = requireFields(data, ["jobId", "status"], "job response");
     this.jobId = d.jobId;
     this.status = d.status;
     this.slideCount = d.slideCount ?? null;

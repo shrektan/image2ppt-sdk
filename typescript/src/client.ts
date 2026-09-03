@@ -37,7 +37,7 @@ import type {
   SubmitOptions,
   WaitOptions,
 } from "./types.js";
-import { Job } from "./types.js";
+import { Job, parseCancellationResult } from "./types.js";
 import { VERSION } from "./version.js";
 
 export const DEFAULT_BASE_URL = "https://image2ppt.com";
@@ -587,32 +587,11 @@ export class Image2PPTClient {
    *   point where cancelling could change the outcome** (409 `JOB_ALREADY_FINISHED`).
    */
   async cancel(jobId: string): Promise<CancellationResult> {
-    const body: unknown = await this.#request(
-      "POST",
-      `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`,
-      { consume: (res) => this.#parseJson(res) },
+    return parseCancellationResult(
+      await this.#request("POST", `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {
+        consume: (res) => this.#parseJson(res),
+      }),
     );
-    // Read the three documented fields rather than casting the body through, so a
-    // malformed envelope surfaces as an Image2PPTError instead of silently handing
-    // back `finalizing: undefined` — which reads as "settled" and stops polling a
-    // job that is still draining. Mirrors the Python CancellationResult model,
-    // shape check included, so the same bad body fails the same way in both clients.
-    if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      throw new MalformedResponseError(
-        "malformed cancellation response, expected a JSON object",
-      );
-    }
-    const d = body as Record<string, unknown>;
-    for (const key of ["jobId", "cancellationRequested", "finalizing"]) {
-      if (!(key in d)) {
-        throw new MalformedResponseError(`malformed cancellation response, missing ${key}`);
-      }
-    }
-    return {
-      jobId: d.jobId as string,
-      cancellationRequested: Boolean(d.cancellationRequested),
-      finalizing: Boolean(d.finalizing),
-    };
   }
 
   /**

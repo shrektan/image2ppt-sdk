@@ -23,6 +23,7 @@ from image2ppt import (
     MAX_UPLOAD_BYTES,
     MAX_PAGES_PER_JOB,
     AuthenticationError,
+    CancellationResult,
     Image2PPTClient,
     Image2PPTError,
     Image2PPTTimeoutError,
@@ -2060,6 +2061,98 @@ def test_a_page_error_missing_its_code_reads_as_conversion_failed():
 
 def test_page_models_are_exported():
     assert PageResult is not None and PageError is not None
+
+
+# --------------------------------------------------------------------------- #
+# One rule for "the contract guaranteed this field", in both clients
+#
+# These three envelopes used to be checked by three hand-written copies of the same
+# idea, and the copies drifted — from each other and from the Node client's. Each
+# case below is pinned identically in `typescript/test/client.test.ts`; the point is
+# not the individual answers so much as that one body cannot mean two things
+# depending on which SDK read it.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"jobId": None, "status": "pending"},
+        {"jobId": "j", "status": None},
+    ],
+)
+def test_a_null_field_is_as_missing_as_an_absent_one(body):
+    """A key present with null offers a caller no more to act on than no key at all.
+
+    ``{"jobId": null}`` used to build a Job with ``job_id=None``, which then went
+    into a URL and asked the service about a job called "None"."""
+    with pytest.raises(MalformedResponseError):
+        Job.from_dict(body)
+
+
+def test_a_null_cancellation_field_is_missing_too():
+    with pytest.raises(MalformedResponseError, match="finalizing"):
+        CancellationResult.from_dict(
+            {"jobId": "j", "cancellationRequested": True, "finalizing": None}
+        )
+
+
+def test_false_is_an_answer_not_an_absence():
+    """The whole reason the check tests for null rather than for falsiness.
+
+    ``finalizing: false`` is the service saying the job is *not* still winding down
+    — the most ordinary cancellation response there is."""
+    result = CancellationResult.from_dict(
+        {"jobId": "j", "cancellationRequested": False, "finalizing": False}
+    )
+    assert result.cancellation_requested is False
+    assert result.finalizing is False
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"pageNumber": "3", "status": "converted"},  # numeric string, not a number
+        {"pageNumber": 1.5, "status": "converted"},  # not a whole page
+        {"pageNumber": True, "status": "converted"},  # a bool is not a page number
+        {"pageNumber": 1, "status": 7},  # a status is a string
+        {"pageNumber": None, "status": "converted"},
+        {"pageNumber": 1, "status": None},
+    ],
+)
+def test_page_entry_types_are_checked_not_coerced(entry):
+    """``"3"`` used to be converted to 3 here and refused outright by Node.
+
+    Quietly converting covers up a wrong type instead of reporting it, and two
+    clients silently disagreeing about one body is worse than either answer."""
+    with pytest.raises(MalformedResponseError):
+        Job.from_dict({"jobId": "j", "status": "completed", "pageResults": [entry]})
+
+
+def test_a_whole_number_page_still_passes_however_json_spelled_it():
+    """``3`` and ``3.0`` are the same JSON number, and JavaScript cannot tell them
+    apart — so refusing the second would be a difference of language, not contract."""
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "completed",
+            "pageResults": [{"pageNumber": 3.0, "status": "converted"}],
+        }
+    )
+    assert job.page_results[0].page_number == 3
+
+
+@pytest.mark.parametrize("bad_error", ["boom", 7, ["boom"], True])
+def test_a_page_error_that_is_not_an_object_reads_as_no_error(bad_error):
+    """It used to be turned into a fully-defaulted PageError, which put a
+    CONVERSION_FAILED on the page that the service never sent. The entry itself is
+    still trustworthy, so nothing is raised either."""
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "completed",
+            "pageResults": [{"pageNumber": 1, "status": "failed", "error": bad_error}],
+        }
+    )
+    assert job.page_results[0].error is None
 
 
 def test_page_results_sit_last_in_the_dataclass():

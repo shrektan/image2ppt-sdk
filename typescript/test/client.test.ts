@@ -2367,6 +2367,96 @@ describe("pageResults", () => {
 });
 
 // --------------------------------------------------------------------------- //
+// One rule for "the contract guaranteed this field", in both clients
+//
+// These three envelopes used to be checked by three hand-written copies of the same
+// idea, and the copies drifted — from each other and from the Python client's. Each
+// case below is pinned identically in `python/tests/test_client.py`; the point is
+// not the individual answers so much as that one body cannot mean two things
+// depending on which SDK read it.
+// --------------------------------------------------------------------------- //
+describe("required response fields", () => {
+  const jobWithPage = (entry: unknown): Response =>
+    json(200, { jobId: "j", status: "completed", pageResults: [entry] });
+
+  it("treats a null field as missing, the same as an absent one", async () => {
+    // `{ "jobId": null }` offers a caller no more to act on than no key at all.
+    for (const body of [
+      { jobId: null, status: "pending" },
+      { jobId: "j", status: null },
+    ]) {
+      await expect(
+        client(fetchSequence(json(200, body))).getJob("j"),
+      ).rejects.toBeInstanceOf(MalformedResponseError);
+    }
+    await expect(
+      client(
+        fetchSequence(
+          json(200, { jobId: "j", cancellationRequested: true, finalizing: null }),
+        ),
+      ).cancel("j"),
+    ).rejects.toMatchObject({
+      name: "MalformedResponseError",
+      message: /finalizing/,
+    });
+  });
+
+  it("treats false as an answer, not as an absence", async () => {
+    // The whole reason the check tests for null rather than for falsiness.
+    // `finalizing: false` is the service saying the job is *not* still winding down
+    // — the most ordinary cancellation response there is.
+    const f = fetchSequence(
+      json(200, { jobId: "j", cancellationRequested: false, finalizing: false }),
+    );
+
+    const result = await client(f).cancel("j");
+
+    expect(result).toEqual({
+      jobId: "j",
+      cancellationRequested: false,
+      finalizing: false,
+    });
+  });
+
+  it("checks page-entry types rather than coercing them", async () => {
+    for (const entry of [
+      { pageNumber: "3", status: "converted" }, // numeric string, not a number
+      { pageNumber: 1.5, status: "converted" }, // not a whole page
+      { pageNumber: true, status: "converted" }, // a bool is not a page number
+      { pageNumber: 1, status: 7 }, // a status is a string
+      { pageNumber: null, status: "converted" },
+      { pageNumber: 1, status: null },
+    ]) {
+      await expect(
+        client(fetchSequence(jobWithPage(entry))).getJob("j"),
+      ).rejects.toBeInstanceOf(MalformedResponseError);
+    }
+  });
+
+  it("accepts a whole page number however JSON spelled it", async () => {
+    // `3` and `3.0` are the same JSON number and JavaScript cannot tell them apart,
+    // so refusing the second would be a difference of language, not of contract.
+    const job = await client(
+      fetchSequence(jobWithPage({ pageNumber: 3.0, status: "converted" })),
+    ).getJob("j");
+
+    expect(job.pageResults![0]!.pageNumber).toBe(3);
+  });
+
+  it("reads a page error that is not an object as no error at all", async () => {
+    // Turning it into a fully-defaulted PageError would put a CONVERSION_FAILED on
+    // the page that the service never sent. The entry itself is still trustworthy,
+    // so nothing is thrown either.
+    for (const badError of ["boom", 7, ["boom"], true]) {
+      const job = await client(
+        fetchSequence(jobWithPage({ pageNumber: 1, status: "failed", error: badError })),
+      ).getJob("j");
+      expect(job.pageResults![0]!.error).toBeUndefined();
+    }
+  });
+});
+
+// --------------------------------------------------------------------------- //
 // Accept-Language
 //
 // Sets the language of the service's error *messages*. Not to be confused with

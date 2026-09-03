@@ -2,10 +2,57 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .errors import MalformedResponseError
+
+
+def _required(data: Any, keys: Sequence[str], what: str) -> Dict[str, Any]:
+    """Check a response envelope is an object carrying every guaranteed field.
+
+    One helper for all three envelopes — a job, a cancellation result, a page
+    entry. The check used to be hand-written at each of them, and the copies drifted
+    apart from each other and from the Node client's, which is exactly the kind of
+    disagreement two clients for one API cannot afford.
+
+    **A field counts as missing when the key is absent or its value is null.** The
+    two mean the same thing to a caller: there is no value to act on. A key present
+    with ``null`` used to pass, and the model was then built with ``None`` where the
+    contract promised a job id.
+
+    The test is ``is None`` rather than a falsiness test, and that matters:
+    ``cancellationRequested`` and ``finalizing`` are booleans whose ``False`` is a
+    real answer the service sends. Rejecting it would fail the response that says
+    "no, the job is not still winding down".
+    """
+    if not isinstance(data, dict):
+        raise MalformedResponseError(f"malformed {what}, expected a JSON object")
+    missing = [key for key in keys if data.get(key) is None]
+    if missing:
+        raise MalformedResponseError(f"malformed {what}, missing {', '.join(missing)}")
+    return data
+
+
+def _is_whole_number(value: Any) -> bool:
+    """Whether ``value`` is a real number whose value is a whole one.
+
+    Checked rather than coerced. A page number arriving as the *string* ``"3"``
+    used to be quietly converted, so a service (or a proxy) sending the wrong type
+    was covered up here instead of reported; the Node client refuses it, and
+    silently disagreeing about the same body is worse than either answer.
+
+    JSON's ``3`` and ``3.0`` are the same number and JavaScript cannot tell them
+    apart, so both are accepted. ``True`` is not: Python's booleans are integers
+    and JavaScript's are not numbers at all, so passing one here would be a
+    difference of language rather than of contract.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer()
+    return True
 
 
 @dataclass
@@ -25,16 +72,13 @@ class CancellationResult:
         is not something a caller can act on. It still has to arrive as an
         ``Image2PPTError``: the READMEs tell callers that catching that one class
         covers the client, and a bare ``KeyError`` would walk straight through it.
+
+        ``cancellationRequested: false`` and ``finalizing: false`` are perfectly
+        good answers and pass — see ``_required`` for why that is worth stating.
         """
-        if not isinstance(data, dict):
-            raise MalformedResponseError(
-                "malformed cancellation response, expected a JSON object"
-            )
-        missing = [k for k in ("jobId", "cancellationRequested", "finalizing") if k not in data]
-        if missing:
-            raise MalformedResponseError(
-                f"malformed cancellation response, missing {', '.join(missing)}"
-            )
+        data = _required(
+            data, ("jobId", "cancellationRequested", "finalizing"), "cancellation response"
+        )
         return cls(
             job_id=data["jobId"],
             cancellation_requested=bool(data["cancellationRequested"]),
@@ -80,12 +124,13 @@ class PageError:
         on a guess. A recognised ``code`` is passed through exactly as it came —
         nothing is rewritten to a value the server did not send.
         """
-        fields: Dict[str, Any] = data if isinstance(data, dict) else {}
+        raw: Optional[Dict[str, Any]] = data if isinstance(data, dict) else None
+        fields: Dict[str, Any] = raw if raw is not None else {}
         return cls(
             code=str(fields.get("code") or "CONVERSION_FAILED"),
             message=str(fields.get("message") or ""),
             retryable=bool(fields.get("retryable", False)),
-            raw=data if isinstance(data, dict) else None,
+            raw=raw,
         )
 
 
@@ -113,27 +158,35 @@ class PageResult:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PageResult":
-        """Build one entry; ``pageNumber`` and ``status`` are required by the contract."""
-        if not isinstance(data, dict):
+        """Build one entry; ``pageNumber`` and ``status`` are required by the contract.
+
+        Their *types* are checked rather than cast through. A page number arriving
+        as ``"3"`` would otherwise be quietly converted, and a status arriving as a
+        number would be stringified into something that matches neither
+        ``converted`` nor ``failed`` — both of them a wrong type covered up rather
+        than reported, and both places where this client used to disagree with the
+        Node one about the very same body.
+        """
+        data = _required(data, ("pageNumber", "status"), "pageResults entry")
+        if not _is_whole_number(data["pageNumber"]):
             raise MalformedResponseError(
-                "malformed page result, expected a JSON object"
+                f"malformed pageResults entry, pageNumber is not a number: "
+                f"{data['pageNumber']!r}"
             )
-        missing = [k for k in ("pageNumber", "status") if k not in data]
-        if missing:
+        if not isinstance(data["status"], str):
             raise MalformedResponseError(
-                f"malformed page result, missing {', '.join(missing)}"
+                "malformed pageResults entry, status is not a string: "
+                f"{data['status']!r}"
             )
-        try:
-            page_number = int(data["pageNumber"])
-        except (TypeError, ValueError) as exc:
-            raise MalformedResponseError(
-                f"malformed page result, pageNumber is not a number: {data['pageNumber']!r}"
-            ) from exc
         raw_error = data.get("error")
         return cls(
-            page_number=page_number,
-            status=str(data["status"]),
-            error=PageError.from_dict(raw_error) if raw_error is not None else None,
+            page_number=int(data["pageNumber"]),
+            status=data["status"],
+            # An ``error`` that is present but is not an object says nothing this
+            # model could report, so it reads as absent. Inventing a fully-defaulted
+            # ``PageError`` from it would put a ``CONVERSION_FAILED`` on the page
+            # that the service never sent.
+            error=PageError.from_dict(raw_error) if isinstance(raw_error, dict) else None,
             raw=data,
         )
 
@@ -208,13 +261,7 @@ class Job:
         ``CONVERSION_FAILED``. The finer per-page reasons live in ``page_results``
         and deliberately do not appear here.
         """
-        if not isinstance(data, dict):
-            raise MalformedResponseError("malformed job response, expected a JSON object")
-        missing = [k for k in ("jobId", "status") if k not in data]
-        if missing:
-            raise MalformedResponseError(
-                f"malformed job response, missing {', '.join(missing)}"
-            )
+        data = _required(data, ("jobId", "status"), "job response")
         return cls(
             job_id=data["jobId"],
             status=data["status"],
