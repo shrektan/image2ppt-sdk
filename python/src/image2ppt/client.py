@@ -200,6 +200,10 @@ def _response_header(headers: Any, name: str) -> Optional[str]:
 
     ``requests`` headers are already case-insensitive; the fake session used in
     tests is a plain dict. One lookup covers both.
+
+    **Every** header read goes through here, ``Retry-After`` included. That one
+    decides how long a retry sleeps, so it is the last read that should be the one
+    exception to the rule.
     """
     target = name.lower()
     for key, value in headers.items():
@@ -455,10 +459,7 @@ class Image2PPTClient:
 
     def get_job(self, job_id: str) -> Job:
         """Fetch the current job state as a ``Job`` snapshot. Raises JobNotFoundError."""
-        resp = self._get(
-            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}",
-            timeout=self.timeout,
-        )
+        resp = self._get(f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}")
         return Job.from_dict(self._parse_json(resp))
 
     def cancel(self, job_id: str) -> CancellationResult:
@@ -475,10 +476,7 @@ class Image2PPTClient:
         change anything: either the job had already finished, or it was past the
         point where cancelling could still change the outcome.
         """
-        resp = self._post(
-            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/cancel",
-            timeout=self.timeout,
-        )
+        resp = self._post(f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/cancel")
         return CancellationResult.from_dict(self._parse_json(resp))
 
     def wait(
@@ -558,10 +556,8 @@ class Image2PPTClient:
         resp = self._get(
             f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/download",
             stream=True,
-            timeout=self.timeout,
         )
         try:
-            self._warn_if_deprecated(resp)
             if not resp.ok:
                 self._raise_for_error(resp)
             # Same directory as the destination, so the rename is atomic rather than
@@ -683,34 +679,43 @@ class Image2PPTClient:
 
     def account(self) -> Dict[str, Any]:
         """Return account info: ``{"email": ..., "credits": available_credits}``."""
-        resp = self._get(
-            f"{self.base_url}/api/v1/account",
-            timeout=self.timeout,
-        )
+        resp = self._get(f"{self.base_url}/api/v1/account")
         return self._parse_json(resp)
 
     # ----- internal helpers -------------------------------------------- #
     def _get(self, url: str, **kwargs: Any) -> requests.Response:
-        """``session.get``, with transport failures translated to SDK errors."""
+        """``session.get``, through the one wrapper every exchange goes through."""
         return self._send(self._session.get, url, **kwargs)
 
     def _post(self, url: str, **kwargs: Any) -> requests.Response:
-        """``session.post``, with transport failures translated to SDK errors."""
+        """``session.post``, through the one wrapper every exchange goes through."""
         return self._send(self._session.post, url, **kwargs)
 
-    @staticmethod
-    def _send(send: Any, url: str, **kwargs: Any) -> requests.Response:
-        """Make one call, with a transport failure translated to an SDK exception.
+    def _send(self, send: Any, url: str, **kwargs: Any) -> requests.Response:
+        """Make one call: the timeout, the transport translation, the version notice.
 
-        The translation itself lives in ``_transport_errors`` — see there for why
-        every block that touches the socket has to go through it, not just this one.
+        The three things that belong to *every* request this client makes, applied
+        in the one place all of them pass through rather than remembered at each
+        call site.
+
+        ``timeout`` is a default, not an override, so a caller may still pass their
+        own. It has to be applied here because ``requests`` has none of its own: a
+        call site that forgot it would block until the peer hung up, which on a
+        wedged connection is never.
+
+        The transport translation itself lives in ``_transport_errors`` — see there
+        for why every block that touches the socket has to go through it, not just
+        this one.
 
         It takes the bound ``.get`` / ``.post`` rather than calling a generic
         ``.request``: those two methods are the whole surface an injected session
         has to provide, and widening it would break every caller who supplies one.
         """
+        kwargs.setdefault("timeout", self.timeout)
         with _transport_errors(f"the request to {url}"):
-            return send(url, **kwargs)
+            resp = send(url, **kwargs)
+        self._warn_if_deprecated(resp)
+        return resp
 
     def _submit_batch(
         self,
@@ -837,7 +842,6 @@ class Image2PPTClient:
                 f"{self.base_url}/api/v1/jobs",
                 files=multipart,
                 data=data,
-                timeout=self.timeout,
             )
         finally:
             for handle in opened:
@@ -886,7 +890,6 @@ class Image2PPTClient:
         ``MalformedResponseError`` rather than a raw ``ValueError``, so it stays
         catchable as an ``Image2PPTError`` like everything else here.
         """
-        self._warn_if_deprecated(resp)
         if not resp.ok:
             self._raise_for_error(resp)
         # The parsing guard sits *inside* the transport one on purpose. ``requests``
@@ -966,7 +969,9 @@ class Image2PPTClient:
             status_code=resp.status_code,
             code=code,
             message=message,
-            retry_after=self._parse_retry_after(resp.headers.get("Retry-After")),
+            retry_after=self._parse_retry_after(
+                _response_header(resp.headers, "Retry-After")
+            ),
         )
 
     @staticmethod

@@ -1116,6 +1116,49 @@ def test_retry_after_is_sanitised(header, expected):
     assert Image2PPTClient._parse_retry_after(header) == expected
 
 
+def test_retry_after_is_read_case_insensitively():
+    """Header names are case-insensitive on the wire, and this is the header that
+    decides how long a retry sleeps — the last one that should be read a way of its
+    own, past the lookup every other header goes through."""
+    client = make_client(
+        lambda *a, **k: FakeResponse(
+            429,
+            {"error": {"code": "RATE_LIMITED", "message": "slow"}},
+            headers={"retry-after": "7"},
+        )
+    )
+    with pytest.raises(RateLimitedError) as caught:
+        client.account()
+
+    assert caught.value.retry_after == 7.0
+
+
+def test_every_request_carries_the_clients_timeout():
+    """``requests`` has no default of its own, so a call site that forgot would wait
+    for a wedged connection until the peer hung up — which is never. Applied by the
+    one wrapper rather than remembered five times."""
+    session = FakeSession(
+        lambda *a, **k: FakeResponse(
+            200,
+            {
+                "email": "e",
+                "credits": 1,
+                "jobId": "j",
+                "status": "completed",
+                "cancellationRequested": True,
+                "finalizing": False,
+            },
+            content=b"DECK",
+        )
+    )
+    client = Image2PPTClient("i2p_live_test", session=session, timeout=12.5)
+    client.account()
+    client.get_job("j")
+    client.cancel("j")
+
+    assert [call[2]["timeout"] for call in session.calls] == [12.5, 12.5, 12.5]
+
+
 def test_submit_all_never_busy_loops_on_retry_after_zero(tmp_path, monkeypatch):
     """A 429 with ``Retry-After: 0`` must still wait, not re-upload immediately."""
     paths = make_images(tmp_path, 2)
