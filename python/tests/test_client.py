@@ -18,6 +18,8 @@ from PIL import Image
 
 from image2ppt import (
     MAX_FILE_BYTES,
+    APIConnectionError,
+    APITimeoutError,
     MAX_UPLOAD_BYTES,
     MAX_PAGES_PER_JOB,
     AuthenticationError,
@@ -32,11 +34,15 @@ from image2ppt import (
     JobCancelledError,
     JobFailedError,
     JobNotFoundError,
+    MalformedResponseError,
     MalformedUploadError,
+    PageError,
+    PageResult,
     NoFilesError,
     NotReadyError,
     PageRateExceededError,
     RateLimitedError,
+    ServerError,
     TooManySlidesError,
     UploadAbortedError,
 )
@@ -304,12 +310,17 @@ def test_cancel_maps_not_found_and_server_failures():
 
 
 def test_cancel_does_not_retry_an_ambiguous_network_failure():
+    """One attempt, and the failure arrives as an SDK error with the cause intact."""
+
     def handler(*args, **kwargs):
         raise requests.ConnectionError("connection reset")
 
     client, session = client_and_session(handler)
-    with pytest.raises(requests.ConnectionError, match="connection reset"):
+    with pytest.raises(APIConnectionError) as exc:
         client.cancel("j")
+    assert isinstance(exc.value, Image2PPTError)
+    assert isinstance(exc.value.__cause__, requests.ConnectionError)
+    assert "connection reset" in str(exc.value.__cause__)
     assert len(session.calls) == 1
 
 
@@ -756,7 +767,7 @@ def test_convert_all_writes_one_numbered_pptx_per_batch(tmp_path):
 # --------------------------------------------------------------------------- #
 # a failed submission is NOT retried
 #
-# This looks like a missing feature; it is a deliberate one. A ConnectionError
+# This looks like a missing feature; it is a deliberate one. An APIConnectionError
 # proves only that the exchange broke — the server may have received the whole
 # body, created the job and reserved credits, and then lost the connection while
 # answering. Retrying that case charges the user twice. Nothing here can tell the
@@ -776,9 +787,10 @@ def test_submit_does_not_retry_a_broken_connection(tmp_path):
 
     client, session = client_and_session(handler)
 
-    with pytest.raises(requests.exceptions.ConnectionError):
+    with pytest.raises(APIConnectionError) as exc:
         client.submit([str(img)])
 
+    assert isinstance(exc.value.__cause__, requests.exceptions.ConnectionError)
     assert attempts["n"] == 1  # tried exactly once
     assert len(posted_filenames(session)) == 1
 
@@ -793,9 +805,14 @@ def test_submit_does_not_retry_a_read_timeout(tmp_path):
 
     client, session = client_and_session(handler)
 
-    with pytest.raises(requests.exceptions.ReadTimeout):
+    with pytest.raises(APITimeoutError) as exc:
         client.submit([str(img)])
 
+    # The per-request timeout is still a transport failure, so one except clause
+    # covers both — but it keeps its own class, because the answer differs.
+    assert isinstance(exc.value, APIConnectionError)
+    assert exc.value.code == "REQUEST_TIMEOUT"
+    assert isinstance(exc.value.__cause__, requests.exceptions.ReadTimeout)
     assert len(posted_filenames(session)) == 1
 
 
@@ -812,7 +829,7 @@ def test_submit_all_does_not_retry_a_broken_connection_either(tmp_path):
 
     client, session = client_and_session(handler)
 
-    with pytest.raises(requests.exceptions.ConnectionError) as exc:
+    with pytest.raises(APIConnectionError) as exc:
         client.submit_all(paths)
 
     assert len(posted_filenames(session)) == 2  # batch 1, then batch 2 once
@@ -1222,7 +1239,7 @@ def test_download_leaves_no_truncated_file_behind(tmp_path):
     dest = tmp_path / "deck.pptx"
     client = make_client(lambda *a, **k: ExplodingBody(200))
 
-    with pytest.raises(requests.ConnectionError):
+    with pytest.raises(APIConnectionError):
         client.download("job_a", str(dest))
 
     assert not dest.exists()  # a half deck would open in a listing and nowhere else
@@ -1240,7 +1257,7 @@ def test_a_failed_download_does_not_destroy_the_deck_already_there(tmp_path):
     dest.write_bytes(b"PREVIOUS-GOOD-DECK")
     client = make_client(lambda *a, **k: ExplodingBody(200))
 
-    with pytest.raises(requests.ConnectionError):
+    with pytest.raises(APIConnectionError):
         client.download("job_a", str(dest))
 
     assert dest.read_bytes() == b"PREVIOUS-GOOD-DECK"
@@ -1584,3 +1601,448 @@ def test_an_out_of_range_retry_after_cannot_reach_the_batch_sleep(tmp_path, monk
 
     assert [job.job_id for job in jobs] == ["job_a"]
     assert slept == [5.0]  # the documented fallback, not an out-of-range wait
+
+
+# --------------------------------------------------------------------------- #
+# Nothing leaks a raw requests exception
+#
+# The README promises that catching Image2PPTError covers this client. It used to
+# be false in four places, and each one is pinned here. The original exception is
+# kept as __cause__ every time, so the translation costs no information.
+# --------------------------------------------------------------------------- #
+def test_a_transport_failure_arrives_as_an_sdk_error():
+    def handler(*_a, **_k):
+        raise requests.ConnectionError("name resolution failed")
+
+    with pytest.raises(APIConnectionError) as exc:
+        make_client(handler).account()
+
+    assert isinstance(exc.value, Image2PPTError)
+    assert isinstance(exc.value.__cause__, requests.ConnectionError)
+
+
+def test_a_per_request_timeout_arrives_as_its_own_sdk_error():
+    def handler(*_a, **_k):
+        raise requests.exceptions.ReadTimeout("timed out")
+
+    with pytest.raises(APITimeoutError) as exc:
+        make_client(handler).get_job("j")
+
+    # One except clause catches both, because both mean "the exchange did not
+    # complete" — but the timeout keeps its own class and code.
+    assert isinstance(exc.value, APIConnectionError)
+    assert exc.value.code == "REQUEST_TIMEOUT"
+    assert isinstance(exc.value.__cause__, requests.exceptions.ReadTimeout)
+
+
+def test_a_connect_timeout_is_classified_as_a_timeout_not_a_bare_connection_error():
+    """ConnectTimeout is both a ConnectionError and a Timeout in requests, so the
+    order the two are caught in decides the class. Timeout has to win."""
+
+    def handler(*_a, **_k):
+        raise requests.exceptions.ConnectTimeout("could not connect in time")
+
+    with pytest.raises(APITimeoutError):
+        make_client(handler).account()
+
+
+def test_a_2xx_that_is_not_json_arrives_as_a_malformed_response():
+    """A proxy login page or CDN error page served with a 200."""
+    with pytest.raises(MalformedResponseError) as exc:
+        make_client(lambda *a, **k: FakeResponse(200, raise_json=True)).account()
+
+    assert isinstance(exc.value, Image2PPTError)
+    assert isinstance(exc.value.__cause__, ValueError)
+
+
+def test_a_job_body_missing_a_guaranteed_field_arrives_as_a_malformed_response():
+    """jobId and status are contract guarantees, so their absence is malformed —
+    the same standard CancellationResult has always been held to. A bare KeyError
+    would walk straight through `except Image2PPTError`."""
+    with pytest.raises(MalformedResponseError, match="status"):
+        make_client(lambda *a, **k: FakeResponse(200, {"jobId": "j"})).get_job("j")
+
+    with pytest.raises(MalformedResponseError, match="jobId"):
+        make_client(lambda *a, **k: FakeResponse(200, {"status": "completed"})).get_job("j")
+
+    with pytest.raises(MalformedResponseError, match="JSON object"):
+        make_client(lambda *a, **k: FakeResponse(200, 5)).get_job("j")
+
+
+def test_a_download_body_that_stops_arriving_is_an_sdk_error(tmp_path):
+    """The streaming body is a second chance to fail, after the request already
+    succeeded — it needs its own wrapping, and had none at all before."""
+    dest = tmp_path / "deck.pptx"
+
+    with pytest.raises(APIConnectionError) as exc:
+        make_client(lambda *a, **k: ExplodingBody(200)).download("job_a", str(dest))
+
+    assert isinstance(exc.value.__cause__, requests.ConnectionError)
+    assert not dest.exists()  # and the all-or-nothing guarantee still holds
+
+
+# --------------------------------------------------------------------------- #
+# is_transient — which failures wait() will poll through
+#
+# The old test was "is this exception one of ours?", which got both halves wrong:
+# a network blip is not ours and is worth retrying, a 404 is ours and never will
+# be. The decision now lives on the exception.
+# --------------------------------------------------------------------------- #
+def test_transient_errors_are_marked_and_the_rest_are_not():
+    assert ServerError("oops", status_code=500).is_transient
+    assert APIConnectionError("reset").is_transient
+    assert APITimeoutError("slow").is_transient
+    assert RateLimitedError("wait", status_code=429).is_transient
+    # A body we cannot parse fails loudly instead of being retried for 30 minutes.
+    assert not MalformedResponseError("not json").is_transient
+    assert not JobNotFoundError("gone", status_code=404).is_transient
+    assert not AuthenticationError("bad key", status_code=401).is_transient
+    assert not InvalidFileError("too big", status_code=413).is_transient
+
+
+def test_a_5xx_becomes_a_server_error():
+    """5xx used to land on the base class. ServerError still subclasses it, so
+    `except Image2PPTError` code is unaffected."""
+    handler = lambda *a, **k: FakeResponse(
+        503, {"error": {"code": "STORAGE_FAILED", "message": "later"}}
+    )
+    with pytest.raises(ServerError) as exc:
+        make_client(handler).account()
+
+    assert isinstance(exc.value, Image2PPTError)
+    assert exc.value.status_code == 503
+    assert exc.value.is_transient
+
+
+def test_wait_retries_a_dropped_connection_during_polling():
+    state = {"n": 0}
+
+    def handler(*_a, **_k):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise requests.ConnectionError("connection reset")
+        return FakeResponse(200, {"jobId": "j", "status": "completed"})
+
+    assert make_client(handler).wait("j", poll_interval=0).is_completed
+
+
+def test_wait_retries_a_per_request_timeout_during_polling():
+    """The bug this fixes: a poll timeout used to be fatal, even though the comment
+    beside it said such failures should be backed off and retried."""
+    state = {"n": 0}
+
+    def handler(*_a, **_k):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise requests.exceptions.ReadTimeout("this one poll was slow")
+        return FakeResponse(200, {"jobId": "j", "status": "completed"})
+
+    assert make_client(handler).wait("j", poll_interval=0).is_completed
+    assert state["n"] == 2
+
+
+def test_wait_gives_up_immediately_on_a_malformed_poll_response():
+    """Not transient: retrying an unparseable body for half an hour would hide the
+    problem rather than solve it."""
+    state = {"n": 0}
+
+    def handler(*_a, **_k):
+        state["n"] += 1
+        return FakeResponse(200, raise_json=True)
+
+    with pytest.raises(MalformedResponseError):
+        make_client(handler).wait("j", poll_interval=0)
+
+    assert state["n"] == 1  # no backoff loop
+
+
+def test_wait_gives_up_immediately_on_an_auth_failure():
+    with pytest.raises(AuthenticationError):
+        make_client(
+            lambda *a, **k: FakeResponse(
+                401, {"error": {"code": "INVALID_API_KEY", "message": "bad key"}}
+            )
+        ).wait("j", poll_interval=0)
+
+
+def test_a_transient_error_still_does_not_make_a_submission_retry(tmp_path):
+    """is_transient answers "is this read worth repeating". Submitting twice costs
+    money, so it must not leak onto the submit path."""
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+
+    def handler(*_a, **_k):
+        raise requests.ConnectionError("connection reset")
+
+    client, session = client_and_session(handler)
+
+    with pytest.raises(APIConnectionError) as exc:
+        client.submit([str(img)])
+
+    assert exc.value.is_transient  # it is, for a read
+    assert len(session.calls) == 1  # and it still went out exactly once
+
+
+# --------------------------------------------------------------------------- #
+# pageResults — the per-page ledger
+#
+# creditsRefunded says how many pages did not convert; this says which ones, and
+# whether each missing page is in the deck as its original image or absent from it
+# entirely. "Absent" and "empty" are different facts and are modelled differently.
+# --------------------------------------------------------------------------- #
+_MIXED_PAGE_RESULTS = [
+    {"pageNumber": 1, "status": "converted"},
+    {
+        "pageNumber": 2,
+        "status": "failed",
+        "error": {
+            "code": "CONVERSION_FAILED",
+            "message": "Conversion failed, please retry later",
+            "retryable": True,
+        },
+    },
+    {
+        "pageNumber": 3,
+        "status": "failed",
+        "error": {
+            "code": "PAGE_NOT_ATTEMPTED",
+            "message": "This page was never started",
+            "retryable": True,
+        },
+    },
+]
+
+
+def test_page_results_carry_every_page_in_order():
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "completed",
+            "slideCount": 3,
+            "creditsRefunded": 2,
+            "pageResults": _MIXED_PAGE_RESULTS,
+        }
+    )
+
+    assert job.page_results is not None
+    assert len(job.page_results) == job.slide_count
+    assert [p.page_number for p in job.page_results] == [1, 2, 3]
+    assert [p.status for p in job.page_results] == ["converted", "failed", "failed"]
+
+    converted, attempted, never_started = job.page_results
+    assert converted.error is None
+    # Attempted and failed: the page IS in the deck, as the original image.
+    assert attempted.error.code == "CONVERSION_FAILED"
+    # Never started: the page is NOT in the deck at all.
+    assert never_started.error.code == "PAGE_NOT_ATTEMPTED"
+
+
+def test_page_results_expose_retryable():
+    """Callers must be able to branch on the field; today's codes are all True, but
+    a code added later may carry False."""
+    job = Job.from_dict(
+        {"jobId": "j", "status": "failed", "pageResults": _MIXED_PAGE_RESULTS}
+    )
+    assert [p.error.retryable for p in job.page_results if p.error] == [True, True]
+
+    later = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "failed",
+            "pageResults": [
+                {
+                    "pageNumber": 1,
+                    "status": "failed",
+                    "error": {
+                        "code": "SOME_FUTURE_CODE",
+                        "message": "no point retrying",
+                        "retryable": False,
+                    },
+                }
+            ],
+        }
+    )
+    assert later.page_results[0].error.retryable is False
+    # An unfamiliar code is passed through, not rewritten. Callers read it as
+    # CONVERSION_FAILED; the client does not decide that for them.
+    assert later.page_results[0].error.code == "SOME_FUTURE_CODE"
+
+
+def test_page_results_absent_is_none_and_not_an_empty_list():
+    """The field is omitted while a job is running, and for jobs submitted before
+    the ledger existed. None means "no ledger reported"; [] would mean "a job with
+    no pages" — a caller who cannot tell them apart reports zero failed pages for a
+    job whose ledger simply is not there yet."""
+    running = Job.from_dict({"jobId": "j", "status": "processing", "progress": 40})
+    assert running.page_results is None
+
+    older = Job.from_dict({"jobId": "j", "status": "completed", "slideCount": 2})
+    assert older.page_results is None
+    assert older.page_results != []
+
+
+def test_page_results_reach_the_caller_through_get_job_and_wait():
+    body = {
+        "jobId": "j",
+        "status": "completed",
+        "slideCount": 3,
+        "creditsRefunded": 2,
+        "pageResults": _MIXED_PAGE_RESULTS,
+    }
+    client = make_client(lambda *a, **k: FakeResponse(200, body))
+    assert len(client.get_job("j").page_results) == 3
+
+    done = make_client(lambda *a, **k: FakeResponse(200, body)).wait("j", poll_interval=0)
+    assert [p.error.code for p in done.page_results if p.error] == [
+        "CONVERSION_FAILED",
+        "PAGE_NOT_ATTEMPTED",
+    ]
+
+
+def test_a_failed_job_keeps_its_ledger_on_the_exception():
+    handler = lambda *a, **k: FakeResponse(
+        200,
+        {
+            "jobId": "j",
+            "status": "failed",
+            "slideCount": 3,
+            "error": {"code": "CONVERSION_FAILED", "message": "boom"},
+            "pageResults": _MIXED_PAGE_RESULTS,
+        },
+    )
+    with pytest.raises(JobFailedError) as exc:
+        make_client(handler).wait("j", poll_interval=0)
+
+    assert len(exc.value.job.page_results) == 3
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"status": "converted"},  # no pageNumber
+        {"pageNumber": 1},  # no status
+        "not an object",
+        {"pageNumber": "one", "status": "converted"},
+    ],
+)
+def test_a_malformed_page_entry_is_a_malformed_response(entry):
+    """pageNumber and status are contract guarantees, so their absence is not a
+    page with missing pieces — it is a body this client cannot trust."""
+    with pytest.raises(MalformedResponseError):
+        Job.from_dict({"jobId": "j", "status": "completed", "pageResults": [entry]})
+
+
+def test_page_results_must_be_an_array():
+    with pytest.raises(MalformedResponseError, match="pageResults"):
+        Job.from_dict({"jobId": "j", "status": "completed", "pageResults": {"1": "ok"}})
+
+
+def test_page_results_tolerate_the_unfamiliar_and_keep_raw():
+    """Unknown status strings and extra fields must not break parsing — the whole
+    ledger would be lost over one field this version has not heard of."""
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "completed",
+            "pageResults": [
+                {
+                    "pageNumber": 1,
+                    "status": "partially_converted",
+                    "somethingNew": 42,
+                    "error": {"code": "BRAND_NEW", "message": "hm", "retryable": True},
+                }
+            ],
+        }
+    )
+    page = job.page_results[0]
+    assert page.status == "partially_converted"  # passed through, not coerced
+    assert page.raw["somethingNew"] == 42
+    assert page.error.raw["code"] == "BRAND_NEW"
+
+
+def test_a_page_error_missing_its_code_reads_as_conversion_failed():
+    """Lenient inside `error`: a surprise there must not cost the caller the rest
+    of the ledger. CONVERSION_FAILED is the contract's own reading of a code you
+    cannot place, and retryable defaults to False rather than to a guess."""
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "failed",
+            "pageResults": [{"pageNumber": 1, "status": "failed", "error": {}}],
+        }
+    )
+    error = job.page_results[0].error
+    assert error.code == "CONVERSION_FAILED"
+    assert error.message == ""
+    assert error.retryable is False
+
+
+def test_page_models_are_exported():
+    assert PageResult is not None and PageError is not None
+
+
+def test_page_results_sit_last_in_the_dataclass():
+    """Guards the positional-constructor order test: page_results is appended at
+    the end, so no existing positional call changes meaning."""
+    import dataclasses
+
+    assert [f.name for f in dataclasses.fields(Job)][-1] == "page_results"
+
+
+# --------------------------------------------------------------------------- #
+# Accept-Language
+#
+# It decides what language error `message` text comes back in. Unrelated to the
+# per-submission `locale`, which decides what language the PPTX is written in.
+# --------------------------------------------------------------------------- #
+def test_no_accept_language_header_by_default():
+    """The default must send exactly what this client has always sent."""
+    session = FakeSession(lambda *a, **k: FakeResponse(200, {"email": "e", "credits": 1}))
+    client = Image2PPTClient("i2p_live_test", session=session)
+    client.account()
+
+    assert "Accept-Language" not in session.headers
+    assert client.accept_language is None
+
+
+def test_accept_language_is_sent_verbatim_on_every_request(tmp_path):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    responses = iter([
+        FakeResponse(201, {"jobId": "j", "status": "pending"}),
+        FakeResponse(200, {"jobId": "j", "status": "completed"}),
+        FakeResponse(200, {"email": "e", "credits": 1}),
+    ])
+    session = FakeSession(lambda *a, **k: next(responses))
+    client = Image2PPTClient(
+        "i2p_live_test", session=session, accept_language="fr-CH, fr;q=0.9, en;q=0.8"
+    )
+
+    client.submit([str(img)])
+    client.get_job("j")
+    client.account()
+
+    # Set once on the session, so it rides along on all three requests — and the
+    # free-form header value is passed through untouched, not normalised.
+    assert session.headers["Accept-Language"] == "fr-CH, fr;q=0.9, en;q=0.8"
+    assert len(session.calls) == 3
+
+
+def test_accept_language_is_independent_of_the_submission_locale(tmp_path):
+    """Different things: locale picks the deck's language, accept_language picks
+    the language of error messages. Setting one must not touch the other."""
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    sent = {}
+
+    def handler(method, url, **kwargs):
+        sent.update(kwargs.get("data") or {})
+        return FakeResponse(201, {"jobId": "j", "status": "pending"})
+
+    session = FakeSession(handler)
+    Image2PPTClient("i2p_live_test", session=session, accept_language="zh-CN").submit(
+        [str(img)], locale="en"
+    )
+
+    assert sent["locale"] == "en"
+    assert session.headers["Accept-Language"] == "zh-CN"

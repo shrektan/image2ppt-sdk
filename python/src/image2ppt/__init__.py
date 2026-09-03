@@ -25,6 +25,8 @@ from ._limits import (
 )
 from .client import DEFAULT_BASE_URL, Image2PPTClient
 from .errors import (
+    APIConnectionError,
+    APITimeoutError,
     AuthenticationError,
     Image2PPTError,
     Image2PPTTimeoutError,
@@ -35,21 +37,25 @@ from .errors import (
     JobCancelledError,
     JobFailedError,
     JobNotFoundError,
+    MalformedResponseError,
     MalformedUploadError,
     NoFilesError,
     NotReadyError,
     OutputExpiredError,
     PageRateExceededError,
     RateLimitedError,
+    ServerError,
     TooManySlidesError,
     UploadAbortedError,
 )
-from .models import CancellationResult, Job
+from .models import CancellationResult, Job, PageError, PageResult
 from ._version import __version__
 
 __all__ = [
     "Image2PPTClient",
     "Job",
+    "PageResult",
+    "PageError",
     "CancellationResult",
     "DEFAULT_BASE_URL",
     "MAX_FILE_BYTES",
@@ -61,6 +67,10 @@ __all__ = [
     "check_submission",
     "plan_batches",
     "Image2PPTError",
+    "APIConnectionError",
+    "APITimeoutError",
+    "MalformedResponseError",
+    "ServerError",
     "AuthenticationError",
     "InvalidFileError",
     "UploadAbortedError",
