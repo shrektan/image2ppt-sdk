@@ -62,6 +62,17 @@ raises subclasses `Image2PPTError`* — is finally true.
   required fields reached callers as `requests.ConnectionError`,
   `requests.exceptions.JSONDecodeError`, and `KeyError` respectively — none of
   which a documented `except Image2PPTError` catches.
+- **Python** — a download that failed *and* then lost the connection while the
+  error explanation was still arriving raised a bare
+  `requests.ChunkedEncodingError`. The download response is streamed, so its
+  error body is read separately from the request itself and had no wrapping of
+  its own.
+- **Both clients** — the two clients disagreed on malformed bodies: a `jobId` of
+  `null`, a page number sent as the string `"3"`, and a non-string page status
+  were accepted by one client and rejected by the other. All three are now
+  rejected by both, as is a page `error` sent as an array. A `false` value for
+  `cancellationRequested` / `finalizing` is a real value, not a missing field,
+  in both.
 
 ### Changed
 
