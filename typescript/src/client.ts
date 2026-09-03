@@ -1110,6 +1110,16 @@ export class Image2PPTClient {
     }
   }
 
+  /**
+   * Raise the mapped error for a non-2xx, reading the `{ error: ... }` envelope.
+   *
+   * Reading that envelope is itself a read off the socket, and `download` reaches
+   * here with a response whose body has not arrived yet — so the connection can
+   * still die at this point. A body that failed to **parse** is nothing worth
+   * reporting: the status code already says what happened, and an HTML gateway page
+   * adds nothing. A body that never finished **arriving** is a transport failure and
+   * has to be raised as one, exactly as the Python client does.
+   */
   async #raiseForError(res: Response): Promise<never> {
     let code: string | undefined;
     let message: string | undefined;
@@ -1119,7 +1129,15 @@ export class Image2PPTClient {
         code = body.error.code;
         message = body.error.message;
       }
-    } catch {
+    } catch (err) {
+      // The watchdog's abort comes through here when the error body stalls partway.
+      if (err instanceof Image2PPTError) throw err;
+      if (!(err instanceof SyntaxError)) {
+        throw new APIConnectionError(
+          `${res.status} error body did not finish arriving: ${describeCause(err)}`,
+          { statusCode: res.status, cause: err },
+        );
+      }
       // non-JSON error body (e.g. a gateway HTML page): fall back to status text
     }
     throw exceptionFor({

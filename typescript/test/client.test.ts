@@ -76,6 +76,26 @@ function fetchSequence(...responses: Response[]): RecordingFetch {
   return fetchScript((n) => responses[Math.min(n - 1, responses.length - 1)]);
 }
 
+/**
+ * A response whose body dies partway through, like a dropped connection.
+ *
+ * `reason` is handed back so a test can assert the original error survived as the
+ * `cause`; `status` lets the same fixture stand in for an *error* body that stops
+ * arriving, which is read on a different path from a successful one.
+ */
+function explodingBody(
+  reason: Error = new Error("connection reset mid-download"),
+  status = 200,
+): Response {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("PK first half"));
+      controller.error(reason);
+    },
+  });
+  return new Response(stream, { status });
+}
+
 /** Filenames carried by each POST, in order: [[batch1...], [batch2...]]. */
 async function postedFilenames(fetchImpl: RecordingFetch): Promise<string[][]> {
   return Promise.all(
@@ -328,13 +348,20 @@ describe("submit", () => {
 
   it("maps 401 to AuthenticationError", async () => {
     const file = await tempFile();
-    const c = client(fetchSequence(json(401, { error: { code: "INVALID_API_KEY", message: "bad key" } })));
-    await expect(c.submit([file])).rejects.toMatchObject({
+    // A fresh response per attempt: a `Response` body can only be read once, and a
+    // second read of a spent one is a body failure rather than a 401.
+    const unauthorized = (): Response =>
+      json(401, { error: { code: "INVALID_API_KEY", message: "bad key" } });
+    await expect(
+      client(fetchSequence(unauthorized())).submit([file]),
+    ).rejects.toMatchObject({
       name: "AuthenticationError",
       code: "INVALID_API_KEY",
       statusCode: 401,
     });
-    await expect(c.submit([file])).rejects.toBeInstanceOf(AuthenticationError);
+    await expect(
+      client(fetchSequence(unauthorized())).submit([file]),
+    ).rejects.toBeInstanceOf(AuthenticationError);
   });
 
   it("maps UPLOAD_ABORTED to its own type", async () => {
@@ -1478,17 +1505,6 @@ describe("download atomicity", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  /** A 200 whose body dies partway through, like a dropped connection. */
-  function explodingBody(): Response {
-    const stream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode("PK\u0003\u0004 first half"));
-        controller.error(new Error("connection reset mid-download"));
-      },
-    });
-    return new Response(stream, { status: 200 });
-  }
-
   it("leaves no truncated file behind", async () => {
     const dest = join(dir, "deck.pptx");
     const f = fetchSequence(explodingBody());
@@ -2054,22 +2070,37 @@ describe("platform errors are wrapped", () => {
     // have wrapped this one.
     const dest = join(dir, "deck.pptx");
     const reset = new Error("connection reset mid-download");
-    const f = fetchSequence(
-      new Response(
-        new ReadableStream({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode("PK first half"));
-            controller.error(reset);
-          },
-        }),
-        { status: 200 },
-      ),
-    );
+    const f = fetchSequence(explodingBody(reset));
 
     const err = await client(f).download("j", dest).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(APIConnectionError);
     expect((err as Error).cause).toBe(reset);
+  });
+
+  it("reports an error body that stops arriving as APIConnectionError", async () => {
+    // A `download` response is streamed, so on a failure status the `{ error: ... }`
+    // envelope has not arrived yet and the connection can still die while it is being
+    // read. Reporting that as the status code alone would call a dropped connection
+    // "the job isn't ready", which is a different thing to do about it.
+    const dest = join(dir, "deck.pptx");
+    const reset = new Error("connection reset mid-body");
+    const f = fetchSequence(explodingBody(reset, 409));
+
+    const err = await client(f).download("j", dest).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(APIConnectionError);
+    expect(err).not.toBeInstanceOf(NotReadyError);
+    expect((err as Error).message).toContain("connection reset mid-body");
+  });
+
+  it("still reports the status when the error body merely is not JSON", async () => {
+    // An HTML gateway page is not a transport failure. The status decides, exactly
+    // as it did before a cut-off body got its own answer.
+    const dest = join(dir, "deck.pptx");
+    const f = fetchSequence(new Response("<html>gateway</html>", { status: 409 }));
+
+    await expect(client(f).download("j", dest)).rejects.toBeInstanceOf(NotReadyError);
   });
 });
 
@@ -2360,11 +2391,7 @@ describe("acceptLanguage", () => {
         ? json(201, { jobId: "j", status: "pending" })
         : json(200, { jobId: "j", status: "completed" }),
     );
-    const c = new Image2PPTClient({
-      apiKey: "i2p_live_test",
-      fetch: f,
-      acceptLanguage: header,
-    });
+    const c = impatientClient(f, { acceptLanguage: header });
 
     const file = await tempFile();
     await c.submit([file]);

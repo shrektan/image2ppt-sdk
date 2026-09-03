@@ -1273,6 +1273,87 @@ def test_download_writes_the_whole_deck_on_success(tmp_path):
     assert [f.name for f in tmp_path.iterdir()] == ["deck.pptx"]
 
 
+class ExplodingErrorBody(FakeResponse):
+    """A non-2xx whose error body dies while it is being read.
+
+    ``download`` opens its response streaming, so on a failure status the
+    ``{"error": ...}`` envelope is still on the socket when the client goes to read
+    it. A server that promises more body than it writes and then hangs up produces
+    exactly this.
+    """
+
+    def __init__(self, status_code, exc):
+        super().__init__(status_code)
+        self._exc = exc
+
+    def json(self):
+        raise self._exc
+
+
+def test_a_download_error_body_that_dies_mid_read_is_still_an_sdk_error(tmp_path):
+    """The README promises every failure subclasses ``Image2PPTError``.
+
+    ``ChunkedEncodingError`` is not a ``ValueError``, so the guard that expected an
+    unparseable body let it straight through and callers got a raw ``requests``
+    type out of ``download``.
+    """
+    dest = tmp_path / "deck.pptx"
+    reset = requests.exceptions.ChunkedEncodingError("connection broken")
+    client = make_client(lambda *a, **k: ExplodingErrorBody(409, reset))
+
+    with pytest.raises(APIConnectionError) as caught:
+        client.download("job_a", str(dest))
+
+    assert caught.value.__cause__ is reset
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_download_error_body_that_times_out_mid_read_is_a_timeout(tmp_path):
+    dest = tmp_path / "deck.pptx"
+    slow = requests.exceptions.ReadTimeout("read timed out")
+    client = make_client(lambda *a, **k: ExplodingErrorBody(409, slow))
+
+    with pytest.raises(APITimeoutError) as caught:
+        client.download("job_a", str(dest))
+
+    assert caught.value.__cause__ is slow
+
+
+def test_a_download_error_body_that_is_not_json_still_reports_the_status(tmp_path):
+    """An HTML gateway page is not a transport failure — the status still decides.
+
+    ``requests`` signals it with a ``JSONDecodeError``, which is *both* a
+    ``ValueError`` and one of its own transport exceptions. Whichever guard claims
+    it first decides the answer, so the order is pinned here.
+    """
+    dest = tmp_path / "deck.pptx"
+    not_json = requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
+    client = make_client(lambda *a, **k: ExplodingErrorBody(409, not_json))
+
+    with pytest.raises(NotReadyError):
+        client.download("job_a", str(dest))
+
+
+def test_a_2xx_body_that_is_not_json_is_malformed_not_a_connection_failure():
+    """Same ordering on the success path: parsed-badly is not the same as cut off."""
+    not_json = requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
+    client = make_client(lambda *a, **k: ExplodingErrorBody(200, not_json))
+
+    with pytest.raises(MalformedResponseError):
+        client.account()
+
+
+def test_a_2xx_body_that_stops_arriving_is_a_connection_failure():
+    reset = requests.exceptions.ChunkedEncodingError("connection broken")
+    client = make_client(lambda *a, **k: ExplodingErrorBody(200, reset))
+
+    with pytest.raises(APIConnectionError) as caught:
+        client.account()
+
+    assert not isinstance(caught.value, MalformedResponseError)
+    assert caught.value.__cause__ is reset
+
+
 # --------------------------------------------------------------------------- #
 # Client identification
 #

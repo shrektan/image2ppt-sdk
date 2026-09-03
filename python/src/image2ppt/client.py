@@ -7,8 +7,9 @@ import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 from urllib.parse import quote
 
 import requests
@@ -161,6 +162,37 @@ def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
         exc.submitted_jobs = list(jobs)  # type: ignore[attr-defined]
     except AttributeError:
         pass  # exotic exception type with no __dict__: nothing we can do
+
+
+@contextmanager
+def _transport_errors(what: str) -> Iterator[None]:
+    """Translate a ``requests`` transport failure into this SDK's own error.
+
+    The READMEs promise that everything this client raises subclasses
+    ``Image2PPTError``. A bare ``requests`` exception would break that promise, and
+    callers would have to import ``requests`` to catch it.
+
+    **Every block that touches the socket goes through here**, not only the call
+    that opens the request. ``download`` opens its response with ``stream=True``,
+    so the body is still on the wire long after the status line arrived: reading it
+    — to write the deck, to parse a JSON reply, or to read the ``{"error": ...}``
+    envelope of a non-2xx — is a second, separate chance for the connection to
+    drop. ``requests`` reports that as a ``ChunkedEncodingError``, which is not a
+    ``ValueError``, so it used to walk straight past the guards that only expected
+    a body which failed to *parse*.
+
+    A per-request timeout gets its own class because the answer to it is different:
+    the request may simply need longer. Either way the original exception stays
+    reachable as ``__cause__``, so nothing is lost by the translation.
+
+    ``what`` names the exchange as a noun phrase — "the request to ...".
+    """
+    try:
+        yield
+    except requests.exceptions.Timeout as exc:
+        raise APITimeoutError(f"{what} timed out: {exc}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise APIConnectionError(f"{what} did not complete: {exc}") from exc
 
 
 def _response_header(headers: Any, name: str) -> Optional[str]:
@@ -542,21 +574,13 @@ class Image2PPTClient:
             try:
                 with os.fdopen(fd, "wb") as out:
                     # The body arrives after the status line, so a drop here is a
-                    # second, separate chance to fail — and the only one the rest of
-                    # the client's wrapping cannot see, since the request itself
-                    # already succeeded.
-                    try:
+                    # second, separate chance to fail — one the request's own
+                    # wrapping cannot see, since the request itself already
+                    # succeeded.
+                    with _transport_errors(f"the deliverable for job {job_id}"):
                         for chunk in resp.iter_content(chunk_size=65536):
                             if chunk:
                                 out.write(chunk)
-                    except requests.exceptions.Timeout as exc:
-                        raise APITimeoutError(
-                            f"timed out reading the deliverable for job {job_id}: {exc}"
-                        ) from exc
-                    except requests.exceptions.RequestException as exc:
-                        raise APIConnectionError(
-                            f"the deliverable for job {job_id} stopped arriving: {exc}"
-                        ) from exc
                 os.replace(partial, dest_path)
             except BaseException:
                 try:
@@ -676,27 +700,17 @@ class Image2PPTClient:
 
     @staticmethod
     def _send(send: Any, url: str, **kwargs: Any) -> requests.Response:
-        """Make one call and turn a transport failure into an SDK exception.
+        """Make one call, with a transport failure translated to an SDK exception.
 
-        The READMEs promise that everything this client raises subclasses
-        ``Image2PPTError``. A bare ``requests`` exception would break that promise,
-        and callers would have to import ``requests`` to catch it — so every
-        exchange goes through here.
+        The translation itself lives in ``_transport_errors`` — see there for why
+        every block that touches the socket has to go through it, not just this one.
 
         It takes the bound ``.get`` / ``.post`` rather than calling a generic
         ``.request``: those two methods are the whole surface an injected session
         has to provide, and widening it would break every caller who supplies one.
-
-        The original exception stays reachable as ``__cause__``, so nothing is lost
-        by the translation. A per-request timeout gets its own class because the
-        answer to it is different: the request may simply need longer.
         """
-        try:
+        with _transport_errors(f"the request to {url}"):
             return send(url, **kwargs)
-        except requests.exceptions.Timeout as exc:
-            raise APITimeoutError(f"request to {url} timed out: {exc}") from exc
-        except requests.exceptions.RequestException as exc:
-            raise APIConnectionError(f"could not reach {url}: {exc}") from exc
 
     def _submit_batch(
         self,
@@ -875,14 +889,20 @@ class Image2PPTClient:
         self._warn_if_deprecated(resp)
         if not resp.ok:
             self._raise_for_error(resp)
-        try:
-            return resp.json()
-        except ValueError as exc:
-            raise MalformedResponseError(
-                f"expected a JSON response but could not parse the body (HTTP "
-                f"{resp.status_code})",
-                status_code=resp.status_code,
-            ) from exc
+        # The parsing guard sits *inside* the transport one on purpose. ``requests``
+        # raises a ``JSONDecodeError`` that is both a ``ValueError`` and one of its
+        # own transport exceptions, so a body that arrived intact and merely is not
+        # JSON has to be claimed by the inner handler before the outer one can
+        # mistake it for a dropped connection.
+        with _transport_errors(f"the HTTP {resp.status_code} response body"):
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise MalformedResponseError(
+                    f"expected a JSON response but could not parse the body (HTTP "
+                    f"{resp.status_code})",
+                    status_code=resp.status_code,
+                ) from exc
 
     def _warn_if_deprecated(self, resp: requests.Response) -> None:
         """Log at most one warning if this SDK version has been marked deprecated.
@@ -925,14 +945,21 @@ class Image2PPTClient:
         """Parse the ``{"error": {code, message}}`` envelope and raise the mapped error."""
         code: Optional[str] = None
         message: Optional[str] = None
-        try:
-            body = resp.json()
-            err = body.get("error") if isinstance(body, dict) else None
-            if isinstance(err, dict):
-                code = err.get("code")
-                message = err.get("message")
-        except ValueError:
-            pass  # non-JSON error body (e.g. a gateway HTML page): fall back to status text
+        # Reading the envelope is itself a read off the socket: on a ``download``
+        # the response was opened with ``stream=True``, so the error body has not
+        # arrived yet and the connection can still die here. A body that failed to
+        # *parse* is nothing worth reporting — the status code already says what
+        # happened — but a body that never finished arriving is a transport failure
+        # and has to be raised as one rather than silently reported as the status.
+        with _transport_errors(f"the HTTP {resp.status_code} error body"):
+            try:
+                body = resp.json()
+                err = body.get("error") if isinstance(body, dict) else None
+                if isinstance(err, dict):
+                    code = err.get("code")
+                    message = err.get("message")
+            except ValueError:
+                pass  # non-JSON error body (a gateway HTML page): fall back to status text
         message = message or f"request failed (HTTP {resp.status_code})"
 
         raise exception_for(
