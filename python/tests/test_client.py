@@ -18,6 +18,8 @@ from PIL import Image
 
 from image2ppt import (
     MAX_FILE_BYTES,
+    APIConnectionError,
+    APITimeoutError,
     MAX_UPLOAD_BYTES,
     MAX_PAGES_PER_JOB,
     AuthenticationError,
@@ -32,11 +34,15 @@ from image2ppt import (
     JobCancelledError,
     JobFailedError,
     JobNotFoundError,
+    MalformedResponseError,
     MalformedUploadError,
+    PageError,
+    PageResult,
     NoFilesError,
     NotReadyError,
     PageRateExceededError,
     RateLimitedError,
+    ServerError,
     TooManySlidesError,
     UploadAbortedError,
 )
@@ -304,12 +310,17 @@ def test_cancel_maps_not_found_and_server_failures():
 
 
 def test_cancel_does_not_retry_an_ambiguous_network_failure():
+    """One attempt, and the failure arrives as an SDK error with the cause intact."""
+
     def handler(*args, **kwargs):
         raise requests.ConnectionError("connection reset")
 
     client, session = client_and_session(handler)
-    with pytest.raises(requests.ConnectionError, match="connection reset"):
+    with pytest.raises(APIConnectionError) as exc:
         client.cancel("j")
+    assert isinstance(exc.value, Image2PPTError)
+    assert isinstance(exc.value.__cause__, requests.ConnectionError)
+    assert "connection reset" in str(exc.value.__cause__)
     assert len(session.calls) == 1
 
 
@@ -756,7 +767,7 @@ def test_convert_all_writes_one_numbered_pptx_per_batch(tmp_path):
 # --------------------------------------------------------------------------- #
 # a failed submission is NOT retried
 #
-# This looks like a missing feature; it is a deliberate one. A ConnectionError
+# This looks like a missing feature; it is a deliberate one. An APIConnectionError
 # proves only that the exchange broke — the server may have received the whole
 # body, created the job and reserved credits, and then lost the connection while
 # answering. Retrying that case charges the user twice. Nothing here can tell the
@@ -776,9 +787,10 @@ def test_submit_does_not_retry_a_broken_connection(tmp_path):
 
     client, session = client_and_session(handler)
 
-    with pytest.raises(requests.exceptions.ConnectionError):
+    with pytest.raises(APIConnectionError) as exc:
         client.submit([str(img)])
 
+    assert isinstance(exc.value.__cause__, requests.exceptions.ConnectionError)
     assert attempts["n"] == 1  # tried exactly once
     assert len(posted_filenames(session)) == 1
 
@@ -793,9 +805,14 @@ def test_submit_does_not_retry_a_read_timeout(tmp_path):
 
     client, session = client_and_session(handler)
 
-    with pytest.raises(requests.exceptions.ReadTimeout):
+    with pytest.raises(APITimeoutError) as exc:
         client.submit([str(img)])
 
+    # The per-request timeout is still a transport failure, so one except clause
+    # covers both — but it keeps its own class, because the answer differs.
+    assert isinstance(exc.value, APIConnectionError)
+    assert exc.value.code == "REQUEST_TIMEOUT"
+    assert isinstance(exc.value.__cause__, requests.exceptions.ReadTimeout)
     assert len(posted_filenames(session)) == 1
 
 
@@ -812,7 +829,7 @@ def test_submit_all_does_not_retry_a_broken_connection_either(tmp_path):
 
     client, session = client_and_session(handler)
 
-    with pytest.raises(requests.exceptions.ConnectionError) as exc:
+    with pytest.raises(APIConnectionError) as exc:
         client.submit_all(paths)
 
     assert len(posted_filenames(session)) == 2  # batch 1, then batch 2 once
@@ -1222,7 +1239,7 @@ def test_download_leaves_no_truncated_file_behind(tmp_path):
     dest = tmp_path / "deck.pptx"
     client = make_client(lambda *a, **k: ExplodingBody(200))
 
-    with pytest.raises(requests.ConnectionError):
+    with pytest.raises(APIConnectionError):
         client.download("job_a", str(dest))
 
     assert not dest.exists()  # a half deck would open in a listing and nowhere else
@@ -1240,7 +1257,7 @@ def test_a_failed_download_does_not_destroy_the_deck_already_there(tmp_path):
     dest.write_bytes(b"PREVIOUS-GOOD-DECK")
     client = make_client(lambda *a, **k: ExplodingBody(200))
 
-    with pytest.raises(requests.ConnectionError):
+    with pytest.raises(APIConnectionError):
         client.download("job_a", str(dest))
 
     assert dest.read_bytes() == b"PREVIOUS-GOOD-DECK"

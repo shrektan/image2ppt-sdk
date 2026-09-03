@@ -31,6 +31,26 @@ class Image2PPTError(Exception):
         #: error not raised out of a batch call.
         self.submitted_jobs: List[Any] = []
 
+    @property
+    def is_transient(self) -> bool:
+        """Whether retrying the *same* read is worth doing.
+
+        This is the one thing ``wait()`` asks before backing off and polling again,
+        and it is deliberately a property of the error rather than a guess made at
+        the call site. The old test — "is this one of ours?" — got both halves
+        wrong: a network blip is not ours and is very much worth retrying, while a
+        404 is ours and never will be.
+
+        The default: a 5xx says the server had a problem on its side, so the same
+        request may well work in a few seconds. Anything else — a 4xx, or a local
+        failure with no status code at all — will answer the same way every time.
+
+        It says nothing about **writes**. Submitting is never retried on this
+        signal: a lost response cannot be told apart from a rejected request, and
+        guessing wrong charges the caller twice.
+        """
+        return self.status_code is not None and self.status_code >= 500
+
     def __str__(self) -> str:
         parts = []
         if self.status_code is not None:
@@ -39,6 +59,75 @@ class Image2PPTError(Exception):
             parts.append(self.code)
         prefix = " ".join(parts)
         return f"[{prefix}] {self.message}" if prefix else self.message
+
+
+class APIConnectionError(Image2PPTError):
+    """The request never completed at the transport level — no HTTP status exists.
+
+    Connection refused or reset, DNS failure, TLS failure, a response body that
+    stopped arriving mid-stream. The underlying library exception is kept as
+    ``__cause__``, so ``raise ... from`` chaining shows it and
+    ``exc.__cause__`` reaches it.
+
+    Transient: the same read is worth trying again. **A failed submission still is
+    not retried** — see ``Image2PPTError.is_transient`` for why writes are
+    different.
+    """
+
+    @property
+    def is_transient(self) -> bool:
+        """Always True — there is no status code to derive it from."""
+        return True
+
+
+class APITimeoutError(APIConnectionError):
+    """A single HTTP request took longer than the client's ``timeout``.
+
+    Subclasses ``APIConnectionError`` so one ``except APIConnectionError`` covers
+    every "the exchange did not complete" case.
+
+    **Not the same as ``Image2PPTTimeoutError``.** This one is per-request: one
+    HTTP call ran past the client's ``timeout`` and nothing came back.
+    ``Image2PPTTimeoutError`` means ``wait()`` gave up on its overall deadline
+    after any number of perfectly healthy polls — no request failed there at all.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        code: Optional[str] = "REQUEST_TIMEOUT",
+    ) -> None:
+        super().__init__(message, status_code=status_code, code=code)
+
+
+class MalformedResponseError(Image2PPTError):
+    """The response arrived but this client cannot make sense of it.
+
+    Two shapes: a 2xx whose body is not JSON at all (a captive-portal login page,
+    a CDN error page served with the wrong status), and a JSON body missing a
+    field the API contract guarantees.
+
+    **Not transient, on purpose.** A body we cannot parse is a sign that something
+    other than the API answered, or that the contract moved — neither gets better
+    by asking again, and quietly retrying it for half an hour would hide the
+    problem instead of showing it. Fail loudly and let the caller look.
+    """
+
+    @property
+    def is_transient(self) -> bool:
+        """Always False — see the class docstring."""
+        return False
+
+
+class ServerError(Image2PPTError):
+    """The service answered with a 5xx.
+
+    Per the API contract these are server-side and coming back later is
+    reasonable, so this is transient. Still an ``Image2PPTError``, so existing
+    ``except Image2PPTError`` code is unaffected.
+    """
 
 
 class AuthenticationError(Image2PPTError):
@@ -60,9 +149,9 @@ class UploadAbortedError(Image2PPTError):
 
     The server is telling you it did **not** take the submission — no job was created
     and no credits were reserved — so **resending the same files is safe**. That makes
-    this different from a transport-level ``requests.ConnectionError``, which cannot
-    rule out that the job was created and only the response was lost; the client never
-    retries that one for you (see ``Client._post_files``).
+    this different from an ``APIConnectionError``, which cannot rule out that the job
+    was created and only the response was lost; the client never retries that one for
+    you (see ``Client._post_files``).
 
     If it keeps happening, the submission is probably too large for the link. Send
     fewer files per request, or use ``submit_all`` / ``convert_all`` to split.
@@ -134,13 +223,27 @@ class RateLimitedError(Image2PPTError):
         super().__init__(message, status_code=status_code, code=code)
         self.retry_after = retry_after
 
+    @property
+    def is_transient(self) -> bool:
+        """Always True — "not right now" is the whole meaning of a 429.
+
+        Honour ``retry_after`` when you retry; the default 5xx rule would not
+        cover this one, since a 429 is a 4xx.
+        """
+        return True
+
 
 class JobNotFoundError(Image2PPTError):
     """The job id doesn't exist, or isn't owned by this key's account (404)."""
 
 
 class JobAlreadyFinishedError(Image2PPTError):
-    """The job finished naturally before cancellation was accepted (409)."""
+    """Cancellation came too late to change anything (409 ``JOB_ALREADY_FINISHED``).
+
+    Either the job had already finished on its own, or it was past the point where
+    cancelling could still change the outcome. Both mean the same thing to you:
+    fetch the job with ``get_job`` and work with the result it already has.
+    """
 
 
 class NotReadyError(Image2PPTError):
@@ -177,6 +280,11 @@ class Image2PPTTimeoutError(Image2PPTError):
 
     This does not mean the job failed — it may still be running. Re-``wait`` on the
     ``job_id`` later. (The prefix avoids shadowing the builtin ``TimeoutError``.)
+
+    **Not the same as ``APITimeoutError``.** Nothing went wrong on the wire here:
+    every poll may have answered promptly, the job just took longer than the
+    deadline you gave ``wait()``. ``APITimeoutError`` is the other one — a single
+    HTTP request that ran past the client's per-request ``timeout``.
     """
 
     def __init__(self, message: str, *, job_id: Optional[str] = None) -> None:
@@ -185,7 +293,7 @@ class Image2PPTTimeoutError(Image2PPTError):
 
 
 # Server error code -> exception class. Unlisted codes fall back to the status-code
-# map, then to the base class.
+# map, then to ``ServerError`` for a 5xx and the base class for anything else.
 _CODE_TO_EXC: Dict[str, type] = {
     "INVALID_API_KEY": AuthenticationError,
     "API_KEY_REQUIRED": AuthenticationError,
@@ -233,5 +341,10 @@ def exception_for(
             code=code or "RATE_LIMITED",
             retry_after=retry_after,
         )
-    exc_cls = _CODE_TO_EXC.get(code or "") or _STATUS_TO_EXC.get(status_code, Image2PPTError)
+    exc_cls = _CODE_TO_EXC.get(code or "") or _STATUS_TO_EXC.get(status_code)
+    if exc_cls is None:
+        # Every 5xx is a ``ServerError``, whatever code it carries — the contract
+        # says these are server-side and worth coming back to. It still subclasses
+        # ``Image2PPTError``, so nothing catching that stops working.
+        exc_cls = ServerError if status_code >= 500 else Image2PPTError
     return exc_cls(message, status_code=status_code, code=code)
