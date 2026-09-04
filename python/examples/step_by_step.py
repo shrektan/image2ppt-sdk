@@ -59,12 +59,18 @@ def main() -> int:
     for page in job.page_results or []:
         if page.status == "converted":
             continue
-        if page.error.code == "PAGE_NOT_ATTEMPTED":
+        # ``error`` is None when the entry carried none this client could read.
+        code = page.error.code if page.error else None
+        if code == "PAGE_NOT_ATTEMPTED":
             where = "not in the deck at all"
         else:
             where = "in the deck as the original image, not editable"
-        retry = "worth resubmitting" if page.error.retryable else "resubmitting will not help"
-        print(f"  page {page.page_number}: {where} ({page.error.code}, {retry})")
+        retry = (
+            "worth resubmitting"
+            if page.error and page.error.retryable
+            else "resubmitting will not help"
+        )
+        print(f"  page {page.page_number}: {where} ({code}, {retry})")
     return 0
 
 

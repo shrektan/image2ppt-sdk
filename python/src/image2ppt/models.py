@@ -281,6 +281,13 @@ class Job:
         and deliberately do not appear here.
         """
         data = _required(data, ("jobId", "status"), "job response")
+        # Same rule as a page entry's ``error`` one level down: a value that is
+        # present but is not an object carries nothing this model could report, so
+        # it reads as absent. Passing it through instead let a string or a list
+        # reach ``wait()``, which asks it for ``code`` and died on a bare
+        # ``AttributeError`` — the one kind of failure this client promises never to
+        # hand back. The original is still on ``raw``.
+        raw_error = data.get("error")
         return cls(
             job_id=data["jobId"],
             status=data["status"],
@@ -293,7 +300,7 @@ class Job:
             completed_at=data.get("completedAt"),
             cancellation_requested=bool(data.get("cancellationRequested", False)),
             download_url=data.get("downloadUrl"),
-            error=data.get("error"),
+            error=raw_error if isinstance(raw_error, dict) else None,
             page_results=_parse_page_results(data.get("pageResults")),
             raw=data,
         )

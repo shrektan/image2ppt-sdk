@@ -925,6 +925,34 @@ describe("Job", () => {
     ).toBe(true);
     expect(Job.fromJson({ jobId: "old", status: "processing" }).cancellationRequested).toBe(false);
   });
+
+  it("coerces the cancellation marker instead of parking a non-boolean in it", () => {
+    // The field is declared `boolean`, and `?? false` let anything non-null sit in
+    // it — a string or an array, typed as a boolean. `parseCancellationResult`, in
+    // the same file, has always coerced; this brings the two envelopes into line.
+    for (const [sent, expected] of [
+      [0, false],
+      ["", false],
+      ["no", true],
+      [1, true],
+    ] as const) {
+      const job = Job.fromJson({ jobId: "j", status: "processing", cancellationRequested: sent });
+      expect(job.cancellationRequested).toBe(expected);
+      expect(typeof job.cancellationRequested).toBe("boolean");
+    }
+  });
+
+  it("reads a job-level error that is not an object as no error", () => {
+    // Same rule as a page entry's `error` one level down. Python crashed outright on
+    // this body — `wait()` asked the value for `code` and raised a bare
+    // AttributeError — so leaving it unvalidated here kept the two ends disagreeing
+    // about what the same payload means.
+    for (const bad of ["boom", 7, ["boom"], true]) {
+      const job = Job.fromJson({ jobId: "j", status: "failed", error: bad });
+      expect(job.error).toBeNull();
+      expect((job.raw as { error: unknown }).error).toEqual(bad);
+    }
+  });
 });
 
 // --------------------------------------------------------------------------- //

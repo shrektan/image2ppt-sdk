@@ -355,9 +355,17 @@ export class Job {
     this.creditsRefunded = d.creditsRefunded ?? null;
     this.createdAt = d.createdAt ?? null;
     this.completedAt = d.completedAt ?? null;
-    this.cancellationRequested = d.cancellationRequested ?? false;
+    // `Boolean`, not `?? false`: the field is declared `boolean`, and a body that
+    // sends something else must not be allowed to sit in it. `parseCancellationResult`
+    // in this same file already coerces, and the Python client has always used
+    // `bool()` — without this, `{"cancellationRequested": []}` reads as true here and
+    // false there, off one payload.
+    this.cancellationRequested = Boolean(d.cancellationRequested);
     this.downloadUrl = d.downloadUrl ?? null;
-    this.error = d.error ?? null;
+    // Same rule as a page entry's `error` one level down: present but not an object
+    // says nothing this model could report, so it reads as absent. The original is
+    // still on `raw`.
+    this.error = isJsonObject(d.error) ? (d.error as JobError) : null;
     this.pageResults = parsePageResults(d.pageResults);
     this.raw = data;
   }

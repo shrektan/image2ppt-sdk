@@ -2311,3 +2311,32 @@ def test_accept_language_is_independent_of_the_submission_locale(tmp_path):
 
     assert sent["locale"] == "en"
     assert session.headers["Accept-Language"] == "zh-CN"
+
+
+@pytest.mark.parametrize("bad_error", ["boom", 7, ["boom"], True])
+def test_a_job_error_that_is_not_an_object_reads_as_no_error(bad_error):
+    """Same rule as a page entry's ``error`` one level down.
+
+    Passing it through instead let a string or a list reach ``wait()``, which asks
+    it for ``code``: the caller got a bare ``AttributeError``, which no documented
+    ``except Image2PPTError`` catches. The TypeScript client never crashed on the
+    same body, so this was a two-end drift as well. The original stays on ``raw``.
+    """
+    job = Job.from_dict({"jobId": "j", "status": "failed", "error": bad_error})
+    assert job.error is None
+    assert job.raw["error"] == bad_error
+
+
+@pytest.mark.parametrize("bad_error", ["boom", 7, ["boom"]])
+def test_wait_on_a_failed_job_whose_error_is_not_an_object_raises_ours(bad_error):
+    """The end-to-end shape of the same bug: ``wait`` has to hand back this SDK's
+    own exception, never an ``AttributeError`` raised while reading the body."""
+
+    def handler(method, url, **kwargs):
+        return FakeResponse(200, {"jobId": "job_1", "status": "failed", "error": bad_error})
+
+    client = make_client(handler)
+    with pytest.raises(JobFailedError) as excinfo:
+        client.wait("job_1", poll_interval=0, timeout=5)
+    assert excinfo.value.code is None
+    assert excinfo.value.message == "conversion failed"

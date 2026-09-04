@@ -78,6 +78,19 @@ raises subclasses `Image2PPTError`* — is finally true.
   `retryable` is now a real boolean or `false` — never truthiness. That last one
   is the one that mattered: the same bad payload used to tell a Node caller a
   page was worth submitting again and a Python caller that it was not.
+- **Both clients** — a job-level `error` that is present but is not an object now
+  reads as no error, the same rule the per-page `error` follows. Python crashed
+  outright on such a body: `wait()` asked the value for its `code` and raised a
+  bare `AttributeError`, which no documented `except Image2PPTError` catches.
+  Node did not crash but kept the value in a field typed as an object. The
+  original is still on `raw` in both.
+- **Python** — the `pageResults` example in the README and in
+  `examples/step_by_step.py` read `page.error.code` with no guard, so it raised
+  `AttributeError` on a failed page whose `error` this client could not read —
+  a value the new parsing rule above produces. The Node examples already guarded.
+- **Node** — `Job.cancellationRequested` is coerced to a real boolean instead of
+  passing any non-null value through into a field declared `boolean`. The
+  cancellation response has always coerced; the job snapshot did not.
 
 ### Changed
 
@@ -90,6 +103,19 @@ raises subclasses `Image2PPTError`* — is finally true.
   **Submission behavior is unchanged**: a submission whose connection broke is
   still never retried automatically, because a lost response cannot be told
   apart from a rejected one and retrying could charge twice.
+- **Node** — `wait()` no longer swallows an unexpected exception. Its old test read
+  "not one of ours" as "worth retrying", so a bug inside the client was retried
+  silently until the overall deadline and then surfaced as a timeout. It now ends
+  the wait and raises. This is the half of the `isTransient` switch that makes
+  *fewer* things retryable, and it is the one to read before upgrading.
+- **Python** — a poll whose body will not parse now ends `wait()` on the first
+  occurrence. `requests` raises its `JSONDecodeError` as a `RequestException`, and
+  the old loop retried every `RequestException` to the deadline; it is now a
+  `MalformedResponseError`, which is deliberately not transient. Worth knowing if
+  you sit behind a proxy that occasionally answers with an HTML page.
+- **Node (types)** — `Job.pageResults` is a declared property rather than an
+  optional one, so a `Job`-shaped object literal in your own code now has to carry
+  it. `Image2PPTError` accepts a `cause`, and `ErrorInit` is exported as a type.
 - **Docs** — `docs/api.md` / `docs/api.zh.md` re-synced with the published
   contract: per-page results, the finer per-page failure codes, the
   `Accept-Language` rule, and clarified cancellation wording (a page being
