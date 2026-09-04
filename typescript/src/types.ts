@@ -314,6 +314,12 @@ export class Job {
   /**
    * Per-page outcome, in page order, `slideCount` entries long — or `null`.
    *
+   * That shape is what the API documents, and this client passes the ledger
+   * through as it arrived rather than cross-checking it against `slideCount`.
+   * Refusing a job over a ledger that did not add up would cost the caller a deck
+   * they can actually download, which is the worse trade. Check the length
+   * yourself if your own logic depends on it.
+   *
    * `null` means the service did not send the field, which is a different fact
    * from an empty array and must not be confused with one. It is absent while the
    * job is still running (mid-run, "this page failed" and "this page has not had

@@ -229,6 +229,12 @@ class Job:
     #: Per-page outcome, in page order, with one entry per page (``len ==
     #: slide_count``).
     #:
+    #: That shape is what the API documents, and this client passes the ledger
+    #: through as it arrived rather than cross-checking it against
+    #: ``slide_count``. Refusing a job over a ledger that did not add up would
+    #: cost the caller a deck they can actually download, which is the worse
+    #: trade. Check the length yourself if your own logic depends on it.
+    #:
     #: ``None`` and ``[]`` mean different things and neither is a stand-in for the
     #: other. ``None`` means **the job did not report a ledger**: it is still
     #: running (while it is, "this page failed" and "this page has not had its turn"

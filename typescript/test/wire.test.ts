@@ -257,4 +257,56 @@ describe("submitting over a real socket", () => {
     expect(elapsed).toBeGreaterThan(idleBudgetMs * 2);
     expect(bytesIn).toBeGreaterThan(8_000_000);
   }, 120_000);
+
+  it("gives the body its own idle budget once the response headers arrive", async () => {
+    // The response headers arriving *is* data moving: the service just answered. If
+    // that does not restart the clock, the whole time spent waiting for the answer
+    // is charged against the body as well, and a deck the service took a while to
+    // start sending is cut off while it is arriving perfectly normally. Worse on a
+    // submission — the caller sees a failure for a job the service accepted, and
+    // resubmitting by hand pays for it twice.
+    const idleBudgetMs = 1_000;
+    const headerDelayMs = 800;
+    const firstChunkDelayMs = 400;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    server = createServer((req, res) => {
+      req.resume();
+      // Answer late, but well inside the budget on its own.
+      setTimeout(() => {
+        res.writeHead(200, { "Content-Type": "application/octet-stream" });
+        // Put the headers on the wire now. `writeHead` alone only stages them —
+        // they would otherwise travel with the first body write, and the client
+        // would rightly see one long silence instead of an answer followed by a
+        // pause.
+        res.flushHeaders();
+        // Then start sending. Each gap is inside the budget; only the two added
+        // together exceed it, which is exactly what a missing restart would do.
+        let sent = 0;
+        const push = (): void => {
+          if (sent === 3) {
+            res.end();
+            return;
+          }
+          sent += 1;
+          res.write(randomBytes(1024));
+          setTimeout(push, firstChunkDelayMs);
+        };
+        setTimeout(push, firstChunkDelayMs);
+      }, headerDelayMs);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    const dest = join(dir, "late-answer.pptx");
+    const started = Date.now();
+    await new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      baseUrl,
+      timeoutMs: idleBudgetMs,
+    }).download("job-late", dest);
+
+    // Proof the download really did outlive a single idle budget while never once
+    // going quiet for longer than one.
+    expect(Date.now() - started).toBeGreaterThan(idleBudgetMs);
+  }, 60_000);
 });

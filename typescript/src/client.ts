@@ -1025,6 +1025,12 @@ export class Image2PPTClient {
       } catch (err) {
         throw this.#asRequestError(err, path);
       }
+      // The answer arriving is data moving, so the body starts on a full budget
+      // rather than on whatever is left of the one the request was sent under.
+      // Without this the wait for the answer is charged twice — once to the
+      // request, then again to the body — and a deck the service took a while to
+      // start sending is cut off while it is arriving perfectly normally.
+      watchdog.kick();
       this.#warnIfDeprecated(res);
       return await options.consume(res, watchdog);
     } finally {
