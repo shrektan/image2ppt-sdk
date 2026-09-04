@@ -2454,6 +2454,44 @@ describe("required response fields", () => {
       expect(job.pageResults![0]!.error).toBeUndefined();
     }
   });
+
+  it("reads a malformed page error exactly the way the Python client does", async () => {
+    // Each row was a real disagreement: the same body told a Node caller one thing
+    // and a Python caller another. `retryable` is the row that costs money —
+    // "worth submitting this page again" versus "don't bother" — so a value that
+    // is not a boolean at all reads as false in both clients now, rather than as
+    // whatever truthiness happens to say. The rows are pinned identically in
+    // `python/tests/test_client.py`.
+    const cases: [Record<string, unknown>, string, string, boolean][] = [
+      [{ code: 7 }, "CONVERSION_FAILED", "", false],
+      [{ code: "" }, "CONVERSION_FAILED", "", false],
+      [{ message: 42 }, "CONVERSION_FAILED", "", false],
+      [{ retryable: [] }, "CONVERSION_FAILED", "", false],
+      [{ retryable: "yes" }, "CONVERSION_FAILED", "", false],
+      [{ retryable: 1 }, "CONVERSION_FAILED", "", false],
+      // Nothing said about it at all is the same answer, for the same reason.
+      [{ code: "CONVERSION_TIMEOUT" }, "CONVERSION_TIMEOUT", "", false],
+      // A well-formed error still arrives untouched.
+      [
+        { code: "PAGE_NOT_ATTEMPTED", message: "never started", retryable: true },
+        "PAGE_NOT_ATTEMPTED",
+        "never started",
+        true,
+      ],
+      [
+        { code: "CONVERSION_FAILED", message: "nope", retryable: false },
+        "CONVERSION_FAILED",
+        "nope",
+        false,
+      ],
+    ];
+    for (const [error, code, message, retryable] of cases) {
+      const job = await client(
+        fetchSequence(jobWithPage({ pageNumber: 1, status: "failed", error })),
+      ).getJob("j");
+      expect(job.pageResults![0]!.error).toMatchObject({ code, message, retryable });
+    }
+  });
 });
 
 // --------------------------------------------------------------------------- //

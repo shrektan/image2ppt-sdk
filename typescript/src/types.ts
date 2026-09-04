@@ -102,10 +102,21 @@ export class PageError {
     const d = data as Record<string, any>;
     // Lenient on purpose: `pageResults` reports what went wrong, and a gap in the
     // report is not itself worth turning into a thrown error the caller has to
-    // handle. The contract's own rule for an unknown code supplies the fallback.
-    this.code = typeof d.code === "string" ? d.code : "CONVERSION_FAILED";
+    // handle. Every rule below is pinned identically in the Python client — one
+    // body must not mean two different things depending on which SDK read it.
+    //
+    // A code has to be a non-empty string. An empty one names no failure, so it
+    // falls back the same way an unrecognised one does, which is the contract's
+    // own instruction to callers.
+    this.code = typeof d.code === "string" && d.code !== "" ? d.code : "CONVERSION_FAILED";
+    // A message has to be a string. A number is not turned into one: `42` is not a
+    // sentence anybody wants to show a person.
     this.message = typeof d.message === "string" ? d.message : "";
-    this.retryable = Boolean(d.retryable);
+    // A real boolean, never truthiness. A flag we cannot read is not a licence to
+    // re-upload, so anything else — a missing field included — is false: telling a
+    // caller "try this page again" on a guess costs them credits, telling them
+    // "don't" costs them nothing they cannot recover by asking again themselves.
+    this.retryable = d.retryable === true;
     this.raw = data;
   }
 }

@@ -2198,6 +2198,54 @@ def test_a_page_error_that_is_not_an_object_reads_as_no_error(bad_error):
     assert job.page_results[0].error is None
 
 
+@pytest.mark.parametrize(
+    ("error", "code", "message", "retryable"),
+    [
+        ({"code": 7}, "CONVERSION_FAILED", "", False),
+        ({"code": ""}, "CONVERSION_FAILED", "", False),
+        ({"message": 42}, "CONVERSION_FAILED", "", False),
+        ({"retryable": []}, "CONVERSION_FAILED", "", False),
+        ({"retryable": "yes"}, "CONVERSION_FAILED", "", False),
+        ({"retryable": 1}, "CONVERSION_FAILED", "", False),
+        # Nothing said about it at all is the same answer, for the same reason.
+        ({"code": "CONVERSION_TIMEOUT"}, "CONVERSION_TIMEOUT", "", False),
+        # A well-formed error still arrives untouched.
+        (
+            {"code": "PAGE_NOT_ATTEMPTED", "message": "never started", "retryable": True},
+            "PAGE_NOT_ATTEMPTED",
+            "never started",
+            True,
+        ),
+        (
+            {"code": "CONVERSION_FAILED", "message": "nope", "retryable": False},
+            "CONVERSION_FAILED",
+            "nope",
+            False,
+        ),
+    ],
+)
+def test_a_malformed_page_error_reads_the_same_in_both_clients(
+    error, code, message, retryable
+):
+    """Each row was a real disagreement: the same body told a Python caller one
+    thing and a Node caller another. ``retryable`` is the row that costs money —
+    "worth submitting this page again" versus "don't bother" — so a value that is
+    not a boolean at all now reads as False in both clients, rather than as
+    whatever truthiness happens to say. The rows are pinned identically in
+    ``typescript/test/client.test.ts``."""
+    job = Job.from_dict(
+        {
+            "jobId": "j",
+            "status": "completed",
+            "pageResults": [{"pageNumber": 1, "status": "failed", "error": error}],
+        }
+    )
+    page_error = job.page_results[0].error
+    assert page_error.code == code
+    assert page_error.message == message
+    assert page_error.retryable is retryable
+
+
 def test_page_results_sit_last_in_the_dataclass():
     """Guards the positional-constructor order test: page_results is appended at
     the end, so no existing positional call changes meaning."""

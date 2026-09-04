@@ -118,18 +118,31 @@ class PageError:
 
         Lenient on purpose: the entry itself is what the contract guarantees, so a
         surprise *inside* ``error`` should not cost you the rest of the ledger. A
-        ``code`` that is missing reads as ``CONVERSION_FAILED``, which is the
-        contract's own rule for a code you cannot place; a missing ``retryable``
-        reads as ``False``, the answer that does not send anyone into a retry loop
-        on a guess. A recognised ``code`` is passed through exactly as it came —
-        nothing is rewritten to a value the server did not send.
+        ``code`` that is missing, empty, or not a string reads as
+        ``CONVERSION_FAILED``, which is the contract's own rule for a code you
+        cannot place; a ``message`` that is not a string reads as empty; anything
+        but a real ``True`` reads as not retryable. A usable ``code`` is passed
+        through exactly as it came — nothing is rewritten to a value the server did
+        not send.
+
+        Every rule here is pinned identically in the Node client. One body must not
+        mean two different things depending on which SDK read it.
         """
         raw: Optional[Dict[str, Any]] = data if isinstance(data, dict) else None
         fields: Dict[str, Any] = raw if raw is not None else {}
+        code = fields.get("code")
+        message = fields.get("message")
         return cls(
-            code=str(fields.get("code") or "CONVERSION_FAILED"),
-            message=str(fields.get("message") or ""),
-            retryable=bool(fields.get("retryable", False)),
+            code=code if isinstance(code, str) and code else "CONVERSION_FAILED",
+            # Not ``str(...)``: a number is not a sentence anybody wants to show a
+            # person, so it reads as no message rather than as "42".
+            message=message if isinstance(message, str) else "",
+            # A real boolean, never truthiness. A flag we cannot read is not a
+            # licence to re-upload, so anything else — a missing field included —
+            # is False: telling a caller "try this page again" on a guess costs
+            # them credits, telling them "don't" costs them nothing they cannot
+            # recover by asking again themselves.
+            retryable=fields.get("retryable") is True,
             raw=raw,
         )
 
