@@ -6,13 +6,22 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+// Imported from `node:timers` rather than taken off the global, and that is
+// load-bearing: the test suite spies on `globalThis.setTimeout` to assert on the
+// delays this client *waits* for (retry backoff, poll intervals). The idle
+// watchdog below is not one of those waits — it is an internal deadline that
+// never sleeps the caller — so it must stay out of that reckoning.
+import { clearTimeout as clearTimer, setTimeout as setTimer } from "node:timers";
 
 import {
+  APIConnectionError,
+  APITimeoutError,
   Image2PPTError,
   Image2PPTTimeoutError,
   InvalidFileError,
   JobCancelledError,
   JobFailedError,
+  MalformedResponseError,
   RateLimitedError,
   exceptionFor,
 } from "./errors.js";
@@ -28,7 +37,7 @@ import type {
   SubmitOptions,
   WaitOptions,
 } from "./types.js";
-import { Job } from "./types.js";
+import { Job, parseCancellationResult } from "./types.js";
 import { VERSION } from "./version.js";
 
 export const DEFAULT_BASE_URL = "https://image2ppt.com";
@@ -58,6 +67,19 @@ const MIN_RETRY_AFTER_SECONDS = 1;
 
 /** How many images are read and re-encoded at the same time. See `#prepareFiles`. */
 const PREPARE_CONCURRENCY = 4;
+
+/**
+ * How much of an upload body is handed to the runtime at a time.
+ *
+ * This is what makes `timeoutMs` mean what it says on the upload side. Progress is
+ * reported once per piece, so a piece is also the longest an upload can go without
+ * reporting any — and while a piece is being written to the socket, a slow link
+ * says nothing at all. A whole image handed over in one go therefore looked idle
+ * for the entire time it was being sent, and a healthy-but-slow upload was cut off
+ * mid-transfer. 64KiB is the size a file is read from disk in, so every part of a
+ * body now moves in the same units, whether it was buffered in memory or streamed.
+ */
+const UPLOAD_SLICE_BYTES = 64 * 1024;
 
 const MIME_BY_EXT: Record<string, string> = {
   ".png": "image/png",
@@ -106,7 +128,68 @@ function fileChanged(path: string, measured: number, actual: number): Image2PPTE
   );
 }
 
-function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
+/**
+ * Aborts a request that has gone `timeoutMs` with **no data moving** either way.
+ *
+ * `timeoutMs` used to bound the whole request, which meant a 40MB upload or a
+ * large PPTX download was killed at 60 seconds however healthy it was — a
+ * progressing transfer punished for being big. It is an idle timeout instead:
+ * `kick()` is called as each chunk of the request body is produced and as each
+ * chunk of the response arrives, and only a real stall reaches the deadline. That
+ * is what the Python client's read timeout has always meant, so the two now agree.
+ *
+ * A request that never gets a response at all is still covered: the clock starts
+ * when the watchdog is built and nothing kicks it.
+ *
+ * The abort reason is an `APITimeoutError` rather than a bare signal, and that is
+ * deliberate. `fetch` rejects with whatever the signal was aborted with, and the
+ * multipart body's own errors only reach the caller if they are `Image2PPTError`s
+ * — anything else degrades into an opaque `TypeError: fetch failed` on the way
+ * out, whichever end of the request it came from.
+ */
+class IdleWatchdog {
+  readonly #controller = new AbortController();
+  readonly #timeoutMs: number;
+  readonly #describe: string;
+  #timer: ReturnType<typeof setTimer> | undefined;
+  #stopped = false;
+
+  constructor(timeoutMs: number, describe: string) {
+    this.#timeoutMs = timeoutMs;
+    this.#describe = describe;
+    this.kick();
+  }
+
+  get signal(): AbortSignal {
+    return this.#controller.signal;
+  }
+
+  /** Data moved: start the clock over. */
+  kick(): void {
+    if (this.#stopped) return;
+    if (this.#timer !== undefined) clearTimer(this.#timer);
+    this.#timer = setTimer(() => {
+      this.#stopped = true;
+      this.#controller.abort(new APITimeoutError(this.#describe));
+    }, this.#timeoutMs);
+    // The watchdog must never be the reason a process stays alive: a caller who
+    // has stopped awaiting this request should not be held open by its timer.
+    this.#timer.unref?.();
+  }
+
+  /** The exchange is over — release the timer. Safe to call more than once. */
+  stop(): void {
+    this.#stopped = true;
+    if (this.#timer !== undefined) clearTimer(this.#timer);
+    this.#timer = undefined;
+  }
+}
+
+function buildMultipart(
+  files: PreparedFile[],
+  options: SubmitOptions,
+  onChunk: () => void,
+): {
   body: RequestBody;
   contentType: string;
   contentLength: number;
@@ -139,10 +222,22 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
     Buffer.byteLength(trailer, "utf8");
 
   async function* chunks(): AsyncGenerator<Buffer> {
+    // Every yield goes through here so the idle watchdog sees the upload moving.
+    // A body that stops being produced — or that the connection stops accepting —
+    // stops kicking, which is exactly when the request should be given up on.
+    const moving = (part: Buffer): Buffer => {
+      onChunk();
+      return part;
+    };
     for (const file of files) {
-      yield chunk(fileHeader(file));
+      yield moving(chunk(fileHeader(file)));
       if (file.buffer !== undefined) {
-        yield file.buffer;
+        // Sliced rather than handed over whole, so an image reports progress as it
+        // goes out instead of once before it starts. `subarray` is a view, not a
+        // copy: the same bytes go on the wire and `Content-Length` is untouched.
+        for (let at = 0; at < file.buffer.byteLength; at += UPLOAD_SLICE_BYTES) {
+          yield moving(file.buffer.subarray(at, at + UPLOAD_SLICE_BYTES));
+        }
       } else if (file.size > 0) {
         // PDFs are intentionally never buffered: retries create a fresh stream from
         // disk while images retain their already-compressed payload. The read is
@@ -151,9 +246,12 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
         // limits were both computed from. A document rewritten underneath us has to
         // fail here rather than send a body that contradicts its own header.
         let sent = 0;
-        for await (const part of createReadStream(file.path, { end: file.size - 1 })) {
+        for await (const part of createReadStream(file.path, {
+          end: file.size - 1,
+          highWaterMark: UPLOAD_SLICE_BYTES,
+        })) {
           sent += (part as Buffer).byteLength;
-          yield Buffer.from(part);
+          yield moving(Buffer.from(part));
         }
         // A file that shrank comes up short right here. One that grew would have been
         // cut off at the cap instead — the byte count still matches, so the size on
@@ -169,10 +267,10 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
         );
         if (sizeAfter !== file.size) throw fileChanged(file.path, file.size, sizeAfter);
       }
-      yield chunk("\r\n");
+      yield moving(chunk("\r\n"));
     }
-    for (const value of fields) yield chunk(value);
-    yield chunk(trailer);
+    for (const value of fields) yield moving(chunk(value));
+    yield moving(chunk(trailer));
   }
   const source = Readable.from(chunks());
   // The body can refuse to finish — a file rewritten underneath the upload. That
@@ -190,6 +288,79 @@ function buildMultipart(files: PreparedFile[], options: SubmitOptions): {
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The real reason behind an opaque transport error.
+ *
+ * undici reports every connection failure — refused, reset, DNS, TLS — as the same
+ * `TypeError: fetch failed`, and puts what actually happened in `cause`. On its own
+ * the top-level message tells a caller nothing, so the chain is walked and the
+ * innermost description is what gets reported.
+ */
+function describeCause(err: unknown): string {
+  const seen = new Set<unknown>();
+  let current = err;
+  let described = String(err);
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    described = current.message || described;
+    if (current.cause === undefined) break;
+    current = current.cause;
+  }
+  return described;
+}
+
+/** A download that stopped arriving. Never a verdict on the file already written. */
+function downloadCutOff(err: unknown, jobId: string): Error {
+  // The watchdog's own abort is already the error worth reporting.
+  if (err instanceof Image2PPTError) return err;
+  return new APIConnectionError(
+    `download of job ${jobId} was cut off: ${describeCause(err)}`,
+    { cause: err },
+  );
+}
+
+/**
+ * The response body, reporting progress and owning its failures.
+ *
+ * Written as a `pipeline` transform stage, so it is handed the source as an async
+ * iterable and yields onward to the file. The download is consumed outside the
+ * `fetch` call, so nothing there could wrap a body that died mid-stream — it used
+ * to reach the caller as whatever the stream threw. Reading it here gives that
+ * failure a home, and gives the idle watchdog the per-chunk signal that lets a
+ * slow-but-moving download run as long as it needs to.
+ *
+ * A disk error is not rewritten into a transport one — `pipeline` reports the
+ * failure the write stream raised. A *stalled* disk is a different matter and is
+ * not distinguished: this stage only kicks the watchdog when a body chunk is read,
+ * and `pipeline` stops pulling from the body while the write stream is applying
+ * backpressure. So a destination that has stopped accepting bytes without failing
+ * will eventually trip the idle timeout, and the message will talk about the
+ * request rather than the disk. Rare, and the transfer really has stopped either
+ * way, but the reason it names may be the wrong one.
+ *
+ * `failure` is where the wrapped error is left for the caller to pick up.
+ * `pipeline` rejects with whichever error came *first*, and when the body dies that
+ * is the raw stream error the source stage raised, an instant before this one
+ * rethrows it wrapped — so the wrapped error would otherwise be dropped on the
+ * floor. A failure from the disk side never sets it and stays as it happened.
+ */
+async function* readingBody(
+  body: AsyncIterable<Uint8Array>,
+  jobId: string,
+  onChunk: () => void,
+  failure: { error?: Error },
+): AsyncGenerator<Buffer> {
+  try {
+    for await (const chunk of body) {
+      onChunk();
+      yield chunk as Buffer;
+    }
+  } catch (err) {
+    failure.error = downloadCutOff(err, jobId);
+    throw failure.error;
+  }
+}
 
 /**
  * MIME type for a supported extension; refuse anything else locally.
@@ -306,6 +477,13 @@ export class Image2PPTClient {
   readonly timeoutMs: number;
   readonly rateLimitMaxWaitMs: number;
   readonly warnOnDeprecated: boolean;
+  /**
+   * `Accept-Language` sent on every request, or undefined to send none.
+   *
+   * Sets the language of the service's error **messages** only — not the language
+   * of the deck, which is `SubmitOptions.locale`.
+   */
+  readonly acceptLanguage?: string;
   readonly #apiKey: string;
   readonly #fetch: typeof fetch;
   #deprecationWarned = false;
@@ -318,6 +496,7 @@ export class Image2PPTClient {
     this.timeoutMs = options.timeoutMs ?? 60_000;
     this.rateLimitMaxWaitMs = Math.max(0, options.rateLimitMaxWaitMs ?? 1_800_000);
     this.warnOnDeprecated = options.warnOnDeprecated !== false;
+    this.acceptLanguage = options.acceptLanguage;
     this.#apiKey = options.apiKey;
     const impl = options.fetch ?? globalThis.fetch;
     if (!impl) {
@@ -424,42 +603,31 @@ export class Image2PPTClient {
 
   /** Fetch the current job state as a `Job` snapshot. Throws JobNotFoundError. */
   async getJob(jobId: string): Promise<Job> {
-    const res = await this.#request("GET", `/api/v1/jobs/${encodeURIComponent(jobId)}`);
-    return Job.fromJson(await this.#parseJson(res));
+    return Job.fromJson(
+      await this.#request("GET", `/api/v1/jobs/${encodeURIComponent(jobId)}`, {
+        consume: (res) => this.#parseJson(res),
+      }),
+    );
   }
 
   /**
    * Request graceful cancellation of a conversion job.
    *
    * Pages already running finish and remain in the deliverable; pages that have
-   * not started are skipped and refunded. Repeating the call is safe. When
-   * `finalizing` is true, keep polling with `getJob` until the job is terminal.
+   * not started are skipped and refunded. **A page being dispatched at the very
+   * moment the request arrives may still run to completion and be billed.**
+   * Repeating the call is safe. When `finalizing` is true, keep polling with
+   * `getJob` until the job is terminal.
+   *
+   * @throws JobAlreadyFinishedError The job already finished, **or is past the
+   *   point where cancelling could change the outcome** (409 `JOB_ALREADY_FINISHED`).
    */
   async cancel(jobId: string): Promise<CancellationResult> {
-    const res = await this.#request(
-      "POST",
-      `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`,
+    return parseCancellationResult(
+      await this.#request("POST", `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {
+        consume: (res) => this.#parseJson(res),
+      }),
     );
-    // Read the three documented fields rather than casting the body through, so a
-    // malformed envelope surfaces as an Image2PPTError instead of silently handing
-    // back `finalizing: undefined` — which reads as "settled" and stops polling a
-    // job that is still draining. Mirrors the Python CancellationResult model,
-    // shape check included, so the same bad body fails the same way in both clients.
-    const body: unknown = await this.#parseJson(res);
-    if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      throw new Image2PPTError("malformed cancellation response, expected a JSON object");
-    }
-    const d = body as Record<string, unknown>;
-    for (const key of ["jobId", "cancellationRequested", "finalizing"]) {
-      if (!(key in d)) {
-        throw new Image2PPTError(`malformed cancellation response, missing ${key}`);
-      }
-    }
-    return {
-      jobId: d.jobId as string,
-      cancellationRequested: Boolean(d.cancellationRequested),
-      finalizing: Boolean(d.finalizing),
-    };
   }
 
   /**
@@ -487,13 +655,19 @@ export class Image2PPTClient {
           await this.#sleepUntil(deadline, waitMs, jobId);
           continue;
         }
-        // A single poll hit a transient server (5xx) or network error. The job may
-        // still be running, so back off and retry until the deadline instead of
-        // aborting. Client errors (4xx: job gone, bad key) are not transient.
-        const transient =
-          !(err instanceof Image2PPTError) ||
-          (err.statusCode != null && err.statusCode >= 500);
-        if (!transient) throw err;
+        // A single poll failed. The job itself is fine — the question is only
+        // whether asking again could go better, and the error answers that itself
+        // through `isTransient`: a 5xx, a dropped connection, a request that
+        // stalled. Back off and ask again until the deadline.
+        //
+        // Anything else ends the wait, and that now includes an error this client
+        // did not expect at all. It used to be the opposite: "not one of ours" was
+        // read as "transient", so a bug in this SDK was swallowed and retried for
+        // the full half hour before surfacing as a timeout. The mirror-image bug
+        // was worse in practice — a single slow status poll is reported as this
+        // SDK's own error, so "one of ours" made it fatal and one stalled poll
+        // killed the whole wait.
+        if (!(err instanceof Image2PPTError) || !err.isTransient) throw err;
         await this.#sleepUntil(deadline, interval, jobId);
         interval = Math.min(interval * 1.5, 15_000);
         continue;
@@ -526,31 +700,71 @@ export class Image2PPTClient {
    * half-written `part-02.pptx` would be indexed as one of them.
    */
   async download(jobId: string, destPath: string): Promise<string> {
-    const res = await this.#request(
-      "GET",
-      `/api/v1/jobs/${encodeURIComponent(jobId)}/download`,
-    );
-    if (!res.ok) {
-      await this.#raiseForError(res);
-    }
     // Same directory as the destination, so the rename is atomic rather than a
     // cross-filesystem copy.
     const partial = join(dirname(destPath), `.${basename(destPath)}.${randomUUID()}.part`);
-    try {
-      if (res.body) {
-        // Stream to disk in chunks so a large PPTX never sits fully in memory
-        // (mirrors the Python client's iter_content streaming).
-        await pipeline(Readable.fromWeb(res.body), createWriteStream(partial));
-      } else {
-        // No body stream (shouldn't happen for a 200 download): buffer as a fallback.
-        await writeFile(partial, Buffer.from(await res.arrayBuffer()));
-      }
-      await rename(partial, destPath);
-    } catch (err) {
-      await rm(partial, { force: true }).catch(() => undefined);
-      throw err;
-    }
-    return destPath;
+    return this.#request("GET", `/api/v1/jobs/${encodeURIComponent(jobId)}/download`, {
+      consume: async (res, watchdog) => {
+        if (!res.ok) {
+          await this.#raiseForError(res);
+        }
+        try {
+          if (res.body) {
+            // Stream to disk in chunks so a large PPTX never sits fully in memory
+            // (mirrors the Python client's iter_content streaming). A deck of any
+            // size downloads fine as long as bytes keep arriving — see `timeoutMs`.
+            //
+            // `readingBody` goes in as a transform *stage*, not wrapped in
+            // `Readable.from`: that wrapper defaults to object mode, so it would sit
+            // in the middle holding up to sixteen buffered chunks — around a megabyte
+            // of deck that need never be in memory — and add a push/read/backpressure
+            // round trip to every chunk on the way past.
+            const bodyFailure: { error?: Error } = {};
+            const source = Readable.fromWeb(
+              res.body as Parameters<typeof Readable.fromWeb>[0],
+            );
+            // Catch the body's failure at the source, where it happens, rather than
+            // relying on it surfacing inside the transform stage. Which stage's
+            // error `pipeline` reports, and whether a destroyed transform gets to
+            // see the one that killed it, differ across the Node versions this
+            // package supports: on Node 20 the raw source error wins and the
+            // transform never observes it, so a dropped download reached callers
+            // unwrapped. Listening here is version-independent.
+            source.on("error", (err: unknown) => {
+              bodyFailure.error ??= downloadCutOff(err, jobId);
+            });
+            try {
+              await pipeline(
+                source,
+                (piped) => readingBody(piped, jobId, () => watchdog.kick(), bodyFailure),
+                createWriteStream(partial),
+              );
+            } catch (err) {
+              // Prefer the wrapped body failure when there is one. Anything else —
+              // the disk side — passes through untouched: it is not a transport
+              // failure and must not be dressed up as one.
+              throw bodyFailure.error ?? err;
+            }
+          } else {
+            // No body stream (shouldn't happen for a 200 download): buffer as a
+            // fallback, wrapped the same way so a failure here is an SDK error too.
+            await writeFile(
+              partial,
+              Buffer.from(
+                await res.arrayBuffer().catch((err: unknown) => {
+                  throw downloadCutOff(err, jobId);
+                }),
+              ),
+            );
+          }
+          await rename(partial, destPath);
+        } catch (err) {
+          await rm(partial, { force: true }).catch(() => undefined);
+          throw err;
+        }
+        return destPath;
+      },
+    });
   }
 
   /**
@@ -626,8 +840,9 @@ export class Image2PPTClient {
 
   /** Return account info: `{ email, credits }` (available credits). */
   async account(): Promise<Account> {
-    const res = await this.#request("GET", "/api/v1/account");
-    return (await this.#parseJson(res)) as unknown as Account;
+    return (await this.#request("GET", "/api/v1/account", {
+      consume: (res) => this.#parseJson(res),
+    })) as unknown as Account;
   }
 
   // ----- internals --------------------------------------------------- //
@@ -750,61 +965,127 @@ export class Image2PPTClient {
       files.filter((file) => file.isImage).length,
       files.filter((file) => !file.isImage).length,
     );
-    const multipart = buildMultipart(files, options);
-    const res = await this.#request("POST", "/api/v1/jobs", {
-      body: multipart.body,
-      headers: {
-        "Content-Type": multipart.contentType,
-        "Content-Length": String(multipart.contentLength),
-      },
-    });
-    return Job.fromJson(await this.#parseJson(res));
+    return Job.fromJson(
+      await this.#request("POST", "/api/v1/jobs", {
+        // Rebuilt per attempt: a retry needs a body that has not been consumed.
+        body: (watchdog) => buildMultipart(files, options, () => watchdog.kick()),
+        consume: (res) => this.#parseJson(res),
+      }),
+    );
   }
 
-  async #request(
+  /**
+   * Make one HTTP request and consume its response, under an idle watchdog.
+   *
+   * The response body is read inside `consume` rather than after this returns,
+   * because the watchdog has to cover it: a body that starts arriving and then
+   * stops is exactly the failure `timeoutMs` is there to catch, and it happens
+   * after the headers are in. `consume` is handed the watchdog so a path that
+   * streams — only `download` — can report each chunk as progress; the short JSON
+   * bodies do not need to, since a JSON reply that takes longer than the whole
+   * idle budget to arrive genuinely is stuck.
+   *
+   * Every failure leaves here as an `Image2PPTError`. The READMEs promise that,
+   * and four different platform errors used to escape it: a transport failure as
+   * undici's opaque `TypeError: fetch failed`, an unparseable 2xx body as a raw
+   * `SyntaxError`, a job body missing its own id as no error at all, and a
+   * download cut off mid-stream as whatever the stream happened to throw.
+   */
+  async #request<T>(
     method: string,
     path: string,
-    init: { body?: RequestBody; headers?: Record<string, string> } = {},
-  ): Promise<Response> {
-    let res: Response;
+    options: {
+      /**
+       * Builds the request body. A callback rather than a value because the body
+       * streams and needs the watchdog, which does not exist until the request does.
+       */
+      body?: (watchdog: IdleWatchdog) => {
+        body: RequestBody;
+        contentType: string;
+        contentLength: number;
+      };
+      consume: (res: Response, watchdog: IdleWatchdog) => Promise<T>;
+    },
+  ): Promise<T> {
+    const watchdog = new IdleWatchdog(
+      this.timeoutMs,
+      `request to ${path} went ${this.timeoutMs}ms with no data moving ` +
+        "(timeoutMs is an idle timeout, not a limit on how long a transfer may take)",
+    );
     try {
-      res = await this.#fetch(`${this.baseUrl}${path}`, {
-        method,
-        headers: {
-          Authorization: `Bearer ${this.#apiKey}`,
-          "User-Agent": USER_AGENT,
-          ...init.headers,
-        },
-        body: init.body,
-        signal: AbortSignal.timeout(this.timeoutMs),
-        // Node's fetch requires this for a streaming request body. It is ignored by
-        // browsers, but this SDK is intentionally server-side only.
-        duplex: "half",
-      });
-    } catch (err) {
-      // AbortSignal.timeout aborts the whole request (including a slow large
-      // upload/download body) with a native DOMException, which is NOT an
-      // Image2PPTError. Re-wrap it so callers catching Image2PPTError — as the
-      // README/examples do — don't crash on a raw DOMException. Raise timeoutMs
-      // for large transfers; it bounds the entire request, not just idle time.
-      if (
-        err instanceof DOMException &&
-        (err.name === "TimeoutError" || err.name === "AbortError")
-      ) {
-        throw new Image2PPTError(
-          `request to ${path} exceeded timeoutMs=${this.timeoutMs}`,
-          { code: "REQUEST_TIMEOUT" },
-        );
+      const payload = options.body?.(watchdog);
+      let res: Response;
+      try {
+        res = await this.#fetch(`${this.baseUrl}${path}`, {
+          method,
+          headers: {
+            Authorization: `Bearer ${this.#apiKey}`,
+            "User-Agent": USER_AGENT,
+            ...(this.acceptLanguage ? { "Accept-Language": this.acceptLanguage } : {}),
+            ...(payload
+              ? {
+                  "Content-Type": payload.contentType,
+                  "Content-Length": String(payload.contentLength),
+                }
+              : {}),
+          },
+          body: payload?.body,
+          signal: watchdog.signal,
+          // Node's fetch requires this for a streaming request body. It is ignored by
+          // browsers, but this SDK is intentionally server-side only.
+          duplex: "half",
+        });
+      } catch (err) {
+        throw this.#asRequestError(err, path);
       }
-      // A throw from the request body reaches the caller as undici's bare
-      // `TypeError: fetch failed`, with the real reason demoted to `cause`. The body
-      // is this client's own code, so when it is the one that objected — a file that
-      // changed underneath the upload — its message is the one worth surfacing.
-      if (err instanceof Error && err.cause instanceof Image2PPTError) throw err.cause;
-      throw err;
+      // The answer arriving is data moving, so the body starts on a full budget
+      // rather than on whatever is left of the one the request was sent under.
+      // Without this the wait for the answer is charged twice — once to the
+      // request, then again to the body — and a deck the service took a while to
+      // start sending is cut off while it is arriving perfectly normally.
+      watchdog.kick();
+      this.#warnIfDeprecated(res);
+      return await options.consume(res, watchdog);
+    } finally {
+      watchdog.stop();
     }
-    this.#warnIfDeprecated(res);
-    return res;
+  }
+
+  /**
+   * Turn whatever `fetch` rejected with into this SDK's own error.
+   *
+   * Order matters here and is not interchangeable. An error the request *body*
+   * raised — this client's own code objecting that a file changed underneath the
+   * upload, or the watchdog giving up on a stalled one — has to be recognised
+   * before the generic transport wrapping, or the caller is told "the connection
+   * failed" about a problem that was never on the connection.
+   */
+  #asRequestError(err: unknown, path: string): Error {
+    // The watchdog aborts with its own APITimeoutError, and `fetch` rejects with
+    // whatever the signal carried, so this arrives already in the right shape.
+    if (err instanceof Image2PPTError) return err;
+    // A throw from the request body reaches the caller as undici's bare
+    // `TypeError: fetch failed`, with the real reason demoted to `cause`. The body
+    // is this client's own code, so when it is the one that objected — a file that
+    // changed underneath the upload — its message is the one worth surfacing.
+    if (err instanceof Error && err.cause instanceof Image2PPTError) return err.cause;
+    // An abort that is not the watchdog's: a caller-supplied `fetch` implementation
+    // with its own deadline, or a runtime that aborts with a bare DOMException.
+    if (
+      err instanceof DOMException &&
+      (err.name === "TimeoutError" || err.name === "AbortError")
+    ) {
+      return new APITimeoutError(`request to ${path} was aborted: ${err.message}`, {
+        cause: err,
+      });
+    }
+    // Everything else is the connection itself: refused, reset, DNS, TLS. undici
+    // reports all of them as the same unhelpful `TypeError: fetch failed` and hides
+    // the actual reason in `cause`, so lift that reason into the message and keep
+    // the original reachable.
+    return new APIConnectionError(`request to ${path} failed: ${describeCause(err)}`, {
+      cause: err,
+    });
   }
 
   /**
@@ -842,13 +1123,48 @@ export class Image2PPTClient {
     }
   }
 
+  /**
+   * The JSON body of a successful response.
+   *
+   * A 2xx that is not JSON is a real thing to meet — a captive portal, a CDN error
+   * page, a proxy that replaced the response — and it used to escape as a raw
+   * `SyntaxError` from `res.json()`, which is not an `Image2PPTError` and so was
+   * not catchable the way the README says every failure is.
+   */
   async #parseJson(res: Response): Promise<Record<string, unknown>> {
     if (!res.ok) {
       await this.#raiseForError(res);
     }
-    return (await res.json()) as Record<string, unknown>;
+    try {
+      return (await res.json()) as Record<string, unknown>;
+    } catch (err) {
+      // The watchdog's abort comes through here too when the body stalls partway.
+      if (err instanceof Image2PPTError) throw err;
+      if (err instanceof SyntaxError) {
+        throw new MalformedResponseError(
+          `${res.status} response was not JSON: ${err.message}`,
+          { statusCode: res.status, cause: err },
+        );
+      }
+      // The body started and then stopped arriving: a transport failure, not a
+      // parsing one, and worth retrying where a mangled body would not be.
+      throw new APIConnectionError(
+        `${res.status} response body did not finish arriving: ${describeCause(err)}`,
+        { statusCode: res.status, cause: err },
+      );
+    }
   }
 
+  /**
+   * Raise the mapped error for a non-2xx, reading the `{ error: ... }` envelope.
+   *
+   * Reading that envelope is itself a read off the socket, and `download` reaches
+   * here with a response whose body has not arrived yet — so the connection can
+   * still die at this point. A body that failed to **parse** is nothing worth
+   * reporting: the status code already says what happened, and an HTML gateway page
+   * adds nothing. A body that never finished **arriving** is a transport failure and
+   * has to be raised as one, exactly as the Python client does.
+   */
   async #raiseForError(res: Response): Promise<never> {
     let code: string | undefined;
     let message: string | undefined;
@@ -858,7 +1174,15 @@ export class Image2PPTClient {
         code = body.error.code;
         message = body.error.message;
       }
-    } catch {
+    } catch (err) {
+      // The watchdog's abort comes through here when the error body stalls partway.
+      if (err instanceof Image2PPTError) throw err;
+      if (!(err instanceof SyntaxError)) {
+        throw new APIConnectionError(
+          `${res.status} error body did not finish arriving: ${describeCause(err)}`,
+          { statusCode: res.status, cause: err },
+        );
+      }
       // non-JSON error body (e.g. a gateway HTML page): fall back to status text
     }
     throw exceptionFor({

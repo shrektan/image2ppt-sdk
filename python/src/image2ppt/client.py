@@ -7,8 +7,9 @@ import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 from urllib.parse import quote
 
 import requests
@@ -17,11 +18,14 @@ from PIL import Image, UnidentifiedImageError
 from ._compress import IMAGE_MIMES, compress_image_for_upload
 from ._limits import UploadItem, check_file_size, check_submission, plan_batches
 from .errors import (
+    APIConnectionError,
+    APITimeoutError,
     Image2PPTError,
     Image2PPTTimeoutError,
     InvalidFileError,
     JobCancelledError,
     JobFailedError,
+    MalformedResponseError,
     RateLimitedError,
     exception_for,
 )
@@ -151,8 +155,8 @@ def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
     """Record the jobs created so far on an exception escaping a batch call.
 
     Every ``Image2PPTError`` declares ``submitted_jobs``; this also reaches the
-    rarer non-SDK escape (an exhausted connection error), so the caller never has
-    to know which kind they caught to find out what they already paid for.
+    rarer non-SDK escape (an ``OSError`` opening a file, say), so the caller never
+    has to know which kind they caught to find out what they already paid for.
     """
     try:
         exc.submitted_jobs = list(jobs)  # type: ignore[attr-defined]
@@ -160,11 +164,46 @@ def _attach_submitted_jobs(exc: BaseException, jobs: Sequence[Job]) -> None:
         pass  # exotic exception type with no __dict__: nothing we can do
 
 
+@contextmanager
+def _transport_errors(what: str) -> Iterator[None]:
+    """Translate a ``requests`` transport failure into this SDK's own error.
+
+    The READMEs promise that everything this client raises subclasses
+    ``Image2PPTError``. A bare ``requests`` exception would break that promise, and
+    callers would have to import ``requests`` to catch it.
+
+    **Every block that touches the socket goes through here**, not only the call
+    that opens the request. ``download`` opens its response with ``stream=True``,
+    so the body is still on the wire long after the status line arrived: reading it
+    — to write the deck, to parse a JSON reply, or to read the ``{"error": ...}``
+    envelope of a non-2xx — is a second, separate chance for the connection to
+    drop. ``requests`` reports that as a ``ChunkedEncodingError``, which is not a
+    ``ValueError``, so it used to walk straight past the guards that only expected
+    a body which failed to *parse*.
+
+    A per-request timeout gets its own class because the answer to it is different:
+    the request may simply need longer. Either way the original exception stays
+    reachable as ``__cause__``, so nothing is lost by the translation.
+
+    ``what`` names the exchange as a noun phrase — "the request to ...".
+    """
+    try:
+        yield
+    except requests.exceptions.Timeout as exc:
+        raise APITimeoutError(f"{what} timed out: {exc}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise APIConnectionError(f"{what} did not complete: {exc}") from exc
+
+
 def _response_header(headers: Any, name: str) -> Optional[str]:
     """Look up an HTTP header, ignoring case.
 
     ``requests`` headers are already case-insensitive; the fake session used in
     tests is a plain dict. One lookup covers both.
+
+    **Every** header read goes through here, ``Retry-After`` included. That one
+    decides how long a retry sleeps, so it is the last read that should be the one
+    exception to the rule.
     """
     target = name.lower()
     for key, value in headers.items():
@@ -219,6 +258,18 @@ class Image2PPTClient:
             themselves take does not, so a slow link cannot quietly turn this into
             "do not wait at all". Submitting a large pile *will* hit the per-minute
             page quota, so waiting is the normal path, not an error.
+        accept_language: Sent verbatim as the ``Accept-Language`` header on every
+            request, or ``None`` (default) to send no such header at all — which
+            is what this client has always done, so the default changes nothing.
+            It decides **what language error ``message`` text comes back in**;
+            without it you get English.
+
+            Not to be confused with the per-submission ``locale``: that one
+            decides what language the generated PPTX is written in. This is an
+            HTTP header value, free-form and not restricted to the ``locale``
+            values, because ``Accept-Language`` has its own syntax
+            (``"zh-CN"``, ``"fr-CH, fr;q=0.9, en;q=0.8"``). The two are unrelated
+            and can be set independently.
         warn_on_deprecated: When the service marks this SDK version deprecated,
             log one warning on the ``image2ppt`` logger. Default True. Set False
             to silence it.
@@ -242,6 +293,7 @@ class Image2PPTClient:
         timeout: float = 60.0,
         session: Optional[requests.Session] = None,
         rate_limit_max_wait: float = 1800.0,
+        accept_language: Optional[str] = None,
         warn_on_deprecated: bool = True,
     ) -> None:
         if not api_key:
@@ -249,12 +301,18 @@ class Image2PPTClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.rate_limit_max_wait = max(0.0, rate_limit_max_wait)
+        self.accept_language = accept_language
         self.warn_on_deprecated = warn_on_deprecated
         self._deprecation_warned = False
         self._session = session or requests.Session()
-        self._session.headers.update(
-            {"Authorization": f"Bearer {api_key}", "User-Agent": _USER_AGENT}
-        )
+        # Set once on the session, like the other two: they belong to every request
+        # this client makes, so no call site has to remember them. Left off entirely
+        # when the caller did not ask for it — an absent header and an empty one are
+        # not the same request.
+        headers = {"Authorization": f"Bearer {api_key}", "User-Agent": _USER_AGENT}
+        if accept_language is not None:
+            headers["Accept-Language"] = accept_language
+        self._session.headers.update(headers)
 
     # ----- public methods ---------------------------------------------- #
     def submit(
@@ -295,8 +353,9 @@ class Image2PPTClient:
             AuthenticationError, InvalidFileError (including the local per-file
             and ``PAYLOAD_TOO_LARGE`` pre-flight failures), TooManySlidesError,
             InsufficientCreditsError, RateLimitedError.
-            ``requests.RequestException`` propagates unchanged for a transport
-            failure — see above on why it is not retried.
+            ``APIConnectionError`` (``APITimeoutError`` for a per-request timeout)
+            for a transport failure — see above on why it is not retried, even
+            though it is marked transient for reads.
         """
         paths = list(paths)
         if not paths:
@@ -400,24 +459,24 @@ class Image2PPTClient:
 
     def get_job(self, job_id: str) -> Job:
         """Fetch the current job state as a ``Job`` snapshot. Raises JobNotFoundError."""
-        resp = self._session.get(
-            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}",
-            timeout=self.timeout,
-        )
+        resp = self._get(f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}")
         return Job.from_dict(self._parse_json(resp))
 
     def cancel(self, job_id: str) -> CancellationResult:
         """Request graceful cancellation of a conversion job.
 
         Pages already running finish and remain in the deliverable; pages that
-        have not started are skipped and refunded. Repeating the call is safe.
-        When ``finalizing`` is true, keep polling with ``get_job`` until the job
-        reaches a terminal state.
+        have not started are skipped and refunded. A page being dispatched at the
+        very moment the cancellation arrives may still run to completion and be
+        billed — the cut is a graceful drain, not a hard stop. Repeating the call
+        is safe. When ``finalizing`` is true, keep polling with ``get_job`` until
+        the job reaches a terminal state.
+
+        Raises ``JobAlreadyFinishedError`` (409) when the request came too late to
+        change anything: either the job had already finished, or it was past the
+        point where cancelling could still change the outcome.
         """
-        resp = self._session.post(
-            f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/cancel",
-            timeout=self.timeout,
-        )
+        resp = self._post(f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/cancel")
         return CancellationResult.from_dict(self._parse_json(resp))
 
     def wait(
@@ -448,14 +507,17 @@ class Image2PPTClient:
                 sleep_for = exc.retry_after if exc.retry_after is not None else interval
                 self._sleep_until(deadline, sleep_for, job_id)
                 continue
-            except (Image2PPTError, requests.RequestException) as exc:
-                # A single poll hit a transient server (5xx) or network error. The job
-                # itself may still be running, so back off and retry until the deadline
-                # instead of aborting the whole wait/convert. Client errors (4xx: job
-                # gone, bad key) are not transient — re-raise them immediately.
-                if isinstance(exc, Image2PPTError) and (
-                    exc.status_code is None or exc.status_code < 500
-                ):
+            except Image2PPTError as exc:
+                # One poll failed. The job itself is very likely still running, so a
+                # failure that could go the other way next time is backed off and
+                # retried until the deadline rather than ending the whole wait.
+                #
+                # The error says which kind it is — see ``Image2PPTError.is_transient``.
+                # Asking the error rather than asking "is this one of ours?" is what
+                # makes a dropped connection or a single slow poll survivable while a
+                # 404, a bad key, or a response we cannot parse still stops
+                # immediately.
+                if not exc.is_transient:
                     raise
                 self._sleep_until(deadline, interval, job_id)
                 interval = min(interval * 1.5, 15.0)
@@ -491,13 +553,11 @@ class Image2PPTClient:
         Raises NotReadyError (409) if the job isn't done, JobNotFoundError (404) if
         it doesn't exist, OutputExpiredError (410) if the deliverable was reaped.
         """
-        resp = self._session.get(
+        resp = self._get(
             f"{self.base_url}/api/v1/jobs/{quote(job_id, safe='')}/download",
             stream=True,
-            timeout=self.timeout,
         )
         try:
-            self._warn_if_deprecated(resp)
             if not resp.ok:
                 self._raise_for_error(resp)
             # Same directory as the destination, so the rename is atomic rather than
@@ -509,9 +569,14 @@ class Image2PPTClient:
             )
             try:
                 with os.fdopen(fd, "wb") as out:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            out.write(chunk)
+                    # The body arrives after the status line, so a drop here is a
+                    # second, separate chance to fail — one the request's own
+                    # wrapping cannot see, since the request itself already
+                    # succeeded.
+                    with _transport_errors(f"the deliverable for job {job_id}"):
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                out.write(chunk)
                 os.replace(partial, dest_path)
             except BaseException:
                 try:
@@ -614,13 +679,44 @@ class Image2PPTClient:
 
     def account(self) -> Dict[str, Any]:
         """Return account info: ``{"email": ..., "credits": available_credits}``."""
-        resp = self._session.get(
-            f"{self.base_url}/api/v1/account",
-            timeout=self.timeout,
-        )
+        resp = self._get(f"{self.base_url}/api/v1/account")
         return self._parse_json(resp)
 
     # ----- internal helpers -------------------------------------------- #
+    def _get(self, url: str, **kwargs: Any) -> requests.Response:
+        """``session.get``, through the one wrapper every exchange goes through."""
+        return self._send(self._session.get, url, **kwargs)
+
+    def _post(self, url: str, **kwargs: Any) -> requests.Response:
+        """``session.post``, through the one wrapper every exchange goes through."""
+        return self._send(self._session.post, url, **kwargs)
+
+    def _send(self, send: Any, url: str, **kwargs: Any) -> requests.Response:
+        """Make one call: the timeout, the transport translation, the version notice.
+
+        The three things that belong to *every* request this client makes, applied
+        in the one place all of them pass through rather than remembered at each
+        call site.
+
+        ``timeout`` is a default, not an override, so a caller may still pass their
+        own. It has to be applied here because ``requests`` has none of its own: a
+        call site that forgot it would block until the peer hung up, which on a
+        wedged connection is never.
+
+        The transport translation itself lives in ``_transport_errors`` — see there
+        for why every block that touches the socket has to go through it, not just
+        this one.
+
+        It takes the bound ``.get`` / ``.post`` rather than calling a generic
+        ``.request``: those two methods are the whole surface an injected session
+        has to provide, and widening it would break every caller who supplies one.
+        """
+        kwargs.setdefault("timeout", self.timeout)
+        with _transport_errors(f"the request to {url}"):
+            resp = send(url, **kwargs)
+        self._warn_if_deprecated(resp)
+        return resp
+
     def _submit_batch(
         self,
         paths: Sequence[str],
@@ -715,19 +811,22 @@ class Image2PPTClient:
         """POST the multipart submission exactly once.
 
         **A failed submission is never retried automatically**, and that is
-        deliberate. When ``requests`` raises ``ConnectionError`` the only thing it
-        proves is that this exchange broke; it does *not* prove the request body
-        was incomplete. The server may have received the whole body, created the
-        job and reserved the credits, and then lost the connection on the way back
-        with the response. Those two cases are indistinguishable from here, and
-        retrying the second one submits the same files twice and charges twice.
+        deliberate. An ``APIConnectionError`` proves only that this exchange broke;
+        it does *not* prove the request body was incomplete. The server may have
+        received the whole body, created the job and reserved the credits, and then
+        lost the connection on the way back with the response. Those two cases are
+        indistinguishable from here, and retrying the second one submits the same
+        files twice and charges twice.
 
         Telling them apart needs an idempotency key the API does not offer, so the
         error goes straight to the caller: check ``account()`` or your job list to
         see whether the job exists, then decide whether to resend.
 
-        (Rate limiting is a different animal — a 429 is the server explicitly
-        saying it did *not* take the submission, so ``submit_all`` does retry that.)
+        That is why ``is_transient`` has no say on this path. It answers "is this
+        read worth repeating", and a connection error is — reading twice costs
+        nothing. Submitting twice costs money, so the submit path stays on its own
+        rule and only a 429 is retried: a 429 is the server explicitly saying it
+        did *not* take the submission.
         """
         opened = []
         multipart = []
@@ -739,11 +838,10 @@ class Image2PPTClient:
                     handle = open(item.path, "rb")
                     opened.append(handle)
                     multipart.append(("files", (item.filename, handle, item.mime)))
-            return self._session.post(
+            return self._post(
                 f"{self.base_url}/api/v1/jobs",
                 files=multipart,
                 data=data,
-                timeout=self.timeout,
             )
         finally:
             for handle in opened:
@@ -785,11 +883,29 @@ class Image2PPTClient:
         time.sleep(min(seconds, remaining, _MAX_SLEEP))
 
     def _parse_json(self, resp: requests.Response) -> Dict[str, Any]:
-        """Return the JSON body on 2xx; otherwise raise the mapped exception."""
-        self._warn_if_deprecated(resp)
+        """Return the JSON body on 2xx; otherwise raise the mapped exception.
+
+        A 2xx that is not JSON is not this API answering — it is a captive portal,
+        a proxy login page, or a CDN error page wearing a success status. That is a
+        ``MalformedResponseError`` rather than a raw ``ValueError``, so it stays
+        catchable as an ``Image2PPTError`` like everything else here.
+        """
         if not resp.ok:
             self._raise_for_error(resp)
-        return resp.json()
+        # The parsing guard sits *inside* the transport one on purpose. ``requests``
+        # raises a ``JSONDecodeError`` that is both a ``ValueError`` and one of its
+        # own transport exceptions, so a body that arrived intact and merely is not
+        # JSON has to be claimed by the inner handler before the outer one can
+        # mistake it for a dropped connection.
+        with _transport_errors(f"the HTTP {resp.status_code} response body"):
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise MalformedResponseError(
+                    f"expected a JSON response but could not parse the body (HTTP "
+                    f"{resp.status_code})",
+                    status_code=resp.status_code,
+                ) from exc
 
     def _warn_if_deprecated(self, resp: requests.Response) -> None:
         """Log at most one warning if this SDK version has been marked deprecated.
@@ -832,21 +948,30 @@ class Image2PPTClient:
         """Parse the ``{"error": {code, message}}`` envelope and raise the mapped error."""
         code: Optional[str] = None
         message: Optional[str] = None
-        try:
-            body = resp.json()
-            err = body.get("error") if isinstance(body, dict) else None
-            if isinstance(err, dict):
-                code = err.get("code")
-                message = err.get("message")
-        except ValueError:
-            pass  # non-JSON error body (e.g. a gateway HTML page): fall back to status text
+        # Reading the envelope is itself a read off the socket: on a ``download``
+        # the response was opened with ``stream=True``, so the error body has not
+        # arrived yet and the connection can still die here. A body that failed to
+        # *parse* is nothing worth reporting — the status code already says what
+        # happened — but a body that never finished arriving is a transport failure
+        # and has to be raised as one rather than silently reported as the status.
+        with _transport_errors(f"the HTTP {resp.status_code} error body"):
+            try:
+                body = resp.json()
+                err = body.get("error") if isinstance(body, dict) else None
+                if isinstance(err, dict):
+                    code = err.get("code")
+                    message = err.get("message")
+            except ValueError:
+                pass  # non-JSON error body (a gateway HTML page): fall back to status text
         message = message or f"request failed (HTTP {resp.status_code})"
 
         raise exception_for(
             status_code=resp.status_code,
             code=code,
             message=message,
-            retry_after=self._parse_retry_after(resp.headers.get("Retry-After")),
+            retry_after=self._parse_retry_after(
+                _response_header(resp.headers, "Retry-After")
+            ),
         )
 
     @staticmethod

@@ -172,6 +172,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 | `createdAt` / `completedAt` | UTC 创建时间 / 完成时间，格式为 `YYYY-MM-DD HH:MM:SS`（未完成时 `completedAt` 为 `null`）。 |
 | `downloadUrl` | **仅当 `completed` 且成品仍在保留期内**时给出，是下载端点的相对路径；其余状态不返回这个字段。 |
 | `error` | **仅当 `failed`** 时给出，形如 `{"code": "...", "message": "..."}`。 |
+| `pageResults` | **仅当 `completed` 或 `failed`** 时给出，逐页交账，见下。 |
 
 **失败时的样子**
 
@@ -180,14 +181,70 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
   "jobId": "job_abc123",
   "status": "failed",
   "progress": 0,
-  "slideCount": 12,
+  "slideCount": 2,
   "creditsUsed": 0,
-  "creditsRefunded": 12,
+  "creditsRefunded": 2,
   "createdAt": "2026-07-07 08:00:00",
   "completedAt": "2026-07-07 08:01:00",
-  "error": { "code": "CONVERSION_FAILED", "message": "转换失败，请稍后重试" }
+  "error": { "code": "CONVERSION_FAILED", "message": "转换失败，请稍后重试" },
+  "pageResults": [
+    {
+      "pageNumber": 1,
+      "status": "failed",
+      "error": { "code": "CONVERSION_FAILED", "message": "转换失败，请稍后重试", "retryable": true }
+    },
+    {
+      "pageNumber": 2,
+      "status": "failed",
+      "error": { "code": "PAGE_NOT_ATTEMPTED", "message": "该页未开始转换", "retryable": true }
+    }
+  ]
 }
 ```
+
+#### 逐页结果 `pageResults`
+
+任务到终局（`completed` 或 `failed`）后，这个数组按页码顺序列出**每一页**的结果，长度等于 `slideCount`。在此之前不返回——任务还在跑的时候，「这页没转出来」和「这页还没轮到」区分不了。
+
+（2026 年 9 月之前提交的任务没有逐页记录，这个字段也不返回。判断时请检查字段是否存在，不要假定终局任务一定带它。）
+
+`creditsRefunded` 只回答「有几页没转出来」，`pageResults` 回答「是**哪几页**」。
+
+| 字段 | 说明 |
+|---|---|
+| `pageNumber` | 页码，从 1 开始，与你提交的顺序一致（PDF 按拆出来的页序）。 |
+| `status` | `converted`：这一页转成了可编辑内容。`failed`：没转成。 |
+| `error` | 仅当 `status` 为 `failed`。含 `code`、`message` 和 `retryable`。 |
+
+失败页有两种去向，靠 `error.code` 区分：
+
+- `PAGE_NOT_ATTEMPTED` — 这一页**从没开始转**，因为任务先一步结束了，成品里**没有**这一页，积分已退。
+- 其余错误码 — 这一页转过但没成，成品里保留的是**这一页的原图**（不可编辑），积分按「计费与退款」规则处理。
+
+`retryable` 表示同样的图再交一次有没有可能成功。**目前逐页结果里的每个失败页都是 `true`**——下面那三个码要么是一次性的故障，要么是这页压根没轮到，重交都有意义。仍然请判断这个字段而不要写死 `true`：以后新增的码可能带 `false`。
+
+#### 错误码
+
+**任务级** `error.code`（整单失败时给出）只有两个值，跟这个接口发布时一样：
+
+| code | 含义 |
+|---|---|
+| `JOB_CANCELLED` | 你自己取消或放弃了这个任务，且没有可交付页面。 |
+| `CONVERSION_FAILED` | 其余所有失败原因。 |
+
+**逐页** `pageResults[].error.code` 用的是更细的一套：
+
+| code | 含义 | `retryable` |
+|---|---|---|
+| `CONVERSION_FAILED` | 这页转过但没成，原因不细分。 | `true` |
+| `CONVERSION_TIMEOUT` | 这页超过时间预算被中断。 | `true` |
+| `PAGE_NOT_ATTEMPTED` | 这页没开始转（任务先一步结束）。 | `true` |
+
+为什么两层粒度不同：任务级那个字段从接口发布起就只有两个值，客户已经部署的代码是照着写的，扩大取值会让那些分支静默失效。细分放在 `pageResults` 里——那是新字段，没有历史包袱。
+
+`message` 是给人看的一句话，会跟着你的 `Accept-Language` 走，**不要拿它做分支判断**——请判断 `code`。
+
+两层都可能新增错误码。请把认不出的 `code` 当作 `CONVERSION_FAILED` 处理。
 
 **可能的错误**
 
@@ -204,7 +261,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 请求服务器停止这个任务的后续工作。这个动作是**收尾式取消**，不是硬切：
 
 - 已经开始转换的页面会继续完成，成功页面会保存在最终 PPTX 中并正常计费。
-- 尚未开始的页面不会再运行，对应积分退回。
+- 尚未开始的页面不会再运行，对应积分退回。取消到达的那一刻恰好正在派发的页可能仍会跑完，按已完成页计费。
 - 请求可以安全重试，不会重复取消或重复结算。
 
 **任务仍在收尾** `202 Accepted`
@@ -229,7 +286,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 | HTTP | code | 含义 |
 |---|---|---|
 | 404 | `JOB_NOT_FOUND` | 任务号不存在、不是 API 任务，或不属于本账户。 |
-| 409 | `JOB_ALREADY_FINISHED` | 取消请求到达前任务已经自然结束。 |
+| 409 | `JOB_ALREADY_FINISHED` | 任务已经结束，或已进入收尾、取消不再能改变结果。 |
 | 500 | `JOB_CANCEL_FAILED` | 服务端暂时无法接受取消请求，可安全重试。 |
 
 ---
@@ -347,7 +404,7 @@ Link: <https://github.com/shrektan/image2ppt-sdk/blob/main/CHANGELOG.md>; rel="d
 
 ## 官方 SDK
 
-我们提供 Python 和 Node.js/TypeScript 两个官方客户端，都封装了提交、轮询、取消、下载、429 退避和错误映射。源码、示例和完整说明在 GitHub：<https://github.com/shrektan/image2ppt-sdk>。
+我们提供 Python 和 Node.js/TypeScript 两个官方客户端，都封装了提交、轮询、取消、下载、429 退避和错误映射。源码、示例、各版本支持的功能和完整说明在 GitHub：<https://github.com/shrektan/image2ppt-sdk>。
 
 > SDK 只在**服务端**使用。别把 API 密钥放进浏览器或任何用户能看到的地方——谁都能读出来。
 
@@ -410,6 +467,8 @@ try {
 
 ## 错误码总表
 
+`message` 是给人读的，语言**只**跟着请求的 `Accept-Language` 走：说中文就给中文，不带这个头或者说别的语言一律给英文。浏览器 cookie、界面语言头这些都不影响它——从浏览器里调这个接口也一样，你声明什么就是什么。要在代码里分支请用 `code`，它不随语言变。
+
 | HTTP | code | 出现场景 |
 |---|---|---|
 | 401 | `INVALID_API_KEY` | 密钥无效或缺失（所有端点）。 |
@@ -427,7 +486,7 @@ try {
 | 413 | `PAYLOAD_TOO_LARGE` | 同一请求的文件内容合计超过 45MB（提交）。 |
 | 429 | `RATE_LIMITED` | 触发限流，带 `Retry-After` 头（提交）。轮询状态不限流。 |
 | 404 | `JOB_NOT_FOUND` | 任务号不存在或不属于本账户（查询、取消、下载）。 |
-| 409 | `JOB_ALREADY_FINISHED` | 取消请求到达前任务已经自然结束（取消）。 |
+| 409 | `JOB_ALREADY_FINISHED` | 任务已经结束，或已进入收尾、取消不再能改变结果（取消）。 |
 | 409 | `NOT_READY` | 任务未完成就来下载（下载）。 |
 | — | `JOB_CANCELLED` | 取消已结算且没有可交付页面（任务状态里的 `error.code`）。 |
 | 410 | `OUTPUT_EXPIRED` | 成品已过保留期被清理（下载）。 |

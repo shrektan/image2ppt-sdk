@@ -11,6 +11,8 @@ import type { Job } from "./types.js";
 export interface ErrorInit {
   statusCode?: number;
   code?: string;
+  /** The underlying error this one wraps, kept reachable as `err.cause`. */
+  cause?: unknown;
 }
 
 /** Base class for all client errors. */
@@ -27,14 +29,105 @@ export class Image2PPTError extends Error {
   submittedJobs: Job[] = [];
 
   constructor(message: string, init: ErrorInit = {}) {
-    super(message);
+    super(message, "cause" in init ? { cause: init.cause } : undefined);
     // new.target gives the concrete subclass, so subclasses get the right name
     // without each redefining it.
     this.name = new.target.name;
     this.statusCode = init.statusCode;
     this.code = init.code;
   }
+
+  /**
+   * Whether retrying the same call later could plausibly succeed.
+   *
+   * `wait()` polls a job for as long as half an hour, and this is the flag it
+   * consults to decide whether one failed poll should be backed off and retried
+   * or should end the wait. It used to ask a different question — "did this error
+   * come out of this SDK?" — and got both halves wrong: an unexpected bug in this
+   * client was retried for the whole deadline, while a single slow status poll
+   * (which this SDK reports as its own error) aborted the wait outright.
+   *
+   * The default is the HTTP rule: a 5xx is the server's own problem and may clear
+   * on its own, everything else — a bad key, a job that does not exist, a
+   * rejected file — will still be wrong in fifteen seconds. Subclasses that know
+   * better override it.
+   */
+  get isTransient(): boolean {
+    return this.statusCode != null && this.statusCode >= 500;
+  }
 }
+
+/**
+ * The request never completed at the transport level.
+ *
+ * A connection refused or reset, a DNS or TLS failure, a response body that
+ * stopped arriving. The underlying error is kept as `cause`.
+ *
+ * **This does not tell you whether the server acted on the request.** For a
+ * submission it is genuinely ambiguous — the job may not exist, or it may exist
+ * with credits reserved and only the reply lost — which is why `submit` never
+ * retries one for you. Polling a job's status has no such cost, so `wait()` does
+ * back these off and retry (`isTransient` is true).
+ */
+export class APIConnectionError extends Image2PPTError {
+  override get isTransient(): boolean {
+    return true;
+  }
+}
+
+/**
+ * A single HTTP request went `timeoutMs` with no data moving in either
+ * direction (`code: "REQUEST_TIMEOUT"`).
+ *
+ * `timeoutMs` is an **idle** timeout, not a cap on how long a request may take:
+ * a large upload or download that keeps making progress is never cut off by it,
+ * however long it runs in total.
+ *
+ * **Not the same as `Image2PPTTimeoutError`**, and the two are deliberately kept
+ * apart. This one is a transport failure — one request stalled — so it is
+ * transient and `wait()` retries it. `Image2PPTTimeoutError` means `wait()` ran
+ * out of its own overall deadline while the job was still running perfectly
+ * well; nothing failed, and there is nothing to retry.
+ */
+export class APITimeoutError extends APIConnectionError {
+  /**
+   * `code` defaults here rather than at each `throw`, the way the Python class
+   * does it. Every construction site meant the same thing by it, and one that
+   * forgot would have produced an `APITimeoutError` with no code at all for a
+   * caller branching on codes.
+   */
+  constructor(message: string, init: ErrorInit = {}) {
+    super(message, { code: "REQUEST_TIMEOUT", ...init });
+  }
+}
+
+/**
+ * The server answered, but this client cannot make sense of the answer.
+ *
+ * Either a 2xx body that is not JSON at all — a captive-portal login page, a CDN
+ * error page, a proxy that replaced the response — or a JSON body missing a
+ * field the API contract guarantees.
+ *
+ * **Never transient**, on purpose. A response that cannot be parsed is a sign
+ * that something between this client and the API is rewriting traffic, and no
+ * amount of waiting fixes it. Retrying would mean `wait()` silently swallowing
+ * the evidence for half an hour and then reporting a timeout instead.
+ */
+export class MalformedResponseError extends Image2PPTError {
+  override get isTransient(): boolean {
+    return false;
+  }
+}
+
+/**
+ * The service failed on its own side (any 5xx).
+ *
+ * The contract's advice for these is to retry later, so `isTransient` is true and
+ * `wait()` backs off and polls again rather than giving up. Subclasses
+ * `Image2PPTError` like every other error here, so existing
+ * `catch (e) { if (e instanceof Image2PPTError) ... }` code is unaffected.
+ */
+export class ServerError extends Image2PPTError {}
 
 /** API key is missing, invalid, or the account is gone (401 / 403). */
 export class AuthenticationError extends Image2PPTError {}
@@ -128,6 +221,11 @@ export class RateLimitedError extends Image2PPTError {
     super(message, init);
     this.retryAfter = init.retryAfter;
   }
+
+  /** "Not right now" is the one server answer that says to come back and ask again. */
+  override get isTransient(): boolean {
+    return true;
+  }
 }
 
 /**
@@ -149,6 +247,11 @@ export class JobCancelledError extends JobFailedError {}
 /**
  * `wait` exceeded its `timeout` before the job reached a terminal state. This does
  * not mean the job failed — it may still be running. Re-`wait` on the `jobId` later.
+ *
+ * **Not the same as `APITimeoutError`**, which means one HTTP request stalled with
+ * no data moving for `timeoutMs`. That one is a transport failure and `wait()`
+ * retries it internally; this one is `wait()` itself running out of the deadline
+ * the caller gave it, with nothing having gone wrong at all.
  */
 export class Image2PPTTimeoutError extends Image2PPTError {
   readonly jobId?: string;
@@ -160,7 +263,7 @@ export class Image2PPTTimeoutError extends Image2PPTError {
 }
 
 // Server error code -> exception class. Unlisted codes fall back to the status-code
-// map, then to the base class.
+// map, then to `ServerError` for any 5xx, then to the base class.
 const CODE_TO_CLASS: Record<string, new (m: string, i?: ErrorInit) => Image2PPTError> = {
   INVALID_API_KEY: AuthenticationError,
   API_KEY_REQUIRED: AuthenticationError,
@@ -207,7 +310,13 @@ export function exceptionFor(args: {
       retryAfter,
     });
   }
+  // A 5xx the maps do not claim is the service's own failure: retrying later is
+  // the contract's advice, so it gets a class that says so. Codes that already map
+  // to a specific class keep doing so, whatever status they arrive with — callers
+  // branch on `code`, and that must not change with the status line.
   const cls =
-    (code && CODE_TO_CLASS[code]) || STATUS_TO_CLASS[statusCode] || Image2PPTError;
+    (code && CODE_TO_CLASS[code]) ||
+    STATUS_TO_CLASS[statusCode] ||
+    (statusCode >= 500 ? ServerError : Image2PPTError);
   return new cls(message, { statusCode, code });
 }

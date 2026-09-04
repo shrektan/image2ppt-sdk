@@ -3,6 +3,141 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## 0.5.0
+
+Error handling, end to end. Both clients now report **which pages** of a job did
+not convert, and the promise both READMEs make — *every exception this client
+raises subclasses `Image2PPTError`* — is finally true.
+
+### Added
+
+- **Both clients** — `page_results` / `pageResults` on a job snapshot: the
+  per-page ledger the API returns once a job is terminal. Each entry says whether
+  that page converted and, when it did not, why — with a `retryable` flag.
+  `creditsRefunded` only ever told you *how many* pages were lost; this tells you
+  *which ones*.
+  `PAGE_NOT_ATTEMPTED` is the code worth branching on: that page is **not in the
+  delivered deck at all**, while every other failed page is present as the
+  original image. The field is absent — `None` / `null`, never an empty list —
+  while a job is still running and for jobs submitted before September 2026, so
+  check that it is present rather than assuming a terminal job carries it.
+- **Both clients** — `APIConnectionError` for transport failures (connection
+  refused or reset, DNS or TLS failure, a body that stopped arriving), with
+  `APITimeoutError` as its subclass for a single request exceeding the
+  per-request timeout. The underlying error is preserved as the cause.
+- **Both clients** — `MalformedResponseError` for a response this client cannot
+  make sense of: a 2xx body that is not JSON (a proxy login page, a captive
+  portal), or a body missing a field the contract guarantees.
+- **Both clients** — `ServerError` for any 5xx. It subclasses `Image2PPTError`,
+  so existing `except Image2PPTError` / `catch (e instanceof Image2PPTError)`
+  code is unaffected; it simply lets you tell "the service had a problem, retry
+  later" from a request you got wrong.
+- **Both clients** — `accept_language` / `acceptLanguage` client option. Error
+  `message` text follows the request's `Accept-Language`; these clients sent no
+  such header, so callers always got English. Unset by default, which keeps
+  today's behavior. It is **not** the same thing as the per-submission `locale`:
+  `locale` picks the language of the generated deck, `accept_language` picks the
+  language of error messages.
+
+### Fixed
+
+- **Both clients** — a network blip while waiting on a job is retried again,
+  instead of aborting the wait. Both clients decided whether a polling failure
+  was worth retrying by asking *"is this exception one of ours?"*, which was
+  never a sound test. Errors now carry an explicit `is_transient` /
+  `isTransient` marker and `wait()` branches on that.
+- **Node** — a status poll that hit the per-request timeout aborted the whole
+  `wait()` rather than backing off and retrying, contradicting the client's own
+  documented behavior. Covered by the same fix.
+- **Node** — `timeoutMs` no longer kills a large transfer that is progressing
+  normally. It was applied as a hard cap on the entire request, so a 45MB upload
+  or a large PPTX download over a slow link was cut off at 60 seconds. It is now
+  an **idle** timeout — time with no data moving — which is what the Python
+  client's equivalent has always meant. The two clients now agree.
+- **Node** — a job status body missing `jobId` or `status` threw nothing at all:
+  it produced a job object with undefined fields, and `wait()` then polled it
+  until the 30-minute deadline. It now raises `MalformedResponseError`
+  immediately, matching what the cancellation response has always done.
+- **Python** — transport failures, non-JSON bodies, and job bodies missing
+  required fields reached callers as `requests.ConnectionError`,
+  `requests.exceptions.JSONDecodeError`, and `KeyError` respectively — none of
+  which a documented `except Image2PPTError` catches.
+- **Python** — a download that failed *and* then lost the connection while the
+  error explanation was still arriving raised a bare
+  `requests.ChunkedEncodingError`. The download response is streamed, so its
+  error body is read separately from the request itself and had no wrapping of
+  its own.
+- **Both clients** — the two clients disagreed on malformed bodies: a `jobId` of
+  `null`, a page number sent as the string `"3"`, and a non-string page status
+  were accepted by one client and rejected by the other. All three are now
+  rejected by both, as is a page `error` sent as an array. A `false` value for
+  `cancellationRequested` / `finalizing` is a real value, not a missing field,
+  in both. The same goes for the fields *inside* a page `error`: a `code` that
+  is not a non-empty string reads as `CONVERSION_FAILED`, a `message` that is
+  not a string reads as empty (a number is not turned into a sentence), and
+  `retryable` is now a real boolean or `false` — never truthiness. That last one
+  is the one that mattered: the same bad payload used to tell a Node caller a
+  page was worth submitting again and a Python caller that it was not.
+- **Both clients** — a job-level `error` that is present but is not an object now
+  reads as no error, the same rule the per-page `error` follows. Python crashed
+  outright on such a body: `wait()` asked the value for its `code` and raised a
+  bare `AttributeError`, which no documented `except Image2PPTError` catches.
+  Node did not crash but kept the value in a field typed as an object. The
+  original is still on `raw` in both.
+- **Python** — the `pageResults` example in the README and in
+  `examples/step_by_step.py` read `page.error.code` with no guard, so it raised
+  `AttributeError` on a failed page whose `error` this client could not read —
+  a value the new parsing rule above produces. The Node examples already guarded.
+- **Node** — `Job.cancellationRequested` is coerced to a real boolean instead of
+  passing any non-null value through into a field declared `boolean`. The
+  cancellation response has always coerced; the job snapshot did not.
+
+### Changed
+
+- **Both clients** — a 5xx now raises `ServerError` rather than the base
+  `Image2PPTError`. `ServerError` subclasses it, so `except Image2PPTError`
+  keeps working; only code matching on the exact class changes behavior.
+- **Both clients** — a transport failure now raises `APIConnectionError` rather
+  than the underlying library's exception. Code that caught
+  `requests.ConnectionError` or Node's `TypeError` directly must be updated.
+  **Submission behavior is unchanged**: a submission whose connection broke is
+  still never retried automatically, because a lost response cannot be told
+  apart from a rejected one and retrying could charge twice.
+- **Node** — `wait()` no longer swallows an unexpected exception. Its old test read
+  "not one of ours" as "worth retrying", so a bug inside the client was retried
+  silently until the overall deadline and then surfaced as a timeout. It now ends
+  the wait and raises. This is the half of the `isTransient` switch that makes
+  *fewer* things retryable, and it is the one to read before upgrading.
+- **Python** — a poll whose body will not parse now ends `wait()` on the first
+  occurrence. `requests` raises its `JSONDecodeError` as a `RequestException`, and
+  the old loop retried every `RequestException` to the deadline; it is now a
+  `MalformedResponseError`, which is deliberately not transient. Worth knowing if
+  you sit behind a proxy that occasionally answers with an HTML page.
+- **Node (types)** — `Job.pageResults` is new and is declared required rather than
+  optional, so a `Job`-shaped object literal in your own code has to carry it.
+  `Image2PPTError` accepts a `cause`, and `ErrorInit` — already exported from the
+  errors module — is now re-exported from the package entry point.
+- **Docs** — `docs/api.md` / `docs/api.zh.md` re-synced with the published
+  contract: per-page results, the finer per-page failure codes, the
+  `Accept-Language` rule, and clarified cancellation wording (a page being
+  dispatched as cancellation arrives may still run to completion and be billed;
+  `JOB_ALREADY_FINISHED` also covers a job past the point where cancellation
+  could change the outcome).
+
+### Deployment Notes
+
+**Data impact**: None — the SDKs are thin HTTP clients with no server-side logic
+and no persisted state.
+**Environment changes**: None — runtime dependencies are unchanged (Python:
+`requests` + `Pillow`; Node: `sharp`), and the minimum Python / Node versions are
+unchanged.
+**Manual operations**: None for consumers, but read **Changed** above before
+upgrading if you catch transport exceptions or match on the exact class of a 5xx.
+`pip install -U image2ppt` / `npm install image2ppt@latest` otherwise.
+**Rollback plan**: PyPI and npm do not allow republishing a version number. If
+0.5.0 turns out to be broken, yank/deprecate it and ship 0.5.1; do not attempt to
+overwrite 0.5.0.
+
 ## 0.4.0
 
 Both clients can now ask the service to stop a conversion job that is already

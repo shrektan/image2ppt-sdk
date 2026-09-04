@@ -64,9 +64,68 @@ try {
 ```
 
 Cancellation is graceful: pages already running finish and are billed if successful;
-pages that have not started are skipped and refunded. The call is idempotent. A job
-with retained pages finishes as `completed`; without any deliverable it finishes as
-`failed`, and `wait()` throws `JobCancelledError` (a subclass of `JobFailedError`).
+pages that have not started are skipped and refunded. A page being dispatched at the
+very moment the request arrives may still run to completion and be billed. The call
+is idempotent. A job with retained pages finishes as `completed`; without any
+deliverable it finishes as `failed`, and `wait()` throws `JobCancelledError` (a
+subclass of `JobFailedError`). `JobAlreadyFinishedError` covers both a job that
+finished on its own and one already past the point where cancelling could change the
+outcome.
+
+## Which pages made it
+
+Once a job is terminal, `job.pageResults` says what happened to each page, in page
+order, one entry per page:
+
+```ts
+for (const page of done.pageResults ?? []) {
+  if (page.status === "converted") continue;
+  if (page.error?.code === "PAGE_NOT_ATTEMPTED") {
+    // This page never started. It is NOT in the deck at all.
+    console.log(`page ${page.pageNumber} is missing from the deck`);
+  } else {
+    // Attempted and failed. The page IS in the deck — as the original image,
+    // not as editable content.
+    console.log(`page ${page.pageNumber} came through as a flat image`);
+  }
+  if (page.error?.retryable) console.log("  worth submitting again");
+}
+```
+
+- **`null` is not an empty list.** `pageResults` is `null` when the service did not
+  send the field at all — while the job is still running, and for a job submitted
+  before September 2026. An empty array would mean the job had no
+  pages. Check for `null` rather than assuming every terminal job carries a ledger.
+- **The two kinds of failed page call for different things.** `PAGE_NOT_ATTEMPTED`
+  means the page is absent from the deck; every other code means it is present as the
+  original image. `creditsRefunded` only tells you *how many* pages did not convert —
+  this tells you which, and what became of them.
+- **Codes**: `CONVERSION_FAILED`, `CONVERSION_TIMEOUT`, `PAGE_NOT_ATTEMPTED`. Treat
+  anything else as `CONVERSION_FAILED`. The job-level `error.code` is deliberately
+  coarser and still has only its two values — the finer reasons live here.
+- **Read `retryable`, don't assume it.** Every code today says `true`; a code added
+  later may not.
+
+## Error messages in your language
+
+Error `message` text follows the request's `Accept-Language` header. This client sends
+none by default, so messages come back in English. To change that:
+
+```ts
+const client = new Image2PPTClient({
+  apiKey: process.env.IMAGE2PPT_API_KEY!,
+  acceptLanguage: "zh-CN",
+});
+```
+
+> **`acceptLanguage` is not `locale`, and the two are easy to mix up.** The
+> per-submission `locale` decides what language the **generated deck** is written in.
+> The client-level `acceptLanguage` decides what language a **failure is explained to
+> you** in. They are unrelated — an English deck with Chinese error messages is a
+> perfectly sensible combination. `acceptLanguage` is a free-form HTTP header value
+> (`"fr, en;q=0.8"` is fine), not one of the two deck languages.
+
+Either way, branch on `code`, never on `message`.
 
 Check your balance:
 
@@ -90,6 +149,8 @@ console.log(email, "credits:", credits);
 - **Every request identifies the client** with a `User-Agent` of `image2ppt-node/<version>`. The service uses this to tell SDK versions apart — it is not part of authentication and never changes a request's outcome.
 - **A deprecated SDK version logs one warning.** If this version is below the lowest the service still supports, the response carries a `Deprecation` header and the client warns once (`console.warn`). Pass `warnOnDeprecated: false` to `Image2PPTClient` to silence it.
 - **Time units.** `pollIntervalMs` and `timeoutMs` are in **milliseconds** (idiomatic for Node's timers).
+- **The 60-second request timeout is idle time, not total time.** `timeoutMs` (default 60000) is how long one request may go with **no data moving in either direction** — it is not a cap on how long a request may take. A 40MB upload or a large PPTX download that keeps making progress runs as long as it needs to; only a transfer that actually stalls is given up on, as `APITimeoutError`. A request that never gets a response at all is covered by the same clock. This matches the Python client's read timeout, so the two SDKs behave the same way on a slow link.
+- **Every failure is an `Image2PPTError`.** A refused connection, a reset mid-download, a 2xx that comes back as a proxy's HTML login page, a job body missing its own id — all of them arrive as an SDK error with the original kept on `.cause`, never as a raw `TypeError: fetch failed` or `SyntaxError`.
 
 > Both the Node and Python SDKs pre-compress images that need processing before upload. PNG/JPEG files already at most 1MiB with a longest edge at most 2000px upload byte-for-byte unchanged. Other PNG/JPEG files, and all WebP/GIF files, may be resized, flattened onto white, and sent as JPEG; PDFs are never compressed or decoded and are streamed unchanged.
 
@@ -147,6 +208,10 @@ for (;;) {
 
 Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `message`. Branch on `code`, not `message`.
 
+Every error also carries **`isTransient`** — whether **repeating this exact read** later could plausibly succeed. It is what `wait()` uses to decide whether a failed status poll should be backed off and retried or should end the wait: `true` for a 5xx, a dropped connection and a stalled request, `false` for a bad key, a job that does not exist, or a response this client cannot parse.
+
+**It says nothing about submitting.** `submit()` is never retried on this signal, and neither should your code be: a lost response cannot be told apart from a submission the server accepted, and there is no idempotency key, so resending the same files can create the same job twice and **charge you twice**. Only a `RateLimitedError` is retried on the submit path — a 429 is the service explicitly saying it took nothing.
+
 | Class | HTTP | code |
 |---|---|---|
 | `AuthenticationError` | 401 / 403 | `INVALID_API_KEY`, `API_KEY_REQUIRED`, `ACCOUNT_DELETED` |
@@ -160,21 +225,28 @@ Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `m
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retryAfter`) |
 | `JobNotFoundError` | 404 | `JOB_NOT_FOUND` |
-| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — cancellation arrived after natural completion |
+| `JobAlreadyFinishedError` | 409 | `JOB_ALREADY_FINISHED` — the job already finished, **or is past the point where cancelling could change the outcome** |
 | `NotReadyError` | 409 | `NOT_READY` |
 | `OutputExpiredError` | 410 | `OUTPUT_EXPIRED` |
 | `JobCancelledError` | — | `JOB_CANCELLED` — cancellation settled with no deliverable; subclasses `JobFailedError` |
 | `JobFailedError` | — | job's `error.code` (thrown by `wait()`; `.job` is the snapshot) |
-| `Image2PPTError` (base) | 5xx | `JOB_CANCEL_FAILED` — the service could not accept the cancellation; **retrying is safe**. Other 5xx codes land here too; branch on `.code`. |
-| `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeoutMs`; job may still be running) |
+| `ServerError` | 5xx | `JOB_CANCEL_FAILED`, `STORAGE_FAILED`, … — the service failed on its own side; **retrying later is reasonable** (`isTransient` is true). Branch on `.code`. |
+| `APIConnectionError` | — | — (the request never completed: connection refused or reset, DNS or TLS failure, a body that stopped arriving; the underlying error is on `.cause`) |
+| `APITimeoutError` | — | `REQUEST_TIMEOUT` — one request went `timeoutMs` with **no data moving**; subclasses `APIConnectionError` |
+| `MalformedResponseError` | — | — (the server answered with something this client cannot read: a 2xx that is not JSON, or a body missing a field the contract guarantees) |
+| `Image2PPTTimeoutError` | — | — (`wait()` exceeded its own `timeoutMs`; job may still be running — **not** a transport failure, and not the same as `APITimeoutError`) |
+
+> **5xx now lands on `ServerError` rather than the base class.** It still subclasses `Image2PPTError`, so `catch (e) { if (e instanceof Image2PPTError) }` is unaffected — only code matching on the exact class or on `e.name` needs updating.
 
 ```ts
-import { Image2PPTError, JobFailedError } from "image2ppt";
+import { APIConnectionError, Image2PPTError, JobFailedError } from "image2ppt";
 
 try {
   await client.convert(paths, "out.pptx");
 } catch (e) {
   if (e instanceof JobFailedError) console.error("failed:", e.code, e.message);
+  // Covers APITimeoutError too — it's a subclass. `.cause` has the real reason.
+  else if (e instanceof APIConnectionError) console.error("network:", e.message);
   else if (e instanceof Image2PPTError) console.error("request error:", e.statusCode, e.code);
   else throw e;
 }

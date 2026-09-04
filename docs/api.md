@@ -194,6 +194,7 @@ Poll this endpoint for progress.
 | `createdAt` / `completedAt` | UTC creation / completion time in `YYYY-MM-DD HH:MM:SS` format (`completedAt` is `null` until complete). |
 | `downloadUrl` | Given **only when `completed` and the output is still retained** — a relative path to the download endpoint; omitted otherwise. |
 | `error` | Given **only when `failed`** — `{"code": "...", "message": "..."}`. |
+| `pageResults` | Given **only when `completed` or `failed`** — the per-page outcome, see below. |
 
 **A failed job looks like**
 
@@ -202,14 +203,97 @@ Poll this endpoint for progress.
   "jobId": "job_abc123",
   "status": "failed",
   "progress": 0,
-  "slideCount": 12,
+  "slideCount": 2,
   "creditsUsed": 0,
-  "creditsRefunded": 12,
+  "creditsRefunded": 2,
   "createdAt": "2026-07-07 08:00:00",
   "completedAt": "2026-07-07 08:01:00",
-  "error": { "code": "CONVERSION_FAILED", "message": "Conversion failed, please retry later" }
+  "error": { "code": "CONVERSION_FAILED", "message": "Conversion failed, please retry later" },
+  "pageResults": [
+    {
+      "pageNumber": 1,
+      "status": "failed",
+      "error": {
+        "code": "CONVERSION_FAILED",
+        "message": "Conversion failed, please retry later",
+        "retryable": true
+      }
+    },
+    {
+      "pageNumber": 2,
+      "status": "failed",
+      "error": {
+        "code": "PAGE_NOT_ATTEMPTED",
+        "message": "This page was never started",
+        "retryable": true
+      }
+    }
+  ]
 }
 ```
+
+#### Per-page results — `pageResults`
+
+Once a job is terminal (`completed` or `failed`), this array reports **every**
+page in page order; its length equals `slideCount`. It is omitted before that —
+while a job is still running, "this page didn't convert" and "this page hasn't
+had its turn yet" are not distinguishable.
+
+(It is also omitted for jobs submitted before September 2026, which have no
+per-page record. Check whether the field is present rather than assuming every
+terminal job carries it.)
+
+`creditsRefunded` only tells you **how many** pages did not convert.
+`pageResults` tells you **which ones**.
+
+| Field | Description |
+|---|---|
+| `pageNumber` | 1-based page number, matching the order you submitted (PDFs follow their split page order). |
+| `status` | `converted`: the page became editable content. `failed`: it did not. |
+| `error` | Present only when `status` is `failed`. Carries `code`, `message` and `retryable`. |
+
+A failed page ends up one of two ways, told apart by `error.code`:
+
+- `PAGE_NOT_ATTEMPTED` — the page **never started**, because the job ended first.
+  It is **absent** from the deck, and its credit was refunded.
+- Any other code — the page was attempted and failed. The deck keeps **the
+  original image** for it (not editable), and its credit follows the
+  [Billing & refunds](#billing--refunds) rules.
+
+`retryable` says whether submitting the same image again could succeed. **Every
+failed page this endpoint can return today is `true`** — the three codes below
+are either a transient fault or a page that never got its turn, so resubmitting
+is worth doing in all of them. Still branch on the field rather than hardcoding
+`true`: a code added later may carry `false`.
+
+#### Error codes
+
+The **job-level** `error.code` (given when the whole job failed) has the same two
+values it has had since this endpoint shipped:
+
+| code | Meaning |
+|---|---|
+| `JOB_CANCELLED` | You cancelled or abandoned the job and nothing was deliverable. |
+| `CONVERSION_FAILED` | Every other failure reason. |
+
+**Per-page** `pageResults[].error.code` uses a finer set:
+
+| code | Meaning | `retryable` |
+|---|---|---|
+| `CONVERSION_FAILED` | The page was attempted and did not succeed; the cause is not broken out. | `true` |
+| `CONVERSION_TIMEOUT` | The page was cut off after exceeding its time budget. | `true` |
+| `PAGE_NOT_ATTEMPTED` | The page never started (the job ended first). | `true` |
+
+Why the two levels differ: the job-level field has carried only those two values
+since this endpoint shipped, and deployed client code branches on them — widening
+it would silently stop matching those branches. The finer reasons live in
+`pageResults`, which is new field surface with no such history.
+
+`message` is a human-readable sentence that follows your `Accept-Language`
+header — **do not branch on it**, branch on `code`.
+
+Either level may gain new codes later. Treat a `code` you do not recognise as
+`CONVERSION_FAILED`.
 
 **Possible errors**
 
@@ -228,7 +312,8 @@ Ask the service to stop future work on this job. Cancellation is a **graceful
 drain**, not a hard kill:
 
 - Pages already running finish; successful pages remain in the final PPTX and are billed.
-- Pages that have not started are skipped and refunded.
+- Pages that have not started are skipped and refunded. A page being dispatched
+  at the moment cancellation arrives may still run to completion and be billed.
 - Repeating the request is safe; it never cancels or settles twice.
 
 **Still winding down** — `202 Accepted`
@@ -257,7 +342,7 @@ Cancellation can end in two ways:
 | HTTP | code | Meaning |
 |---|---|---|
 | 404 | `JOB_NOT_FOUND` | Job id does not exist, is not an API job, or belongs to another account. |
-| 409 | `JOB_ALREADY_FINISHED` | The job finished naturally before cancellation was accepted. |
+| 409 | `JOB_ALREADY_FINISHED` | The job already finished, or is past the point where cancellation can change the outcome. |
 | 500 | `JOB_CANCEL_FAILED` | The service could not accept cancellation; retrying is safe. |
 
 ---
@@ -413,8 +498,9 @@ In short: you only pay for **pages that were successfully produced**.
 ## Official SDKs
 
 We provide official Python and Node.js/TypeScript clients that wrap submission,
-polling, cancellation, download, 429 backoff, and error mapping. Source, examples, and full docs
-are on GitHub: <https://github.com/shrektan/image2ppt-sdk>.
+polling, cancellation, download, 429 backoff, and error mapping. Source, examples,
+the features supported by each release, and full docs are on GitHub:
+<https://github.com/shrektan/image2ppt-sdk>.
 
 > Use the SDK **server-side only**. Never put an API key in a browser or anywhere a
 > user can read it — anyone can extract it.
@@ -479,6 +565,8 @@ and full details on each exception are in the GitHub repo's README and examples.
 
 ## Error code reference
 
+`message` is written for people to read, and its language follows the request's `Accept-Language` and nothing else: ask for Chinese and you get Chinese, send no such header or ask for anything else and you get English. Browser cookies and UI-language headers do not affect it, so calling this API from a browser behaves the same as calling it from a script. Branch on `code` in your own code — it never changes with the language.
+
 | HTTP | code | When it happens |
 |---|---|---|
 | 401 | `INVALID_API_KEY` | Key missing or invalid (all endpoints). |
@@ -496,7 +584,7 @@ and full details on each exception are in the GitHub repo's README and examples.
 | 413 | `PAYLOAD_TOO_LARGE` | Total file content in one request exceeds 45MB (submit). |
 | 429 | `RATE_LIMITED` | Rate limit hit, with a `Retry-After` header (submit). Status polling is not rate limited. |
 | 404 | `JOB_NOT_FOUND` | Job id doesn't exist or isn't owned by this account (status, cancel, download). |
-| 409 | `JOB_ALREADY_FINISHED` | The job finished naturally before cancellation was accepted (cancel). |
+| 409 | `JOB_ALREADY_FINISHED` | The job already finished, or is past the point where cancellation can change the outcome (cancel). |
 | 409 | `NOT_READY` | Download requested before the job completed (download). |
 | — | `JOB_CANCELLED` | Cancellation settled with no deliverable pages (`error.code` in job status). |
 | 410 | `OUTPUT_EXPIRED` | Result cleaned up after its retention window (download). |

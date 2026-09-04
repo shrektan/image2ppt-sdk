@@ -55,6 +55,18 @@ async function main(): Promise<number> {
 
   await client.download(job.jobId, "out.pptx");
   console.log(`saved out.pptx — ${job.creditsUsed} credits used, ${job.creditsRefunded} refunded`);
+
+  // creditsRefunded says how many pages did not convert; pageResults says which,
+  // and what became of them. It is null for a job the service sent no ledger for.
+  for (const page of job.pageResults ?? []) {
+    if (page.status === "converted") continue;
+    console.log(
+      page.error?.code === "PAGE_NOT_ATTEMPTED"
+        ? `  page ${page.pageNumber}: never started, so it is not in the deck at all`
+        : `  page ${page.pageNumber}: kept as the original image, not editable`,
+      page.error?.retryable ? "(worth submitting again)" : "",
+    );
+  }
   return 0;
 }
 

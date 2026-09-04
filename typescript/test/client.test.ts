@@ -17,8 +17,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
 
 import {
+  APIConnectionError,
+  APITimeoutError,
   AuthenticationError,
   Image2PPTClient,
+  Image2PPTError,
   Image2PPTTimeoutError,
   InsufficientCreditsError,
   InvalidAspectRatioError,
@@ -28,6 +31,7 @@ import {
   JobCancelledError,
   JobFailedError,
   JobNotFoundError,
+  MalformedResponseError,
   MalformedUploadError,
   MAX_FILE_BYTES,
   MAX_PAGES_PER_JOB,
@@ -36,6 +40,7 @@ import {
   NotReadyError,
   PageRateExceededError,
   RateLimitedError,
+  ServerError,
   type Job as JobType,
   TooManySlidesError,
   UploadAbortedError,
@@ -69,6 +74,26 @@ function fetchScript(handler: (n: number) => Response | Promise<Response>): Reco
 /** A fake fetch that returns the given responses in sequence. */
 function fetchSequence(...responses: Response[]): RecordingFetch {
   return fetchScript((n) => responses[Math.min(n - 1, responses.length - 1)]);
+}
+
+/**
+ * A response whose body dies partway through, like a dropped connection.
+ *
+ * `reason` is handed back so a test can assert the original error survived as the
+ * `cause`; `status` lets the same fixture stand in for an *error* body that stops
+ * arriving, which is read on a different path from a successful one.
+ */
+function explodingBody(
+  reason: Error = new Error("connection reset mid-download"),
+  status = 200,
+): Response {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("PK first half"));
+      controller.error(reason);
+    },
+  });
+  return new Response(stream, { status });
 }
 
 /** Filenames carried by each POST, in order: [[batch1...], [batch2...]]. */
@@ -128,6 +153,129 @@ function client(fetchImpl: typeof fetch): Image2PPTClient {
   return new Image2PPTClient({ apiKey: "i2p_live_test", fetch: fetchImpl });
 }
 
+// --------------------------------------------------------------------------- //
+// Driving the idle watchdog
+//
+// `timeoutMs` is time with no data moving, so a fake fetch that resolves instantly
+// can never exercise it — there is no such thing as an idle instant. The fakes below
+// take real time and honour the abort signal the way a real fetch does: `fetch`
+// rejects with whatever the signal was aborted with, and an aborted response body
+// errors with the same. Delays are tens of milliseconds so the suite stays quick.
+// --------------------------------------------------------------------------- //
+
+/**
+ * The idle budget these tests give the client, and one step of a moving transfer.
+ *
+ * The ratio matters, not the absolute numbers. An upload runs a chunk or two ahead
+ * of what the far end has taken, so the last thing the client produces is followed
+ * by a few more steps of quiet before the response arrives — the budget has to be
+ * several steps wide or a *healthy* transfer trips it at the very end.
+ */
+const IDLE_MS = 200;
+const TICK_MS = 25;
+
+/** A client that gives up after IDLE_MS of nothing moving. */
+function impatientClient(
+  fetchImpl: typeof fetch,
+  options: { acceptLanguage?: string } = {},
+): Image2PPTClient {
+  return new Image2PPTClient({
+    apiKey: "i2p_live_test",
+    fetch: fetchImpl,
+    timeoutMs: IDLE_MS,
+    ...options,
+  });
+}
+
+/** Reject as soon as `signal` aborts, with the reason it carries. */
+function rejectOnAbort(signal: AbortSignal | null | undefined): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    if (!signal) return;
+    if (signal.aborted) reject(signal.reason);
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+}
+
+/** Sleep `ms`, or reject early if `signal` aborts first. */
+function sleepOrAbort(ms: number, signal: AbortSignal | null | undefined): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      },
+      { once: true },
+    );
+  });
+}
+
+/** The signal of the most recent call — what a real fetch would be honouring. */
+function liveSignal(impl: RecordingFetch): AbortSignal | null | undefined {
+  return impl.calls[impl.calls.length - 1]?.init.signal;
+}
+
+/** A fake fetch that never answers — the request that gets no response at all. */
+function stallingFetch(): RecordingFetch {
+  const impl: RecordingFetch = fetchScript(
+    () => rejectOnAbort(liveSignal(impl)) as Promise<Response>,
+  );
+  return impl;
+}
+
+/**
+ * A 200 whose body emits `chunks`, with `gapMs` of quiet before each one.
+ * A `null` chunk stalls the body there until the request is aborted.
+ */
+function streamingFetch(chunks: Array<string | null>, gapMs: number): RecordingFetch {
+  const impl: RecordingFetch = fetchScript(() => {
+    const signal = liveSignal(impl);
+    let index = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = chunks[index];
+        index += 1;
+        if (next === undefined) {
+          controller.close();
+          return;
+        }
+        if (next === null) {
+          await rejectOnAbort(signal);
+          return;
+        }
+        await sleepOrAbort(gapMs, signal);
+        controller.enqueue(new TextEncoder().encode(next));
+      },
+    });
+    return new Response(stream, { status: 200 });
+  });
+  return impl;
+}
+
+/**
+ * A fake fetch that drains the streamed request body at `gapMs` per chunk.
+ *
+ * With `stallAfter` set it stops taking chunks at that point and never finishes:
+ * the client keeps offering the body and nothing accepts it, which is what a
+ * wedged upload looks like from this end.
+ */
+function uploadingFetch(gapMs: number, stallAfter = Infinity): RecordingFetch {
+  const impl: RecordingFetch = fetchScript(async () => {
+    const signal = liveSignal(impl);
+    const reader = (
+      impl.calls[impl.calls.length - 1]!.init.body as ReadableStream<Uint8Array>
+    ).getReader();
+    for (let taken = 0; taken < stallAfter; taken += 1) {
+      await sleepOrAbort(gapMs, signal);
+      const { done } = await reader.read();
+      if (done) return json(201, { jobId: "job_slow", status: "pending" });
+    }
+    return rejectOnAbort(signal) as Promise<Response>;
+  });
+  return impl;
+}
+
 let dir: string;
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "i2p-"));
@@ -183,6 +331,37 @@ describe("construction", () => {
 // submit
 // --------------------------------------------------------------------------- //
 describe("submit", () => {
+  it("hands the upload body over in pieces no larger than 64KiB", async () => {
+    // This is what makes `timeoutMs` an idle timeout on the upload side. Progress
+    // is reported once per piece handed to the runtime, so a piece is also the
+    // longest an upload can go without reporting any: a whole image handed over in
+    // one go looked idle for the entire time it was being written to the socket,
+    // and a healthy-but-slow upload was cut off mid-transfer.
+    //
+    // Pinned by shape rather than by clock on purpose. The timing version of this
+    // could only tell the two apart inside a window narrow enough for a loaded CI
+    // runner to land outside of, which makes it flaky in one direction and — once
+    // the budget is widened to stop that — silently useless in the other.
+    const sizes: number[] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      const reader = (init.body as ReadableStream<Uint8Array>).getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sizes.push(value!.byteLength);
+      }
+      return json(201, { jobId: "job_1", status: "pending" });
+    }) as unknown as typeof fetch;
+
+    // Random pixels so the payload survives compression at a size that cannot fit
+    // in one piece.
+    await client(fetchImpl).submit([await noisyPng("slices.png", 2000, 2000)]);
+
+    const total = sizes.reduce((sum, n) => sum + n, 0);
+    expect(total).toBeGreaterThan(256 * 1024);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(64 * 1024);
+  });
+
   it("returns a pending Job", async () => {
     const file = await tempFile();
     const c = client(
@@ -200,13 +379,20 @@ describe("submit", () => {
 
   it("maps 401 to AuthenticationError", async () => {
     const file = await tempFile();
-    const c = client(fetchSequence(json(401, { error: { code: "INVALID_API_KEY", message: "bad key" } })));
-    await expect(c.submit([file])).rejects.toMatchObject({
+    // A fresh response per attempt: a `Response` body can only be read once, and a
+    // second read of a spent one is a body failure rather than a 401.
+    const unauthorized = (): Response =>
+      json(401, { error: { code: "INVALID_API_KEY", message: "bad key" } });
+    await expect(
+      client(fetchSequence(unauthorized())).submit([file]),
+    ).rejects.toMatchObject({
       name: "AuthenticationError",
       code: "INVALID_API_KEY",
       statusCode: 401,
     });
-    await expect(c.submit([file])).rejects.toBeInstanceOf(AuthenticationError);
+    await expect(
+      client(fetchSequence(unauthorized())).submit([file]),
+    ).rejects.toBeInstanceOf(AuthenticationError);
   });
 
   it("maps UPLOAD_ABORTED to its own type", async () => {
@@ -274,17 +460,18 @@ describe("cancel", () => {
     // stops polling a job that is still draining. Python raises here too.
     const f = fetchSequence(json(200, { jobId: "j", cancellationRequested: true }));
     await expect(client(f).cancel("j")).rejects.toMatchObject({
-      name: "Image2PPTError",
+      name: "MalformedResponseError",
       message: expect.stringContaining("finalizing"),
     });
 
     // A 2xx body that isn't an object at all has to land in the same place. A null
     // body is the case that makes the point: `"jobId" in null` throws a raw
-    // TypeError, which is not an Image2PPTError and so is not catchable per the README.
+    // TypeError, which would escape as a platform error the caller cannot catch
+    // through Image2PPTError — the one thing the README promises never happens.
     await expect(
       client(fetchSequence(json(200, null))).cancel("j"),
     ).rejects.toMatchObject({
-      name: "Image2PPTError",
+      name: "MalformedResponseError",
       message: expect.stringContaining("JSON object"),
     });
   });
@@ -314,7 +501,7 @@ describe("cancel", () => {
         ),
       ).cancel("j"),
     ).rejects.toMatchObject({
-      name: "Image2PPTError",
+      name: "ServerError",
       statusCode: 500,
       code: "JOB_CANCEL_FAILED",
     });
@@ -324,7 +511,7 @@ describe("cancel", () => {
     const f = fetchScript(() => {
       throw new TypeError("fetch failed");
     });
-    await expect(client(f).cancel("j")).rejects.toThrow("fetch failed");
+    await expect(client(f).cancel("j")).rejects.toBeInstanceOf(APIConnectionError);
     expect(f.calls).toHaveLength(1);
   });
 
@@ -715,7 +902,7 @@ describe("error mapping", () => {
 
   it("falls back for a non-JSON error body", async () => {
     const c = client(fetchSequence(new Response("<html>gateway error</html>", { status: 500 })));
-    await expect(c.account()).rejects.toMatchObject({ name: "Image2PPTError", statusCode: 500 });
+    await expect(c.account()).rejects.toMatchObject({ name: "ServerError", statusCode: 500 });
   });
 });
 
@@ -737,6 +924,34 @@ describe("Job", () => {
         .cancellationRequested,
     ).toBe(true);
     expect(Job.fromJson({ jobId: "old", status: "processing" }).cancellationRequested).toBe(false);
+  });
+
+  it("coerces the cancellation marker instead of parking a non-boolean in it", () => {
+    // The field is declared `boolean`, and `?? false` let anything non-null sit in
+    // it — a string or an array, typed as a boolean. `parseCancellationResult`, in
+    // the same file, has always coerced; this brings the two envelopes into line.
+    for (const [sent, expected] of [
+      [0, false],
+      ["", false],
+      ["no", true],
+      [1, true],
+    ] as const) {
+      const job = Job.fromJson({ jobId: "j", status: "processing", cancellationRequested: sent });
+      expect(job.cancellationRequested).toBe(expected);
+      expect(typeof job.cancellationRequested).toBe("boolean");
+    }
+  });
+
+  it("reads a job-level error that is not an object as no error", () => {
+    // Same rule as a page entry's `error` one level down. Python crashed outright on
+    // this body — `wait()` asked the value for `code` and raised a bare
+    // AttributeError — so leaving it unvalidated here kept the two ends disagreeing
+    // about what the same payload means.
+    for (const bad of ["boom", 7, ["boom"], true]) {
+      const job = Job.fromJson({ jobId: "j", status: "failed", error: bad });
+      expect(job.error).toBeNull();
+      expect((job.raw as { error: unknown }).error).toEqual(bad);
+    }
   });
 });
 
@@ -876,22 +1091,42 @@ describe("convertAll", () => {
 // --------------------------------------------------------------------------- //
 describe("no automatic submit retry", () => {
   it("does not retry a broken connection", async () => {
+    // The failure is now reported as an SDK error rather than escaping as undici's
+    // raw TypeError, but the invariant this test guards is unchanged and is the
+    // whole point: exactly one attempt.
     const file = await tempFile();
     const f = fetchScript(() => {
       throw new TypeError("fetch failed");
     });
 
-    await expect(client(f).submit([file])).rejects.toBeInstanceOf(TypeError);
+    await expect(client(f).submit([file])).rejects.toBeInstanceOf(APIConnectionError);
     expect(f.calls).toHaveLength(1); // tried exactly once
   });
 
   it("does not retry a request it timed out", async () => {
+    // Driven by the real idle watchdog against a server that never answers, not by
+    // a fake fetch throwing a ready-made abort: the point is that a stalled
+    // submission is given up on exactly once, and that only holds if the thing
+    // giving up is the client's own timeout.
+    const file = await tempFile();
+    const f = stallingFetch();
+
+    await expect(
+      impatientClient(f).submit([file]),
+    ).rejects.toBeInstanceOf(APITimeoutError);
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("does not retry an abort raised by a caller-supplied fetch", async () => {
+    // A custom `fetch` may enforce a deadline of its own and abort with a bare
+    // DOMException. It is still a timeout, and still must not be retried.
     const file = await tempFile();
     const f = fetchScript(() => {
       throw new DOMException("The operation was aborted", "TimeoutError");
     });
 
     await expect(client(f).submit([file])).rejects.toMatchObject({
+      name: "APITimeoutError",
       code: "REQUEST_TIMEOUT",
     });
     expect(f.calls).toHaveLength(1);
@@ -918,7 +1153,7 @@ describe("no automatic submit retry", () => {
 
     const err = await client(f).submitAll(files).catch((e: unknown) => e);
 
-    expect(err).toBeInstanceOf(TypeError);
+    expect(err).toBeInstanceOf(APIConnectionError);
     expect(f.calls).toHaveLength(2); // batch 1, then batch 2 once
     expect(submittedIds(err)).toEqual(["job_a"]);
   });
@@ -1328,17 +1563,6 @@ describe("download atomicity", () => {
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
   });
-
-  /** A 200 whose body dies partway through, like a dropped connection. */
-  function explodingBody(): Response {
-    const stream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode("PK\u0003\u0004 first half"));
-        controller.error(new Error("connection reset mid-download"));
-      },
-    });
-    return new Response(stream, { status: 200 });
-  }
 
   it("leaves no truncated file behind", async () => {
     const dest = join(dir, "deck.pptx");
@@ -1839,5 +2063,626 @@ describe("every wait is bounded", () => {
     expect(delays).toHaveLength(1);
     expect(delays[0]).toBeGreaterThan(0);
     expect(delays[0]).toBeLessThanOrEqual(30_000); // the deadline, not the clamp
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Nothing escapes as a platform error
+//
+// Both READMEs promise every failure subclasses Image2PPTError, and four separate
+// paths used to break that promise. A caller who wraps their whole call in
+// `catch (e) { if (e instanceof Image2PPTError) ... }` — which is the pattern the
+// README shows — got an unhandled TypeError, SyntaxError, or stream error instead.
+// Each test below also checks the original error is still reachable, because that
+// is the only place the real reason survives.
+// --------------------------------------------------------------------------- //
+describe("platform errors are wrapped", () => {
+  it("reports a transport failure as APIConnectionError, keeping the reason", async () => {
+    const reason = new Error("ECONNREFUSED 127.0.0.1:443");
+    const outer = new TypeError("fetch failed");
+    outer.cause = reason;
+    const f = fetchScript(() => {
+      throw outer;
+    });
+
+    const err = await client(f).account().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(APIConnectionError);
+    expect(err).toBeInstanceOf(Image2PPTError);
+    // undici's own message says nothing; the reason it buried is what a caller needs.
+    expect((err as Error).message).toContain("ECONNREFUSED");
+    expect((err as Error).cause).toBe(outer);
+  });
+
+  it("reports an unparseable 2xx body as MalformedResponseError", async () => {
+    // A captive portal or CDN error page answering 200 with HTML. This used to
+    // escape as a raw SyntaxError from res.json().
+    const f = fetchSequence(
+      new Response("<html>login to continue</html>", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const err = await client(f).account().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(MalformedResponseError);
+    expect((err as Error).cause).toBeInstanceOf(SyntaxError);
+  });
+
+  it("reports a job body missing its contract fields as MalformedResponseError", async () => {
+    // This one used to throw nothing at all: the Job came back with jobId and
+    // status undefined, and wait() then polled that object to its deadline.
+    await expect(
+      client(fetchSequence(json(200, { hello: "world" }))).getJob("j"),
+    ).rejects.toBeInstanceOf(MalformedResponseError);
+    await expect(
+      client(fetchSequence(json(200, { status: "completed" }))).getJob("j"),
+    ).rejects.toMatchObject({ name: "MalformedResponseError", message: /jobId/ });
+    await expect(
+      client(fetchSequence(json(200, { jobId: "j" }))).getJob("j"),
+    ).rejects.toMatchObject({ name: "MalformedResponseError", message: /status/ });
+  });
+
+  it("reports a download cut off mid-stream as APIConnectionError", async () => {
+    // The body is consumed outside the fetch call, so nothing there could ever
+    // have wrapped this one.
+    const dest = join(dir, "deck.pptx");
+    const reset = new Error("connection reset mid-download");
+    const f = fetchSequence(explodingBody(reset));
+
+    const err = await client(f).download("j", dest).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(APIConnectionError);
+    expect((err as Error).cause).toBe(reset);
+  });
+
+  it("reports an error body that stops arriving as APIConnectionError", async () => {
+    // A `download` response is streamed, so on a failure status the `{ error: ... }`
+    // envelope has not arrived yet and the connection can still die while it is being
+    // read. Reporting that as the status code alone would call a dropped connection
+    // "the job isn't ready", which is a different thing to do about it.
+    const dest = join(dir, "deck.pptx");
+    const reset = new Error("connection reset mid-body");
+    const f = fetchSequence(explodingBody(reset, 409));
+
+    const err = await client(f).download("j", dest).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(APIConnectionError);
+    expect(err).not.toBeInstanceOf(NotReadyError);
+    expect((err as Error).message).toContain("connection reset mid-body");
+  });
+
+  it("still reports the status when the error body merely is not JSON", async () => {
+    // An HTML gateway page is not a transport failure. The status decides, exactly
+    // as it did before a cut-off body got its own answer.
+    const dest = join(dir, "deck.pptx");
+    const f = fetchSequence(new Response("<html>gateway</html>", { status: 409 }));
+
+    await expect(client(f).download("j", dest)).rejects.toBeInstanceOf(NotReadyError);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// What wait() retries, and what it refuses to
+//
+// A half-hour poll loop swallowing the wrong thing is expensive in both
+// directions: retry a permanent failure and the caller waits thirty minutes for an
+// answer they could have had at once; abort on a passing blip and a job that was
+// going to finish is abandoned. The error itself decides, through isTransient.
+// --------------------------------------------------------------------------- //
+describe("isTransient", () => {
+  it("is true for the failures that clear on their own", () => {
+    expect(new ServerError("x", { statusCode: 500 }).isTransient).toBe(true);
+    expect(new APIConnectionError("x").isTransient).toBe(true);
+    expect(new APITimeoutError("x").isTransient).toBe(true);
+    expect(new RateLimitedError("x", { statusCode: 429 }).isTransient).toBe(true);
+  });
+
+  it("is false for the failures that will still be failures later", () => {
+    expect(new JobNotFoundError("x", { statusCode: 404 }).isTransient).toBe(false);
+    expect(new AuthenticationError("x", { statusCode: 401 }).isTransient).toBe(false);
+    expect(new Image2PPTError("x").isTransient).toBe(false);
+    // A body this client cannot parse means something is rewriting the traffic.
+    // Retrying just hides that for half an hour and then reports a timeout.
+    expect(new MalformedResponseError("x", { statusCode: 200 }).isTransient).toBe(false);
+  });
+});
+
+describe("wait retries only transient poll failures", () => {
+  it("retries a dropped connection and finishes", async () => {
+    const f = fetchScript((n) =>
+      n === 1
+        ? Promise.reject(new TypeError("fetch failed"))
+        : json(200, { jobId: "j", status: "completed" }),
+    );
+
+    const job = await client(f).wait("j", { pollIntervalMs: 0 });
+
+    expect(job.isCompleted).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  });
+
+  it("retries a status poll that timed out rather than abandoning the job", async () => {
+    // The live bug this replaces: a per-request timeout is reported as this SDK's
+    // own error, and the old "is it one of ours" test read that as fatal — so one
+    // slow poll killed a wait for a job that was converting perfectly well.
+    const f: RecordingFetch = fetchScript((n) =>
+      n === 1
+        ? (rejectOnAbort(liveSignal(f)) as Promise<Response>)
+        : json(200, { jobId: "j", status: "completed", slideCount: 2 }),
+    );
+
+    const job = await impatientClient(f).wait("j", { pollIntervalMs: 0 });
+
+    expect(job.isCompleted).toBe(true);
+    expect(f.calls).toHaveLength(2);
+  });
+
+  it("gives up on a job that is gone, an unusable key, or an unreadable body", async () => {
+    const cases: Array<[Response, unknown]> = [
+      [json(404, { error: { code: "JOB_NOT_FOUND", message: "gone" } }), JobNotFoundError],
+      [json(401, { error: { code: "INVALID_API_KEY", message: "no" } }), AuthenticationError],
+      [new Response("not json", { status: 200 }), MalformedResponseError],
+    ];
+    for (const [response, expected] of cases) {
+      const f = fetchScript((n) => {
+        // A second call would mean it retried; make that fail loudly rather than loop.
+        if (n > 1) throw new Error("a non-transient poll failure was retried");
+        return response;
+      });
+      await expect(client(f).wait("j", { pollIntervalMs: 0 })).rejects.toBeInstanceOf(
+        expected as new () => Error,
+      );
+    }
+  });
+
+  it("propagates an unexpected error from this client instead of retrying it", async () => {
+    // Stricter than before, and deliberately so. The old rule was "not one of ours
+    // means transient", so a bug in this SDK was swallowed and retried for the full
+    // deadline, surfacing half an hour later as a timeout with the real cause long
+    // gone. Simulated by a response that blows up while this client reads it —
+    // which is where such a bug would actually surface, well after `fetch` returned.
+    const bug = new RangeError("a bug in this client");
+    const booby = json(200, { jobId: "j", status: "completed" });
+    Object.defineProperty(booby, "ok", {
+      get() {
+        throw bug;
+      },
+    });
+    const f = fetchScript((n) => {
+      if (n > 1) throw new Error("an unexpected error was retried");
+      return booby;
+    });
+
+    await expect(client(f).wait("j", { pollIntervalMs: 0 })).rejects.toBe(bug);
+    expect(f.calls).toHaveLength(1);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// 5xx has a class of its own
+// --------------------------------------------------------------------------- //
+describe("ServerError", () => {
+  it("is what a 5xx becomes, and is still an Image2PPTError", async () => {
+    const f = fetchSequence(json(503, { error: { code: "STORAGE_FAILED", message: "later" } }));
+
+    const err = await client(f).account().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ServerError);
+    // Existing `catch (e) { if (e instanceof Image2PPTError) }` code is unaffected.
+    expect(err).toBeInstanceOf(Image2PPTError);
+    expect(err).toMatchObject({ name: "ServerError", statusCode: 503, code: "STORAGE_FAILED" });
+    expect((err as ServerError).isTransient).toBe(true);
+  });
+
+  it("does not steal a status that already has a more specific class", async () => {
+    // 4xx keeps its own mapping; only a 5xx nothing else claims lands here.
+    const f = fetchSequence(json(404, { error: { code: "JOB_NOT_FOUND", message: "gone" } }));
+    await expect(client(f).getJob("j")).rejects.not.toBeInstanceOf(ServerError);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Per-page results
+//
+// creditsRefunded says how many pages did not convert. This says which — and, for
+// each one, whether the page is still in the deck as its original image or is
+// missing from it entirely. Those call for different things from the caller, so the
+// distinction has to survive parsing.
+// --------------------------------------------------------------------------- //
+describe("pageResults", () => {
+  const terminalJob = (pageResults: unknown): Response =>
+    json(200, {
+      jobId: "j",
+      status: "completed",
+      slideCount: 3,
+      creditsUsed: 1,
+      creditsRefunded: 2,
+      pageResults,
+    });
+
+  it("reads a mix of converted and failed pages", async () => {
+    const f = fetchSequence(
+      terminalJob([
+        { pageNumber: 1, status: "converted" },
+        {
+          pageNumber: 2,
+          status: "failed",
+          error: { code: "CONVERSION_TIMEOUT", message: "took too long", retryable: true },
+        },
+        {
+          pageNumber: 3,
+          status: "failed",
+          error: { code: "PAGE_NOT_ATTEMPTED", message: "never started", retryable: true },
+        },
+      ]),
+    );
+
+    const job = await client(f).getJob("j");
+
+    expect(job.pageResults).toHaveLength(3);
+    expect(job.pageResults![0]).toMatchObject({ pageNumber: 1, status: "converted" });
+    expect(job.pageResults![0]!.error).toBeUndefined();
+    // Attempted and failed: the page IS in the deck, as the original image.
+    expect(job.pageResults![1]!.error).toMatchObject({
+      code: "CONVERSION_TIMEOUT",
+      message: "took too long",
+      retryable: true,
+    });
+    // Never attempted: the page is NOT in the deck at all. Different remedy.
+    expect(job.pageResults![2]!.error!.code).toBe("PAGE_NOT_ATTEMPTED");
+  });
+
+  it("surfaces retryable rather than making the caller assume it", async () => {
+    // Every code today says true, but a code added later may not — so the field has
+    // to be readable, and read as sent.
+    const f = fetchSequence(
+      terminalJob([
+        {
+          pageNumber: 1,
+          status: "failed",
+          error: { code: "CONVERSION_FAILED", message: "no", retryable: false },
+        },
+      ]),
+    );
+
+    const job = await client(f).getJob("j");
+
+    expect(job.pageResults![0]!.error!.retryable).toBe(false);
+  });
+
+  it("tells an absent ledger apart from an empty one", async () => {
+    // Absent is what a running job and a pre-September-2026 job both look like:
+    // "no per-page record exists". Empty would claim the job had no pages.
+    const older = await client(
+      fetchSequence(json(200, { jobId: "j", status: "completed", slideCount: 2 })),
+    ).getJob("j");
+    expect(older.pageResults).toBeNull();
+
+    const empty = await client(fetchSequence(terminalJob([]))).getJob("j");
+    expect(empty.pageResults).toEqual([]);
+    expect(empty.pageResults).not.toBeNull();
+
+    const running = await client(
+      fetchSequence(json(200, { jobId: "j", status: "processing", progress: 40 })),
+    ).getJob("j");
+    expect(running.pageResults).toBeNull();
+  });
+
+  it("refuses an entry that cannot say which page it is or how it ended", async () => {
+    for (const entry of [
+      { status: "converted" }, // no pageNumber
+      { pageNumber: 1 }, // no status
+      { pageNumber: "one", status: "failed" }, // a page number that is not a number
+      "not an object",
+    ]) {
+      await expect(
+        client(fetchSequence(terminalJob([entry]))).getJob("j"),
+      ).rejects.toBeInstanceOf(MalformedResponseError);
+    }
+    await expect(
+      client(fetchSequence(terminalJob("not a list"))).getJob("j"),
+    ).rejects.toBeInstanceOf(MalformedResponseError);
+  });
+
+  it("passes an unfamiliar status or code through instead of losing it", async () => {
+    // The service may add either. Folding an unknown value into a known one would
+    // report something that did not happen; the doc comments tell callers to read an
+    // unrecognised code as CONVERSION_FAILED, which is their decision to make.
+    const f = fetchSequence(
+      terminalJob([
+        {
+          pageNumber: 1,
+          status: "quarantined",
+          error: { code: "SOMETHING_NEW", message: "?", retryable: true, detail: "extra" },
+        },
+      ]),
+    );
+
+    const job = await client(f).getJob("j");
+
+    expect(job.pageResults![0]!.status).toBe("quarantined");
+    expect(job.pageResults![0]!.error!.code).toBe("SOMETHING_NEW");
+    // Nothing is dropped: the untouched entry is kept for fields added later.
+    expect(job.pageResults![0]!.raw).toMatchObject({ status: "quarantined" });
+    expect(job.pageResults![0]!.error!.raw).toMatchObject({ detail: "extra" });
+  });
+
+  it("tolerates a gap inside a page's error rather than failing the whole job", async () => {
+    // The ledger reports what went wrong; a hole in the report is not itself worth
+    // turning into an exception the caller has to handle. An absent code falls back
+    // to the contract's own rule for an unrecognised one.
+    const f = fetchSequence(terminalJob([{ pageNumber: 1, status: "failed", error: {} }]));
+
+    const job = await client(f).getJob("j");
+
+    expect(job.pageResults![0]!.error).toMatchObject({
+      code: "CONVERSION_FAILED",
+      message: "",
+      retryable: false,
+    });
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// One rule for "the contract guaranteed this field", in both clients
+//
+// These three envelopes used to be checked by three hand-written copies of the same
+// idea, and the copies drifted — from each other and from the Python client's. Each
+// case below is pinned identically in `python/tests/test_client.py`; the point is
+// not the individual answers so much as that one body cannot mean two things
+// depending on which SDK read it.
+// --------------------------------------------------------------------------- //
+describe("required response fields", () => {
+  const jobWithPage = (entry: unknown): Response =>
+    json(200, { jobId: "j", status: "completed", pageResults: [entry] });
+
+  it("treats a null field as missing, the same as an absent one", async () => {
+    // `{ "jobId": null }` offers a caller no more to act on than no key at all.
+    for (const body of [
+      { jobId: null, status: "pending" },
+      { jobId: "j", status: null },
+    ]) {
+      await expect(
+        client(fetchSequence(json(200, body))).getJob("j"),
+      ).rejects.toBeInstanceOf(MalformedResponseError);
+    }
+    await expect(
+      client(
+        fetchSequence(
+          json(200, { jobId: "j", cancellationRequested: true, finalizing: null }),
+        ),
+      ).cancel("j"),
+    ).rejects.toMatchObject({
+      name: "MalformedResponseError",
+      message: /finalizing/,
+    });
+  });
+
+  it("treats false as an answer, not as an absence", async () => {
+    // The whole reason the check tests for null rather than for falsiness.
+    // `finalizing: false` is the service saying the job is *not* still winding down
+    // — the most ordinary cancellation response there is.
+    const f = fetchSequence(
+      json(200, { jobId: "j", cancellationRequested: false, finalizing: false }),
+    );
+
+    const result = await client(f).cancel("j");
+
+    expect(result).toEqual({
+      jobId: "j",
+      cancellationRequested: false,
+      finalizing: false,
+    });
+  });
+
+  it("checks page-entry types rather than coercing them", async () => {
+    for (const entry of [
+      { pageNumber: "3", status: "converted" }, // numeric string, not a number
+      { pageNumber: 1.5, status: "converted" }, // not a whole page
+      { pageNumber: true, status: "converted" }, // a bool is not a page number
+      { pageNumber: 1, status: 7 }, // a status is a string
+      { pageNumber: null, status: "converted" },
+      { pageNumber: 1, status: null },
+    ]) {
+      await expect(
+        client(fetchSequence(jobWithPage(entry))).getJob("j"),
+      ).rejects.toBeInstanceOf(MalformedResponseError);
+    }
+  });
+
+  it("accepts a whole page number however JSON spelled it", async () => {
+    // `3` and `3.0` are the same JSON number and JavaScript cannot tell them apart,
+    // so refusing the second would be a difference of language, not of contract.
+    const job = await client(
+      fetchSequence(jobWithPage({ pageNumber: 3.0, status: "converted" })),
+    ).getJob("j");
+
+    expect(job.pageResults![0]!.pageNumber).toBe(3);
+  });
+
+  it("reads a page error that is not an object as no error at all", async () => {
+    // Turning it into a fully-defaulted PageError would put a CONVERSION_FAILED on
+    // the page that the service never sent. The entry itself is still trustworthy,
+    // so nothing is thrown either.
+    for (const badError of ["boom", 7, ["boom"], true]) {
+      const job = await client(
+        fetchSequence(jobWithPage({ pageNumber: 1, status: "failed", error: badError })),
+      ).getJob("j");
+      expect(job.pageResults![0]!.error).toBeUndefined();
+    }
+  });
+
+  it("reads a malformed page error exactly the way the Python client does", async () => {
+    // Each row was a real disagreement: the same body told a Node caller one thing
+    // and a Python caller another. `retryable` is the row that costs money —
+    // "worth submitting this page again" versus "don't bother" — so a value that
+    // is not a boolean at all reads as false in both clients now, rather than as
+    // whatever truthiness happens to say. The rows are pinned identically in
+    // `python/tests/test_client.py`.
+    const cases: [Record<string, unknown>, string, string, boolean][] = [
+      [{ code: 7 }, "CONVERSION_FAILED", "", false],
+      [{ code: "" }, "CONVERSION_FAILED", "", false],
+      [{ message: 42 }, "CONVERSION_FAILED", "", false],
+      [{ retryable: [] }, "CONVERSION_FAILED", "", false],
+      [{ retryable: "yes" }, "CONVERSION_FAILED", "", false],
+      [{ retryable: 1 }, "CONVERSION_FAILED", "", false],
+      // Nothing said about it at all is the same answer, for the same reason.
+      [{ code: "CONVERSION_TIMEOUT" }, "CONVERSION_TIMEOUT", "", false],
+      // A well-formed error still arrives untouched.
+      [
+        { code: "PAGE_NOT_ATTEMPTED", message: "never started", retryable: true },
+        "PAGE_NOT_ATTEMPTED",
+        "never started",
+        true,
+      ],
+      [
+        { code: "CONVERSION_FAILED", message: "nope", retryable: false },
+        "CONVERSION_FAILED",
+        "nope",
+        false,
+      ],
+    ];
+    for (const [error, code, message, retryable] of cases) {
+      const job = await client(
+        fetchSequence(jobWithPage({ pageNumber: 1, status: "failed", error })),
+      ).getJob("j");
+      expect(job.pageResults![0]!.error).toMatchObject({ code, message, retryable });
+    }
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Accept-Language
+//
+// Sets the language of the service's error *messages*. Not to be confused with
+// SubmitOptions.locale, which sets the language of the generated deck — the two are
+// unrelated, and a caller can reasonably want an English deck with Chinese errors.
+// --------------------------------------------------------------------------- //
+describe("acceptLanguage", () => {
+  it("sends no header at all when unset", async () => {
+    const f = fetchSequence(json(200, { email: "e", credits: 1 }));
+
+    await client(f).account();
+
+    expect(f.calls[0]!.init.headers).not.toHaveProperty("Accept-Language");
+  });
+
+  it("sends the value verbatim on every request", async () => {
+    // Free-form on purpose: it is an HTTP header value, so a quality-weighted list
+    // has to survive intact rather than being narrowed to a deck language.
+    const header = "fr-CA, fr;q=0.9, en;q=0.5";
+    const f = fetchScript((n) =>
+      n === 1
+        ? json(201, { jobId: "j", status: "pending" })
+        : json(200, { jobId: "j", status: "completed" }),
+    );
+    const c = impatientClient(f, { acceptLanguage: header });
+
+    const file = await tempFile();
+    await c.submit([file]);
+    await c.getJob("j");
+
+    expect(f.calls).toHaveLength(2);
+    for (const call of f.calls) {
+      expect(call.init.headers).toMatchObject({ "Accept-Language": header });
+    }
+  });
+
+  it("is not the deck language — locale still travels as a form field", async () => {
+    const file = await tempFile();
+    const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
+
+    await impatientClient(f, { acceptLanguage: "zh-CN" }).submit([file], { locale: "en" });
+
+    const body = Buffer.from(
+      await new Response(f.calls[0]!.init.body).arrayBuffer(),
+    ).toString("latin1");
+    expect(body).toContain('name="locale"');
+    expect(body).toContain("en");
+    expect(f.calls[0]!.init.headers).toMatchObject({ "Accept-Language": "zh-CN" });
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// timeoutMs is idle time, not total time
+//
+// It used to cover the whole request, so a 40MB upload or a large PPTX download was
+// killed at 60 seconds however healthy it was — a transfer punished for being big.
+// The Python client's equivalent has always been a read timeout; these pin the Node
+// one to the same meaning. Delays are in tens of milliseconds, not seconds.
+// --------------------------------------------------------------------------- //
+describe("idle timeout", () => {
+  it("lets a slow but moving download run past the idle budget", async () => {
+    const dest = join(dir, "slow.pptx");
+    // Together these gaps run well past IDLE_MS, but no single one reaches it.
+    // Nothing here should be cut off.
+    const parts = ["PK", "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-i", "-j", "-k"];
+    const f = streamingFetch(parts, TICK_MS);
+    const started = Date.now();
+
+    await impatientClient(f).download("j", dest);
+
+    expect(await readFile(dest, "utf8")).toBe(parts.join(""));
+    expect(Date.now() - started).toBeGreaterThan(IDLE_MS);
+  });
+
+  it("lets a slow but moving upload run past the idle budget", async () => {
+    // The body has to be big enough to actually stream: a small one is buffered
+    // whole the moment the request starts, and then there is no upload left to be
+    // slow about. A PDF is read from disk in chunks, which is the case that used to
+    // be killed at 60 seconds for the crime of being large.
+    const pdf = await sparseFile("slow.pdf", 2 * 1024 * 1024);
+    const f = uploadingFetch(TICK_MS);
+    const started = Date.now();
+
+    const job = await impatientClient(f).submit([pdf]);
+
+    expect(job.jobId).toBe("job_slow");
+    expect(Date.now() - started).toBeGreaterThan(IDLE_MS);
+  });
+
+  it("gives up on a download that stops arriving", async () => {
+    const dest = join(dir, "stalled.pptx");
+    const f = streamingFetch(["PK first half", null], TICK_MS);
+
+    await expect(impatientClient(f).download("j", dest)).rejects.toBeInstanceOf(
+      APITimeoutError,
+    );
+  });
+
+  it("gives up on an upload nothing is taking any more", async () => {
+    const pdf = await sparseFile("wedged.pdf", 2 * 1024 * 1024);
+    const f = uploadingFetch(TICK_MS, 2);
+
+    const err = await impatientClient(f).submit([pdf]).catch((e: unknown) => e);
+
+    // The multipart body is a stream whose own error events are swallowed, and the
+    // only way out is fetch's `cause` — unwrapped only for an Image2PPTError. An
+    // abort raised as anything else would reach the caller as "fetch failed".
+    expect(err).toBeInstanceOf(APITimeoutError);
+    expect(err).toMatchObject({ code: "REQUEST_TIMEOUT" });
+  });
+
+  it("gives up on a request that never gets a response at all", async () => {
+    const f = stallingFetch();
+
+    await expect(impatientClient(f).account()).rejects.toBeInstanceOf(APITimeoutError);
+  });
+
+  it("still cleans up after a stalled download, leaving the destination alone", async () => {
+    // The atomicity contract does not get an exception for timeouts: no temp file
+    // left behind, and a good deck already at that path survives untouched.
+    const dest = join(dir, "deck.pptx");
+    await writeFile(dest, "PREVIOUS-GOOD-DECK");
+    const f = streamingFetch(["PK half a deck", null], TICK_MS);
+
+    await expect(impatientClient(f).download("j", dest)).rejects.toBeInstanceOf(
+      APITimeoutError,
+    );
+
+    expect(await readFile(dest, "utf8")).toBe("PREVIOUS-GOOD-DECK");
+    expect((await readdir(dir)).sort()).toEqual(["deck.pptx"]);
   });
 });
