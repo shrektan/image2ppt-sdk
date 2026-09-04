@@ -8,6 +8,7 @@
  * `Content-Length` the client computes is the number of bytes that arrive.
  */
 
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import { appendFile, mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -57,6 +58,23 @@ function client(): Image2PPTClient {
 async function png(name: string, width: number, height: number): Promise<string> {
   const path = join(dir, name);
   await sharp({ create: { width, height, channels: 3, background: "#204060" } })
+    .png()
+    .toFile(path);
+  return path;
+}
+
+/**
+ * An image whose bytes cannot be squeezed small. Random pixels compress to nothing,
+ * so what goes on the wire is a payload of several megabytes rather than the few
+ * hundred kilobytes a photograph turns into. The size is the point: the part has to
+ * be big enough that writing it to a slow receiver takes longer than a whole idle
+ * budget.
+ */
+async function noisyPng(name: string, edge: number): Promise<string> {
+  const path = join(dir, name);
+  await sharp(randomBytes(edge * edge * 3), {
+    raw: { width: edge, height: edge, channels: 3 },
+  })
     .png()
     .toFile(path);
   return path;
@@ -185,4 +203,58 @@ describe("submitting over a real socket", () => {
     expect(received[1]!.body.byteLength).toBe(received[0]!.body.byteLength);
     expect(Number(received[1]!.headers["content-length"])).toBe(received[1]!.body.byteLength);
   }, 20_000);
+
+  it("keeps a slow but progressing upload alive past the idle timeout", async () => {
+    // What `timeoutMs` means: nothing moved for this long. A receiver that takes the
+    // body in small sips holds one request open for several times that budget while
+    // never once going quiet, and that request has to succeed.
+    //
+    // This is out of reach of the injected `fetch` the rest of the suite uses,
+    // because that one never writes a byte anywhere. Only a real socket pushes back:
+    // handing the runtime a whole image in a single piece let it swallow the lot
+    // immediately, so the upload was reported as progressing once and then said
+    // nothing for the whole time the bytes were actually crawling out — and the
+    // clock ran out in the middle of a perfectly healthy upload, which is the exact
+    // thing an idle timeout exists to prevent. In pieces, the runtime only takes the
+    // next one once the previous one has gone, so what gets reported is the transfer
+    // as it really moves.
+    const sipMs = 20;
+    const idleBudgetMs = 1_000;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    let bytesIn = 0;
+    server = createServer((req, res) => {
+      req.on("data", (part: Buffer) => {
+        bytesIn += part.byteLength;
+        // Stop reading, then start again. The socket stops draining, the client
+        // stops being able to write, and the transfer slows right down without ever
+        // actually stopping.
+        req.pause();
+        setTimeout(() => req.resume(), sipMs);
+      });
+      req.on("end", () => {
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jobId: "job-slow", status: "pending" }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    // Enough megabytes that the sips add up to several times the idle budget.
+    const paths = await Promise.all(
+      [1, 2, 3, 4].map((n) => noisyPng(`noise-${n}.png`, 2000)),
+    );
+
+    const started = Date.now();
+    const job = await new Image2PPTClient({
+      apiKey: "i2p_live_test",
+      baseUrl,
+      timeoutMs: idleBudgetMs,
+    }).submit(paths);
+    const elapsed = Date.now() - started;
+
+    expect(job.jobId).toBe("job-slow");
+    // Proof the request really did outlast its own idle budget, several times over,
+    // rather than the server having quietly swallowed everything at full speed.
+    expect(elapsed).toBeGreaterThan(idleBudgetMs * 2);
+    expect(bytesIn).toBeGreaterThan(8_000_000);
+  }, 120_000);
 });

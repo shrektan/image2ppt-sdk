@@ -68,6 +68,19 @@ const MIN_RETRY_AFTER_SECONDS = 1;
 /** How many images are read and re-encoded at the same time. See `#prepareFiles`. */
 const PREPARE_CONCURRENCY = 4;
 
+/**
+ * How much of an upload body is handed to the runtime at a time.
+ *
+ * This is what makes `timeoutMs` mean what it says on the upload side. Progress is
+ * reported once per piece, so a piece is also the longest an upload can go without
+ * reporting any — and while a piece is being written to the socket, a slow link
+ * says nothing at all. A whole image handed over in one go therefore looked idle
+ * for the entire time it was being sent, and a healthy-but-slow upload was cut off
+ * mid-transfer. 64KiB is the size a file is read from disk in, so every part of a
+ * body now moves in the same units, whether it was buffered in memory or streamed.
+ */
+const UPLOAD_SLICE_BYTES = 64 * 1024;
+
 const MIME_BY_EXT: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -219,7 +232,12 @@ function buildMultipart(
     for (const file of files) {
       yield moving(chunk(fileHeader(file)));
       if (file.buffer !== undefined) {
-        yield moving(file.buffer);
+        // Sliced rather than handed over whole, so an image reports progress as it
+        // goes out instead of once before it starts. `subarray` is a view, not a
+        // copy: the same bytes go on the wire and `Content-Length` is untouched.
+        for (let at = 0; at < file.buffer.byteLength; at += UPLOAD_SLICE_BYTES) {
+          yield moving(file.buffer.subarray(at, at + UPLOAD_SLICE_BYTES));
+        }
       } else if (file.size > 0) {
         // PDFs are intentionally never buffered: retries create a fresh stream from
         // disk while images retain their already-compressed payload. The read is
@@ -228,7 +246,10 @@ function buildMultipart(
         // limits were both computed from. A document rewritten underneath us has to
         // fail here rather than send a body that contradicts its own header.
         let sent = 0;
-        for await (const part of createReadStream(file.path, { end: file.size - 1 })) {
+        for await (const part of createReadStream(file.path, {
+          end: file.size - 1,
+          highWaterMark: UPLOAD_SLICE_BYTES,
+        })) {
           sent += (part as Buffer).byteLength;
           yield moving(Buffer.from(part));
         }
