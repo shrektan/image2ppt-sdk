@@ -72,7 +72,12 @@ raises subclasses `Image2PPTError`* — is finally true.
   were accepted by one client and rejected by the other. All three are now
   rejected by both, as is a page `error` sent as an array. A `false` value for
   `cancellationRequested` / `finalizing` is a real value, not a missing field,
-  in both.
+  in both. The same goes for the fields *inside* a page `error`: a `code` that
+  is not a non-empty string reads as `CONVERSION_FAILED`, a `message` that is
+  not a string reads as empty (a number is not turned into a sentence), and
+  `retryable` is now a real boolean or `false` — never truthiness. That last one
+  is the one that mattered: the same bad payload used to tell a Node caller a
+  page was worth submitting again and a Python caller that it was not.
 
 ### Changed
 
