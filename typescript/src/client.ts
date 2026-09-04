@@ -720,16 +720,29 @@ export class Image2PPTClient {
             // of deck that need never be in memory — and add a push/read/backpressure
             // round trip to every chunk on the way past.
             const bodyFailure: { error?: Error } = {};
+            const source = Readable.fromWeb(
+              res.body as Parameters<typeof Readable.fromWeb>[0],
+            );
+            // Catch the body's failure at the source, where it happens, rather than
+            // relying on it surfacing inside the transform stage. Which stage's
+            // error `pipeline` reports, and whether a destroyed transform gets to
+            // see the one that killed it, differ across the Node versions this
+            // package supports: on Node 20 the raw source error wins and the
+            // transform never observes it, so a dropped download reached callers
+            // unwrapped. Listening here is version-independent.
+            source.on("error", (err: unknown) => {
+              bodyFailure.error ??= downloadCutOff(err, jobId);
+            });
             try {
               await pipeline(
-                Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]),
-                (source) => readingBody(source, jobId, () => watchdog.kick(), bodyFailure),
+                source,
+                (piped) => readingBody(piped, jobId, () => watchdog.kick(), bodyFailure),
                 createWriteStream(partial),
               );
             } catch (err) {
-              // The body is now the source stage, so its raw error is the one
-              // `pipeline` reports. Prefer the wrapped one when there is one — see
-              // `readingBody`. Anything else (the disk) passes through untouched.
+              // Prefer the wrapped body failure when there is one. Anything else —
+              // the disk side — passes through untouched: it is not a transport
+              // failure and must not be dressed up as one.
               throw bodyFailure.error ?? err;
             }
           } else {
