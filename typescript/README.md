@@ -208,7 +208,9 @@ for (;;) {
 
 Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `message`. Branch on `code`, not `message`.
 
-Every error also carries **`isTransient`** — whether making the same call again later could plausibly succeed. It is what `wait()` uses to decide whether a failed status poll should be backed off and retried or should end the wait: `true` for a 5xx, a dropped connection and a stalled request, `false` for a bad key, a job that does not exist, or a response this client cannot parse.
+Every error also carries **`isTransient`** — whether **repeating this exact read** later could plausibly succeed. It is what `wait()` uses to decide whether a failed status poll should be backed off and retried or should end the wait: `true` for a 5xx, a dropped connection and a stalled request, `false` for a bad key, a job that does not exist, or a response this client cannot parse.
+
+**It says nothing about submitting.** `submit()` is never retried on this signal, and neither should your code be: a lost response cannot be told apart from a submission the server accepted, and there is no idempotency key, so resending the same files can create the same job twice and **charge you twice**. Only a `RateLimitedError` is retried on the submit path — a 429 is the service explicitly saying it took nothing.
 
 | Class | HTTP | code |
 |---|---|---|
