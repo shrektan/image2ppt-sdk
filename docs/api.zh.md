@@ -206,7 +206,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 
 任务到终局（`completed` 或 `failed`）后，这个数组按页码顺序列出**每一页**的结果，长度等于 `slideCount`。在此之前不返回——任务还在跑的时候，「这页没转出来」和「这页还没轮到」区分不了。
 
-（2026 年 9 月之前提交的少量早期任务没有逐页记录，这个字段也不返回。判断时请检查字段是否存在，不要假定终局任务一定带它。）
+（2026 年 9 月之前提交的任务没有逐页记录，这个字段也不返回。判断时请检查字段是否存在，不要假定终局任务一定带它。）
 
 `creditsRefunded` 只回答「有几页没转出来」，`pageResults` 回答「是**哪几页**」。
 
@@ -218,7 +218,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 
 失败页有两种去向，靠 `error.code` 区分：
 
-- `PAGE_NOT_ATTEMPTED` — 这一页**从没开始转**（任务先一步被取消、超时或被服务重启打断），成品里**没有**这一页，积分已退。
+- `PAGE_NOT_ATTEMPTED` — 这一页**从没开始转**，因为任务先一步结束了，成品里**没有**这一页，积分已退。
 - 其余错误码 — 这一页转过但没成，成品里保留的是**这一页的原图**（不可编辑），积分按「计费与退款」规则处理。
 
 `retryable` 表示同样的图再交一次有没有可能成功。**目前逐页结果里的每个失败页都是 `true`**——下面那三个码要么是一次性的故障，要么是这页压根没轮到，重交都有意义。仍然请判断这个字段而不要写死 `true`：以后新增的码可能带 `false`。
@@ -242,7 +242,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 
 为什么两层粒度不同：任务级那个字段从接口发布起就只有两个值，客户已经部署的代码是照着写的，扩大取值会让那些分支静默失效。细分放在 `pageResults` 里——那是新字段，没有历史包袱。
 
-`message` 是给人看的一句话，会跟着你的 `Accept-Language` 走，**不要拿它做分支判断**——请判断 `code`。出错细节（上游服务的响应、内部路径）不会出现在响应里，只留在服务端日志中。
+`message` 是给人看的一句话，会跟着你的 `Accept-Language` 走，**不要拿它做分支判断**——请判断 `code`。它不会夹带出错的诊断细节。
 
 两层都可能新增错误码。请把认不出的 `code` 当作 `CONVERSION_FAILED` 处理。
 
@@ -404,7 +404,7 @@ Link: <https://github.com/shrektan/image2ppt-sdk/blob/main/CHANGELOG.md>; rel="d
 
 ## 官方 SDK
 
-我们提供 Python 和 Node.js/TypeScript 两个官方客户端，都封装了提交、轮询、下载、429 退避和错误映射。源码、示例、各版本支持的功能和完整说明在 GitHub：<https://github.com/shrektan/image2ppt-sdk>。
+我们提供 Python 和 Node.js/TypeScript 两个官方客户端，都封装了提交、轮询、取消、下载、429 退避和错误映射。源码、示例、各版本支持的功能和完整说明在 GitHub：<https://github.com/shrektan/image2ppt-sdk>。
 
 > SDK 只在**服务端**使用。别把 API 密钥放进浏览器或任何用户能看到的地方——谁都能读出来。
 

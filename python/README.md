@@ -121,8 +121,8 @@ since a code added later may carry `False`.
 
 **`None` and `[]` are different facts.** `page_results` is `None` when the job reported
 no ledger at all: it is still running (while it is, "this page failed" and "this page
-has not had its turn" are indistinguishable), or it is one of the small number of jobs
-submitted before September 2026. An empty list would mean a job with no pages. Check
+has not had its turn" are indistinguishable), or it was submitted before September
+2026. An empty list would mean a job with no pages. Check
 `is not None` before iterating.
 
 ## What language error messages come back in

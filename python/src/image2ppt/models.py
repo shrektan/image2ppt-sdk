@@ -238,8 +238,8 @@ class Job:
     #: ``None`` and ``[]`` mean different things and neither is a stand-in for the
     #: other. ``None`` means **the job did not report a ledger**: it is still
     #: running (while it is, "this page failed" and "this page has not had its turn"
-    #: are indistinguishable), or it is one of the small number of jobs submitted
-    #: before September 2026, which have no per-page record. An empty list would
+    #: are indistinguishable), or it was submitted before September 2026, and
+    #: those jobs have no per-page record. An empty list would
     #: mean a job with no pages. Check ``is not None`` before iterating.
     #:
     #: ``credits_refunded`` tells you how many pages did not convert; this tells you

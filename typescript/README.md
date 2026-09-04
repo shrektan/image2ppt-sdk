@@ -93,8 +93,8 @@ for (const page of done.pageResults ?? []) {
 ```
 
 - **`null` is not an empty list.** `pageResults` is `null` when the service did not
-  send the field at all — while the job is still running, and for the small number of
-  jobs submitted before September 2026. An empty array would mean the job had no
+  send the field at all — while the job is still running, and for a job submitted
+  before September 2026. An empty array would mean the job had no
   pages. Check for `null` rather than assuming every terminal job carries a ledger.
 - **The two kinds of failed page call for different things.** `PAGE_NOT_ATTEMPTED`
   means the page is absent from the deck; every other code means it is present as the

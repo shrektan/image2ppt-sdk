@@ -239,8 +239,8 @@ page in page order; its length equals `slideCount`. It is omitted before that �
 while a job is still running, "this page didn't convert" and "this page hasn't
 had its turn yet" are not distinguishable.
 
-(It is also omitted for the small number of early jobs submitted before September
-2026, which have no per-page record. Check whether the field is present rather
+(It is also omitted for jobs submitted before September 2026, which have no
+per-page record. Check whether the field is present rather
 than assuming every terminal job carries it.)
 
 `creditsRefunded` only tells you **how many** pages did not convert.
@@ -254,9 +254,8 @@ than assuming every terminal job carries it.)
 
 A failed page ends up one of two ways, told apart by `error.code`:
 
-- `PAGE_NOT_ATTEMPTED` — the page **never started** (the job was cancelled, timed
-  out, or was interrupted by a service restart first). It is **absent** from the
-  deck, and its credit was refunded.
+- `PAGE_NOT_ATTEMPTED` — the page **never started**, because the job ended first.
+  It is **absent** from the deck, and its credit was refunded.
 - Any other code — the page was attempted and failed. The deck keeps **the
   original image** for it (not editable), and its credit follows the
   [Billing & refunds](#billing--refunds) rules.
@@ -291,9 +290,8 @@ it would silently stop matching those branches. The finer reasons live in
 `pageResults`, which is new field surface with no such history.
 
 `message` is a human-readable sentence that follows your `Accept-Language`
-header — **do not branch on it**, branch on `code`. Diagnostic detail (upstream
-service responses, internal paths) never appears in the response; it stays in
-server logs.
+header — **do not branch on it**, branch on `code`. It never carries diagnostic
+detail.
 
 Either level may gain new codes later. Treat a `code` you do not recognise as
 `CONVERSION_FAILED`.
@@ -501,7 +499,7 @@ In short: you only pay for **pages that were successfully produced**.
 ## Official SDKs
 
 We provide official Python and Node.js/TypeScript clients that wrap submission,
-polling, download, 429 backoff, and error mapping. Source, examples, the features
+polling, cancellation, download, 429 backoff, and error mapping. Source, examples, the features
 supported by each release, and full docs are on GitHub:
 <https://github.com/shrektan/image2ppt-sdk>.
 

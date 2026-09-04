@@ -323,8 +323,8 @@ export class Job {
    * `null` means the service did not send the field, which is a different fact
    * from an empty array and must not be confused with one. It is absent while the
    * job is still running (mid-run, "this page failed" and "this page has not had
-   * its turn" cannot be told apart), and absent for the small number of jobs
-   * submitted before September 2026, which have no per-page record at all.
+   * its turn" cannot be told apart), and absent for a job submitted before
+   * September 2026, which has no per-page record at all.
    *
    * `creditsRefunded` says how many pages did not convert; this says **which**,
    * and whether each one still made it into the deck as its original image. See
