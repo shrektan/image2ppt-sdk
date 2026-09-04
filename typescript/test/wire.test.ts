@@ -218,13 +218,16 @@ describe("submitting over a real socket", () => {
     // thing an idle timeout exists to prevent. In pieces, the runtime only takes the
     // next one once the previous one has gone, so what gets reported is the transfer
     // as it really moves.
-    const sipMs = 60;
-    // Generous on purpose. What this test pins is the difference between reporting
-    // progress once per file and once per 64KiB piece, and that difference is
-    // several seconds wide here — so the budget does not need to sit close to
-    // either side of it. A tight one only makes the test fail on a loaded CI
-    // runner, where a scheduling hiccup can be a second on its own.
-    const idleBudgetMs = 2_000;
+    const sipMs = 20;
+    // Deliberately far above anything this transfer should go quiet for, because
+    // this test is not the one that pins the piece size — a unit test does that,
+    // by reading the body and checking no piece exceeds 64KiB, which no amount of
+    // CI load can perturb. Trying to make *this* test tell the two apart meant a
+    // budget sitting inside a window narrow enough for a loaded runner to fall
+    // outside of: flaky when tight, and silently proving nothing when widened
+    // enough to stop being flaky. What is left here is the end-to-end claim that
+    // needs a real socket: a multi-second upload over a slow link completes.
+    const idleBudgetMs = 10_000;
     await new Promise<void>((resolve) => server.close(() => resolve()));
     let bytesIn = 0;
     server = createServer((req, res) => {
@@ -257,9 +260,10 @@ describe("submitting over a real socket", () => {
     const elapsed = Date.now() - started;
 
     expect(job.jobId).toBe("job-slow");
-    // Proof the request really did outlast its own idle budget, several times over,
-    // rather than the server having quietly swallowed everything at full speed.
-    expect(elapsed).toBeGreaterThan(idleBudgetMs);
+    // Proof the upload really did crawl rather than the server having quietly
+    // swallowed everything at full speed — without pinning the number so close to
+    // the budget that a slow runner decides the outcome.
+    expect(elapsed).toBeGreaterThan(2_000);
     expect(bytesIn).toBeGreaterThan(8_000_000);
   }, 120_000);
 

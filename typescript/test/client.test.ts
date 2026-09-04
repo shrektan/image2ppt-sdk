@@ -331,6 +331,37 @@ describe("construction", () => {
 // submit
 // --------------------------------------------------------------------------- //
 describe("submit", () => {
+  it("hands the upload body over in pieces no larger than 64KiB", async () => {
+    // This is what makes `timeoutMs` an idle timeout on the upload side. Progress
+    // is reported once per piece handed to the runtime, so a piece is also the
+    // longest an upload can go without reporting any: a whole image handed over in
+    // one go looked idle for the entire time it was being written to the socket,
+    // and a healthy-but-slow upload was cut off mid-transfer.
+    //
+    // Pinned by shape rather than by clock on purpose. The timing version of this
+    // could only tell the two apart inside a window narrow enough for a loaded CI
+    // runner to land outside of, which makes it flaky in one direction and — once
+    // the budget is widened to stop that — silently useless in the other.
+    const sizes: number[] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      const reader = (init.body as ReadableStream<Uint8Array>).getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sizes.push(value!.byteLength);
+      }
+      return json(201, { jobId: "job_1", status: "pending" });
+    }) as unknown as typeof fetch;
+
+    // Random pixels so the payload survives compression at a size that cannot fit
+    // in one piece.
+    await client(fetchImpl).submit([await noisyPng("slices.png", 2000, 2000)]);
+
+    const total = sizes.reduce((sum, n) => sum + n, 0);
+    expect(total).toBeGreaterThan(256 * 1024);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(64 * 1024);
+  });
+
   it("returns a pending Job", async () => {
     const file = await tempFile();
     const c = client(
