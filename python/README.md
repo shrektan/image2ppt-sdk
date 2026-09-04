@@ -93,13 +93,17 @@ else:
     for page in job.page_results:
         if page.status == "converted":
             continue
-        # ``error`` is None when the entry carried none this client could read, so
-        # guard it rather than reaching straight through.
-        if page.error and page.error.code == "PAGE_NOT_ATTEMPTED":
+        # ``error`` is None when the entry carried none this client could read.
+        # Say so rather than guessing: neither "where is it" nor "is it worth
+        # resubmitting" is knowable without it.
+        if page.error is None:
+            print(f"page {page.page_number} failed, with no reason given")
+            continue
+        if page.error.code == "PAGE_NOT_ATTEMPTED":
             print(f"page {page.page_number} is NOT in the deck at all")
         else:
             print(f"page {page.page_number} is in the deck as the original image")
-        if page.error and page.error.retryable:
+        if page.error.retryable:
             print("  resubmitting this one is worth a try")
 ```
 

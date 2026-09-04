@@ -242,7 +242,7 @@ curl -X POST https://image2ppt.com/api/v1/jobs \
 
 为什么两层粒度不同：任务级那个字段从接口发布起就只有两个值，客户已经部署的代码是照着写的，扩大取值会让那些分支静默失效。细分放在 `pageResults` 里——那是新字段，没有历史包袱。
 
-`message` 是给人看的一句话，会跟着你的 `Accept-Language` 走，**不要拿它做分支判断**——请判断 `code`。它不会夹带出错的诊断细节。
+`message` 是给人看的一句话，会跟着你的 `Accept-Language` 走，**不要拿它做分支判断**——请判断 `code`。
 
 两层都可能新增错误码。请把认不出的 `code` 当作 `CONVERSION_FAILED` 处理。
 

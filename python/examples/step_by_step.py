@@ -60,17 +60,18 @@ def main() -> int:
         if page.status == "converted":
             continue
         # ``error`` is None when the entry carried none this client could read.
-        code = page.error.code if page.error else None
-        if code == "PAGE_NOT_ATTEMPTED":
+        # Neither "where did it end up" nor "is it worth resubmitting" is knowable
+        # then, so say that instead of picking the answer the else-branch happens
+        # to hold.
+        if page.error is None:
+            print(f"  page {page.page_number}: failed, no reason given")
+            continue
+        if page.error.code == "PAGE_NOT_ATTEMPTED":
             where = "not in the deck at all"
         else:
             where = "in the deck as the original image, not editable"
-        retry = (
-            "worth resubmitting"
-            if page.error and page.error.retryable
-            else "resubmitting will not help"
-        )
-        print(f"  page {page.page_number}: {where} ({code}, {retry})")
+        retry = "worth resubmitting" if page.error.retryable else "resubmitting will not help"
+        print(f"  page {page.page_number}: {where} ({page.error.code}, {retry})")
     return 0
 
 

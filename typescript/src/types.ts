@@ -357,9 +357,10 @@ export class Job {
     this.completedAt = d.completedAt ?? null;
     // `Boolean`, not `?? false`: the field is declared `boolean`, and a body that
     // sends something else must not be allowed to sit in it. `parseCancellationResult`
-    // in this same file already coerces, and the Python client has always used
-    // `bool()` — without this, `{"cancellationRequested": []}` reads as true here and
-    // false there, off one payload.
+    // in this same file already coerces, and this matches the Python client's
+    // `bool()` on every scalar. It does not close the gap entirely — `[]` is truthy
+    // in JavaScript and falsy in Python — and that remainder is filed, not fixed
+    // here.
     this.cancellationRequested = Boolean(d.cancellationRequested);
     this.downloadUrl = d.downloadUrl ?? null;
     // Same rule as a page entry's `error` one level down: present but not an object

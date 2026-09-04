@@ -113,9 +113,10 @@ raises subclasses `Image2PPTError`* — is finally true.
   the old loop retried every `RequestException` to the deadline; it is now a
   `MalformedResponseError`, which is deliberately not transient. Worth knowing if
   you sit behind a proxy that occasionally answers with an HTML page.
-- **Node (types)** — `Job.pageResults` is a declared property rather than an
-  optional one, so a `Job`-shaped object literal in your own code now has to carry
-  it. `Image2PPTError` accepts a `cause`, and `ErrorInit` is exported as a type.
+- **Node (types)** — `Job.pageResults` is new and is declared required rather than
+  optional, so a `Job`-shaped object literal in your own code has to carry it.
+  `Image2PPTError` accepts a `cause`, and `ErrorInit` — already exported from the
+  errors module — is now re-exported from the package entry point.
 - **Docs** — `docs/api.md` / `docs/api.zh.md` re-synced with the published
   contract: per-page results, the finer per-page failure codes, the
   `Accept-Language` rule, and clarified cancellation wording (a page being

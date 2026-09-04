@@ -240,8 +240,8 @@ while a job is still running, "this page didn't convert" and "this page hasn't
 had its turn yet" are not distinguishable.
 
 (It is also omitted for jobs submitted before September 2026, which have no
-per-page record. Check whether the field is present rather
-than assuming every terminal job carries it.)
+per-page record. Check whether the field is present rather than assuming every
+terminal job carries it.)
 
 `creditsRefunded` only tells you **how many** pages did not convert.
 `pageResults` tells you **which ones**.
@@ -290,8 +290,7 @@ it would silently stop matching those branches. The finer reasons live in
 `pageResults`, which is new field surface with no such history.
 
 `message` is a human-readable sentence that follows your `Accept-Language`
-header — **do not branch on it**, branch on `code`. It never carries diagnostic
-detail.
+header — **do not branch on it**, branch on `code`.
 
 Either level may gain new codes later. Treat a `code` you do not recognise as
 `CONVERSION_FAILED`.
@@ -499,8 +498,8 @@ In short: you only pay for **pages that were successfully produced**.
 ## Official SDKs
 
 We provide official Python and Node.js/TypeScript clients that wrap submission,
-polling, cancellation, download, 429 backoff, and error mapping. Source, examples, the features
-supported by each release, and full docs are on GitHub:
+polling, cancellation, download, 429 backoff, and error mapping. Source, examples,
+the features supported by each release, and full docs are on GitHub:
 <https://github.com/shrektan/image2ppt-sdk>.
 
 > Use the SDK **server-side only**. Never put an API key in a browser or anywhere a
