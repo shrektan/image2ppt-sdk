@@ -75,14 +75,29 @@ class CancellationResult:
 
         ``cancellationRequested: false`` and ``finalizing: false`` are perfectly
         good answers and pass — see ``_required`` for why that is worth stating.
+
+        Both booleans are read by **identity, never truthiness** — the rule
+        ``PageError.retryable`` already reads by. ``bool([])`` is False here and
+        truthy in JavaScript, so a coerced field meant opposite things to the two
+        clients for one API. Identity is the same test in both, and each field
+        falls to the side that costs the caller nothing when the value cannot be
+        read — which is why the two comparisons point opposite ways:
+
+        - ``cancellationRequested`` needs a real ``True``. Claiming a cancellation
+          the service never accepted is the expensive mistake; repeating the call
+          is safe.
+        - ``finalizing`` needs a real ``False`` to mean settled — otherwise an
+          unreadable value ends the wait on a job that is still draining. One more
+          poll costs nothing, and ``get_job`` is the authority on when the job is
+          really terminal.
         """
         data = _required(
             data, ("jobId", "cancellationRequested", "finalizing"), "cancellation response"
         )
         return cls(
             job_id=data["jobId"],
-            cancellation_requested=bool(data["cancellationRequested"]),
-            finalizing=bool(data["finalizing"]),
+            cancellation_requested=data["cancellationRequested"] is True,
+            finalizing=data["finalizing"] is not False,
             raw=data,
         )
 
@@ -298,7 +313,12 @@ class Job:
             credits_refunded=data.get("creditsRefunded"),
             created_at=data.get("createdAt"),
             completed_at=data.get("completedAt"),
-            cancellation_requested=bool(data.get("cancellationRequested", False)),
+            # Identity, not ``bool(...)``: coercing left the two clients reading the
+            # same malformed body differently, because ``[]`` is falsy here and
+            # truthy in JavaScript. ``True`` is the only value that says the service
+            # accepted a cancellation. See ``CancellationResult.from_dict`` for why
+            # the envelope's ``finalizing`` compares the other way round.
+            cancellation_requested=data.get("cancellationRequested") is True,
             download_url=data.get("downloadUrl"),
             error=raw_error if isinstance(raw_error, dict) else None,
             page_results=_parse_page_results(data.get("pageResults")),

@@ -54,6 +54,15 @@ function json(status: number, body: unknown, headers: Record<string, string> = {
   });
 }
 
+/**
+ * Values a documented boolean field must never be read through truthiness.
+ *
+ * The same list is pinned in `python/tests/test_client.py`, and both ends must
+ * agree on every entry — that agreement is the point of the tests that use it.
+ * `[]` and `{}` are the two that used to disagree: truthy here, falsy there.
+ */
+const NOT_A_BOOLEAN = [0, 1, "", "no", "false", [], {}] as const;
+
 /** A fake fetch that also records every call, so tests can assert on what was sent. */
 type RecordingFetch = typeof fetch & {
   calls: Array<{ url: string; init: RequestInit }>;
@@ -926,19 +935,14 @@ describe("Job", () => {
     expect(Job.fromJson({ jobId: "old", status: "processing" }).cancellationRequested).toBe(false);
   });
 
-  it("coerces the cancellation marker instead of parking a non-boolean in it", () => {
-    // The field is declared `boolean`, and `?? false` let anything non-null sit in
-    // it — a string or an array, typed as a boolean. `parseCancellationResult`, in
-    // the same file, has always coerced; this brings the two envelopes into line.
-    for (const [sent, expected] of [
-      [0, false],
-      ["", false],
-      ["no", true],
-      [1, true],
-    ] as const) {
+  it("reads only a real `true` as the cancellation marker", () => {
+    // Coercing was the first fix, and it was not enough: truthiness is not the same
+    // test in the two languages this API is served by. `parseCancellationResult`
+    // carries the reasoning; what is pinned here is that no value but `true` gets
+    // to claim a cancellation went through.
+    for (const sent of NOT_A_BOOLEAN) {
       const job = Job.fromJson({ jobId: "j", status: "processing", cancellationRequested: sent });
-      expect(job.cancellationRequested).toBe(expected);
-      expect(typeof job.cancellationRequested).toBe("boolean");
+      expect(job.cancellationRequested).toBe(false);
     }
   });
 
@@ -2477,6 +2481,23 @@ describe("required response fields", () => {
     });
   });
 
+  it("reads the two cancellation booleans by identity, each failing safe", async () => {
+    // The two fields compare opposite ways, and this is where that is held in
+    // place: an unreadable value must not claim a cancellation went through, and
+    // must not report a still-draining job as settled. `parseCancellationResult`
+    // carries the reasoning for both.
+    for (const sent of NOT_A_BOOLEAN) {
+      const result = await client(
+        fetchSequence(
+          json(200, { jobId: "j", cancellationRequested: sent, finalizing: sent }),
+        ),
+      ).cancel("j");
+
+      expect(result.cancellationRequested).toBe(false);
+      expect(result.finalizing).toBe(true);
+    }
+  });
+
   it("checks page-entry types rather than coercing them", async () => {
     for (const entry of [
       { pageNumber: "3", status: "converted" }, // numeric string, not a number
@@ -2525,9 +2546,18 @@ describe("required response fields", () => {
       [{ code: 7 }, "CONVERSION_FAILED", "", false],
       [{ code: "" }, "CONVERSION_FAILED", "", false],
       [{ message: 42 }, "CONVERSION_FAILED", "", false],
-      [{ retryable: [] }, "CONVERSION_FAILED", "", false],
-      [{ retryable: "yes" }, "CONVERSION_FAILED", "", false],
-      [{ retryable: 1 }, "CONVERSION_FAILED", "", false],
+      // Every value that is not a boolean, from the one list both suites pin, so
+      // this field and the cancellation markers cannot drift apart on what counts
+      // as unreadable.
+      ...NOT_A_BOOLEAN.map(
+        (sent) =>
+          [{ retryable: sent }, "CONVERSION_FAILED", "", false] as [
+            Record<string, unknown>,
+            string,
+            string,
+            boolean,
+          ],
+      ),
       // Nothing said about it at all is the same answer, for the same reason.
       [{ code: "CONVERSION_TIMEOUT" }, "CONVERSION_TIMEOUT", "", false],
       // A well-formed error still arrives untouched.

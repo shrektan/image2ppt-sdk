@@ -49,6 +49,14 @@ from image2ppt import (
 )
 from image2ppt._compress import compress_image_for_upload
 
+#: Values a documented boolean field must never be read through truthiness.
+#:
+#: The same list is pinned in ``typescript/test/client.test.ts``, and both ends
+#: must agree on every entry — that agreement is the point of the tests that use
+#: it. ``[]`` and ``{}`` are the two that used to disagree: falsy here, truthy
+#: there.
+NOT_A_BOOLEAN = [0, 1, "", "no", "false", [], {}]
+
 
 class FakeResponse:
     def __init__(self, status_code=200, json_body=None, content=b"", headers=None, raise_json=False):
@@ -562,6 +570,19 @@ def test_job_from_dict_maps_camelcase():
     assert job.credits_refunded == 1
     assert job.cancellation_requested
     assert not Job.from_dict({"jobId": "old", "status": "processing"}).cancellation_requested
+
+
+@pytest.mark.parametrize("sent", NOT_A_BOOLEAN)
+def test_only_a_real_true_is_the_cancellation_marker(sent):
+    """Coercing was the first fix, and it was not enough.
+
+    Truthiness is not the same test in the two languages this API is served by.
+    ``CancellationResult.from_dict`` carries the reasoning; what is pinned here is
+    that no value but ``True`` gets to claim a cancellation went through.
+    """
+    job = Job.from_dict({"jobId": "j", "status": "processing", "cancellationRequested": sent})
+
+    assert job.cancellation_requested is False
 
 
 def test_job_preserves_legacy_positional_constructor_order():
@@ -2150,6 +2171,22 @@ def test_false_is_an_answer_not_an_absence():
     assert result.finalizing is False
 
 
+@pytest.mark.parametrize("sent", NOT_A_BOOLEAN)
+def test_the_two_cancellation_booleans_are_read_by_identity_each_failing_safe(sent):
+    """The two fields compare opposite ways, and this is where that is held in place.
+
+    An unreadable value must not claim a cancellation went through, and must not
+    report a still-draining job as settled. ``CancellationResult.from_dict``
+    carries the reasoning for both.
+    """
+    result = CancellationResult.from_dict(
+        {"jobId": "j", "cancellationRequested": sent, "finalizing": sent}
+    )
+
+    assert result.cancellation_requested is False
+    assert result.finalizing is True
+
+
 @pytest.mark.parametrize(
     "entry",
     [
@@ -2204,9 +2241,10 @@ def test_a_page_error_that_is_not_an_object_reads_as_no_error(bad_error):
         ({"code": 7}, "CONVERSION_FAILED", "", False),
         ({"code": ""}, "CONVERSION_FAILED", "", False),
         ({"message": 42}, "CONVERSION_FAILED", "", False),
-        ({"retryable": []}, "CONVERSION_FAILED", "", False),
-        ({"retryable": "yes"}, "CONVERSION_FAILED", "", False),
-        ({"retryable": 1}, "CONVERSION_FAILED", "", False),
+        # Every value that is not a boolean, from the one list both suites pin, so
+        # this field and the cancellation markers cannot drift apart on what counts
+        # as unreadable.
+        *(({"retryable": sent}, "CONVERSION_FAILED", "", False) for sent in NOT_A_BOOLEAN),
         # Nothing said about it at all is the same answer, for the same reason.
         ({"code": "CONVERSION_TIMEOUT"}, "CONVERSION_TIMEOUT", "", False),
         # A well-formed error still arrives untouched.

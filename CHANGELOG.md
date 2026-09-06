@@ -3,6 +3,19 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## Unreleased
+
+### Fixed
+
+- **Both clients** — the two booleans in a cancellation response, and the
+  `cancellation_requested` / `cancellationRequested` marker on a job snapshot, are
+  read by identity rather than truthiness. Coercing them was not the same test in
+  the two languages — `[]` is truthy in JavaScript and falsy in Python — so a
+  malformed body meant opposite things to the two clients for one API. Each field
+  now falls to the side that costs a caller nothing when the value cannot be read:
+  only a real `true` says a cancellation was accepted, and only a real `false` says
+  a job has finished winding down. A well-formed response is unaffected.
+
 ## 0.5.0
 
 Error handling, end to end. Both clients now report **which pages** of a job did
