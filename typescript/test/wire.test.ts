@@ -218,16 +218,31 @@ describe("submitting over a real socket", () => {
     // thing an idle timeout exists to prevent. In pieces, the runtime only takes the
     // next one once the previous one has gone, so what gets reported is the transfer
     // as it really moves.
+    // The two numbers below are what make this test able to fail. The upload has to
+    // outrun a whole budget end to end while never going quiet for anything close
+    // to one: a budget the entire transfer fits inside would pass just as happily
+    // against a `timeoutMs` that capped total request time, which is the very thing
+    // this test exists to rule out. It sat that way for a while — a 10s budget on a
+    // 3.5s transfer — and proved nothing.
+    //
+    // Neither margin is threatened by a loaded runner, and they are not threatened
+    // symmetrically. Elapsed time cannot fall below `pieces × sipMs`, because a
+    // timer never fires early and load only slows a transfer down, so the ~3.5x it
+    // clears the budget by is a floor rather than an average. The pause between
+    // pieces belongs to the receiver rather than to the runner — the server hands
+    // the socket back after `sipMs` — and stays a fiftieth of the budget however
+    // slow the machine is. Widening either number costs seconds on every run for
+    // headroom that is already structural: `sipMs` is what this test spends its
+    // wall clock on, one piece at a time.
+    //
+    // What only a real socket can add is here and nowhere else: that the runtime
+    // paces the body against back-pressure instead of swallowing it whole. The
+    // idle-vs-total rule itself is pinned in milliseconds by an injected-`fetch`
+    // unit test ("lets a slow but moving upload run past the idle budget"), and the
+    // 64KiB piece size by another — this test is the end-to-end counterpart to
+    // both, not their replacement.
     const sipMs = 20;
-    // Deliberately far above anything this transfer should go quiet for, because
-    // this test is not the one that pins the piece size — a unit test does that,
-    // by reading the body and checking no piece exceeds 64KiB, which no amount of
-    // CI load can perturb. Trying to make *this* test tell the two apart meant a
-    // budget sitting inside a window narrow enough for a loaded runner to fall
-    // outside of: flaky when tight, and silently proving nothing when widened
-    // enough to stop being flaky. What is left here is the end-to-end claim that
-    // needs a real socket: a multi-second upload over a slow link completes.
-    const idleBudgetMs = 10_000;
+    const idleBudgetMs = 1_000;
     await new Promise<void>((resolve) => server.close(() => resolve()));
     let bytesIn = 0;
     server = createServer((req, res) => {
@@ -260,10 +275,10 @@ describe("submitting over a real socket", () => {
     const elapsed = Date.now() - started;
 
     expect(job.jobId).toBe("job-slow");
-    // Proof the upload really did crawl rather than the server having quietly
-    // swallowed everything at full speed — without pinning the number so close to
-    // the budget that a slow runner decides the outcome.
-    expect(elapsed).toBeGreaterThan(2_000);
+    // Proof the upload really did outlive a whole idle budget while never once
+    // going quiet for longer than one — the same claim the download direction
+    // makes below, and the one a total-time cap could not satisfy.
+    expect(elapsed).toBeGreaterThan(idleBudgetMs);
     expect(bytesIn).toBeGreaterThan(8_000_000);
   }, 120_000);
 
