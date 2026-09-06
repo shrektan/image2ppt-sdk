@@ -2170,14 +2170,22 @@ describe("platform errors are wrapped", () => {
     expect(String((err as Error).message)).toContain("ENOENT");
   });
 
-  it("reports the disk's failure even once back-pressure is in play", async () => {
-    // The same claim as above, reached down a different path. A deck large enough
-    // to fill the write buffer makes `write` return false, so the failure arrives
-    // while the client is parked waiting for the disk to catch up rather than while
-    // it is reading the socket — a wait that has to end in the disk's own error
-    // rather than hanging or being relabelled. A refused destination also reports
-    // more than once under these conditions, which is why the failure is listened
-    // for rather than awaited once.
+  it("reports the disk's failure with a deck-sized body still on the wire", async () => {
+    // The same claim as above with a body big enough to be a real deck, so a
+    // refusal cannot be passed off as something only tiny responses survive.
+    //
+    // It does *not* reach that claim down a second path, and it is worth saying so
+    // rather than leaving the next reader to assume otherwise: `writeFile` opens
+    // the destination before it pulls the first chunk, so a directory that is not
+    // there fails at `open` and the body is never read — no write happens, and no
+    // back-pressure with it. Chunk size changes nothing about that.
+    //
+    // The path this leaves untested is a disk that accepts the first bytes and
+    // then fails (`ENOSPC` mid-write). That one turns on `writeFile` closing the
+    // generator with `return()` rather than `throw()`, so `readingBody`'s `catch`
+    // stays out of it and the raw disk error survives — provoking it needs a
+    // filesystem that fills up, which is not something a unit test can arrange
+    // portably. See #8.
     const dest = join(dir, "no-such-directory", "deck.pptx");
     const big = "x".repeat(64 * 1024);
     const f = streamingFetch([big, big, big, big], 1);

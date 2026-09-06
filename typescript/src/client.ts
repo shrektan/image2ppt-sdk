@@ -338,8 +338,12 @@ function downloadCutOff(err: unknown, jobId: string): Error {
  * to wrap it. The disk's own error is never seen by this function at all, so it
  * reaches the caller as it happened: `ENOSPC`, `EACCES`, `ENOENT`, naming the
  * problem they have to go and fix. None of this SDK's errors would say anything
- * truer than the operating system already did. It is the shape the Python client
- * has always had, where only the read side sits inside the transport wrapper.
+ * truer than the operating system already did. The Python client has always ended
+ * up in the same place, though not by this route: its write sits *inside* the
+ * transport wrapper, and the disk still gets through because that wrapper only
+ * catches `requests` exceptions and an `OSError` is not one. Worth knowing before
+ * widening what it catches to keep the two "in sync" — that would undo there
+ * exactly what this function is here to do.
  *
  * `onChunk` is the idle watchdog's per-chunk signal, which is what lets a
  * slow-but-moving download run as long as it needs to. A *stalled* disk is still
