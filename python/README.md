@@ -213,7 +213,9 @@ while True:
 
 ## Errors
 
-Every exception subclasses `Image2PPTError` and carries `status_code`, `code`, and `message`. Branch on `code`, not `message`. **A raw `requests` exception never reaches you** — a dropped connection, a per-request timeout, and a response body this client cannot parse all arrive as the SDK types below, with the original exception kept as `__cause__`.
+Every exception this client raises about a *request* subclasses `Image2PPTError` and carries `status_code`, `code`, and `message`. Branch on `code`, not `message`. **A raw `requests` exception never reaches you** — a dropped connection, a per-request timeout, and a response body this client cannot parse all arrive as the SDK types below, with the original exception kept as `__cause__`.
+
+**Your own filesystem is the exception, deliberately.** If `download` cannot write where you asked it to, you get the operating system's `OSError` — `ENOSPC`, `EACCES`, `ENOENT` — because that names the thing you have to go and fix, and no error of ours would say it better. So catch `OSError` alongside `Image2PPTError` around `download`. The Node client draws the same line.
 
 | Exception | HTTP | code |
 |---|---|---|
@@ -259,7 +261,7 @@ except Image2PPTError as e:
 
 ### Which failures are worth retrying
 
-Every exception carries `is_transient`, and it is the same question `wait()` asks itself before polling again: **would repeating this exact read plausibly work?**
+Every `Image2PPTError` carries `is_transient`, and it is the same question `wait()` asks itself before polling again: **would repeating this exact read plausibly work?** (A raw `OSError` from `download` has no such attribute; that is the same exception as above, and it is never transient — free the space or fix the permission first.)
 
 ```python
 except Image2PPTError as e:

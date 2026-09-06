@@ -150,7 +150,7 @@ console.log(email, "credits:", credits);
 - **A deprecated SDK version logs one warning.** If this version is below the lowest the service still supports, the response carries a `Deprecation` header and the client warns once (`console.warn`). Pass `warnOnDeprecated: false` to `Image2PPTClient` to silence it.
 - **Time units.** `pollIntervalMs` and `timeoutMs` are in **milliseconds** (idiomatic for Node's timers).
 - **The 60-second request timeout is idle time, not total time.** `timeoutMs` (default 60000) is how long one request may go with **no data moving in either direction** — it is not a cap on how long a request may take. A 40MB upload or a large PPTX download that keeps making progress runs as long as it needs to; only a transfer that actually stalls is given up on, as `APITimeoutError`. A request that never gets a response at all is covered by the same clock. This matches the Python client's read timeout, so the two SDKs behave the same way on a slow link.
-- **Every failure is an `Image2PPTError`.** A refused connection, a reset mid-download, a 2xx that comes back as a proxy's HTML login page, a job body missing its own id — all of them arrive as an SDK error with the original kept on `.cause`, never as a raw `TypeError: fetch failed` or `SyntaxError`.
+- **Every failure of the request is an `Image2PPTError`.** A refused connection, a reset mid-download, a 2xx that comes back as a proxy's HTML login page, a job body missing its own id — all of them arrive as an SDK error with the original kept on `.cause`, never as a raw `TypeError: fetch failed` or `SyntaxError`. **Your own filesystem is the exception, deliberately:** if `download` cannot write where you asked it to, you get the operating system's error — `ENOSPC`, `EACCES`, `ENOENT` — because that names the thing you have to go and fix, and no error of ours would say it better. The Python client draws the same line.
 
 > Both the Node and Python SDKs pre-compress images that need processing before upload. PNG/JPEG files already at most 1MiB with a longest edge at most 2000px upload byte-for-byte unchanged. Other PNG/JPEG files, and all WebP/GIF files, may be resized, flattened onto white, and sent as JPEG; PDFs are never compressed or decoded and are streamed unchanged.
 
@@ -206,9 +206,9 @@ for (;;) {
 
 ## Errors
 
-Every error subclasses `Image2PPTError` and carries `statusCode`, `code`, and `message`. Branch on `code`, not `message`.
+Every error this client raises about a *request* subclasses `Image2PPTError` and carries `statusCode`, `code`, and `message`. Branch on `code`, not `message`. The one thing that reaches you unwrapped is a failure of your own disk while `download` is writing — see the note above.
 
-Every error also carries **`isTransient`** — whether **repeating this exact read** later could plausibly succeed. It is what `wait()` uses to decide whether a failed status poll should be backed off and retried or should end the wait: `true` for a 5xx, a dropped connection and a stalled request, `false` for a bad key, a job that does not exist, or a response this client cannot parse.
+Every `Image2PPTError` also carries **`isTransient`** — whether **repeating this exact read** later could plausibly succeed. (A raw filesystem error from `download` has no such field; that is the same exception as above, and it is never transient — free the space or fix the permission first.) It is what `wait()` uses to decide whether a failed status poll should be backed off and retried or should end the wait: `true` for a 5xx, a dropped connection and a stalled request, `false` for a bad key, a job that does not exist, or a response this client cannot parse.
 
 **It says nothing about submitting.** `submit()` is never retried on this signal, and neither should your code be: a lost response cannot be told apart from a submission the server accepted, and there is no idempotency key, so resending the same files can create the same job twice and **charge you twice**. Only a `RateLimitedError` is retried on the submit path — a 429 is the service explicitly saying it took nothing.
 

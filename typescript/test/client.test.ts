@@ -2141,6 +2141,83 @@ describe("platform errors are wrapped", () => {
     expect((err as Error).cause).toBe(reset);
   });
 
+  it("reports a download the disk refused as the disk's own failure", async () => {
+    // The contrast with the test above, and the reason the two are not one code
+    // path. Both ends of a download can fail, and they call for opposite answers:
+    // a dropped connection is worth another try, a full or unwritable disk is not.
+    // Dressing the second up as the first hands a caller an `isTransient` marker
+    // that invites them to retry something that cannot succeed until they free
+    // space or fix a permission.
+    //
+    // A destination whose directory does not exist is the one way to provoke this
+    // that behaves the same everywhere — a read-only directory does not stop root,
+    // which is who CI often runs as.
+    //
+    // The body has to still be arriving when the disk gives up, which is what makes
+    // this the interesting case rather than a rare one: a deck big enough to be
+    // worth streaming is *always* still arriving. A body that fits in one piece is
+    // already finished by then, nothing is left for the disk's failure to be
+    // mistaken for, and the bug this pins does not appear.
+    const dest = join(dir, "no-such-directory", "deck.pptx");
+    const f = streamingFetch(["PK first", "second", "third"], 10);
+
+    const err = await client(f).download("j", dest).catch((e: unknown) => e);
+
+    expect(err).not.toBeInstanceOf(APIConnectionError);
+    expect((err as { isTransient?: boolean }).isTransient).not.toBe(true);
+    // The reason the disk gave has to survive: "ENOENT" is what tells the caller
+    // which of their own problems this is.
+    expect(String((err as Error).message)).toContain("ENOENT");
+  });
+
+  it("reports the disk's failure with a deck-sized body still on the wire", async () => {
+    // The same claim as above with a body big enough to be a real deck, so a
+    // refusal cannot be passed off as something only tiny responses survive.
+    //
+    // It does *not* reach that claim down a second path, and it is worth saying so
+    // rather than leaving the next reader to assume otherwise: `writeFile` opens
+    // the destination before it pulls the first chunk, so a directory that is not
+    // there fails at `open` and the body is never read — no write happens, and no
+    // back-pressure with it. Chunk size changes nothing about that.
+    //
+    // The path this leaves untested is a disk that accepts the first bytes and
+    // then fails (`ENOSPC` mid-write). That one turns on `writeFile` closing the
+    // generator with `return()` rather than `throw()`, so `readingBody`'s `catch`
+    // stays out of it and the raw disk error survives — provoking it needs a
+    // filesystem that fills up, which is not something a unit test can arrange
+    // portably. See #8.
+    const dest = join(dir, "no-such-directory", "deck.pptx");
+    const big = "x".repeat(64 * 1024);
+    const f = streamingFetch([big, big, big, big], 1);
+
+    const err = await client(f).download("j", dest).catch((e: unknown) => e);
+
+    expect(err).not.toBeInstanceOf(APIConnectionError);
+    expect(String((err as Error).message)).toContain("ENOENT");
+  });
+
+  it("lets go of the connection when the disk refuses the download", async () => {
+    // A download that cannot be written has no reason to keep reading the socket,
+    // and every reason not to: the body is still arriving, and walking away from it
+    // leaves the connection stuck open for as long as the process lives. Nothing in
+    // the happy path notices this, which is exactly why it is pinned here.
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(64 * 1024));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const dest = join(dir, "no-such-directory", "deck.pptx");
+    const f = fetchSequence(new Response(body, { status: 200 }));
+
+    await expect(client(f).download("j", dest)).rejects.toThrow(/ENOENT/);
+
+    expect(cancelled).toBe(true);
+  });
+
   it("reports an error body that stops arriving as APIConnectionError", async () => {
     // A `download` response is streamed, so on a failure status the `{ error: ... }`
     // envelope has not arrived yet and the connection can still die while it is being
