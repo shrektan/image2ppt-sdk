@@ -23,6 +23,14 @@ here. The two clients share a single version number.
   caller unchanged, naming the problem they have to fix. A download that stops
   *arriving* is unaffected and still raises `APIConnectionError`; the Python
   client already drew the line here.
+- **API reference** — the note on when `pageResults` is absent no longer names a
+  date. It said the field is omitted for jobs submitted before September 2026,
+  and that was not true: jobs submitted well inside that window do carry a
+  per-page ledger, so anyone who read the sentence as a rule and skipped
+  `pageResults` for those jobs was skipping data that is really there. No date
+  replaces it, because the boundary is not a date a caller can check against.
+  **Test whether the field is present** — the same advice the sentence always
+  ended with, and now the only thing it says.
 
 ## 0.5.0
 
