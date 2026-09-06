@@ -15,6 +15,14 @@ here. The two clients share a single version number.
   now falls to the side that costs a caller nothing when the value cannot be read:
   only a real `true` says a cancellation was accepted, and only a real `false` says
   a job has finished winding down. A well-formed response is unaffected.
+- **Node** — a download that fails because of the *disk* — no space, no
+  permission, a destination directory that is not there — is no longer reported
+  as `APIConnectionError`. It was, complete with the `isTransient` marker that
+  invites a retry, so a caller with a full disk could retry forever. The
+  operating system's own error (`ENOSPC`, `EACCES`, `ENOENT`) now reaches the
+  caller unchanged, naming the problem they have to fix. A download that stops
+  *arriving* is unaffected and still raises `APIConnectionError`; the Python
+  client already drew the line here.
 
 ## 0.5.0
 

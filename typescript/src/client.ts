@@ -1,11 +1,10 @@
 /** The image2ppt API client. */
 
 import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 // Imported from `node:timers` rather than taken off the global, and that is
 // load-bearing: the test suite spies on `globalThis.setTimeout` to assert on the
 // delays this client *waits* for (retry backoff, poll intervals). The idle
@@ -323,42 +322,40 @@ function downloadCutOff(err: unknown, jobId: string): Error {
 /**
  * The response body, reporting progress and owning its failures.
  *
- * Written as a `pipeline` transform stage, so it is handed the source as an async
- * iterable and yields onward to the file. The download is consumed outside the
- * `fetch` call, so nothing there could wrap a body that died mid-stream — it used
- * to reach the caller as whatever the stream threw. Reading it here gives that
- * failure a home, and gives the idle watchdog the per-chunk signal that lets a
+ * A download can fail at either end, and the two call for opposite answers: a body
+ * that stopped arriving is worth another try, a disk that is full or unwritable is
+ * not. So the two must never be told apart by guessing — which is what the
+ * `pipeline` this replaced forced on the client. `pipeline` ties its ends together
+ * by design, destroying the source with whatever the destination raised, so the
+ * listener watching for a dropped connection was handed the disk's error and
+ * wrapped it as a transport failure. Ordering could not break the tie either:
+ * which end reports first differs across the Node versions this package supports,
+ * and getting off that dependency was the point of the fix before this one.
+ *
+ * Wrapping the read side *here*, and letting `writeFile` own the write side, keeps
+ * them apart by construction. Whatever the body throws becomes an
+ * `APIConnectionError` — a body consumed outside the `fetch` call has nothing else
+ * to wrap it. The disk's own error is never seen by this function at all, so it
+ * reaches the caller as it happened: `ENOSPC`, `EACCES`, `ENOENT`, naming the
+ * problem they have to go and fix. None of this SDK's errors would say anything
+ * truer than the operating system already did. It is the shape the Python client
+ * has always had, where only the read side sits inside the transport wrapper.
+ *
+ * `onChunk` is the idle watchdog's per-chunk signal, which is what lets a
  * slow-but-moving download run as long as it needs to.
- *
- * A disk error is not rewritten into a transport one — `pipeline` reports the
- * failure the write stream raised. A *stalled* disk is a different matter and is
- * not distinguished: this stage only kicks the watchdog when a body chunk is read,
- * and `pipeline` stops pulling from the body while the write stream is applying
- * backpressure. So a destination that has stopped accepting bytes without failing
- * will eventually trip the idle timeout, and the message will talk about the
- * request rather than the disk. Rare, and the transfer really has stopped either
- * way, but the reason it names may be the wrong one.
- *
- * `failure` is where the wrapped error is left for the caller to pick up.
- * `pipeline` rejects with whichever error came *first*, and when the body dies that
- * is the raw stream error the source stage raised, an instant before this one
- * rethrows it wrapped — so the wrapped error would otherwise be dropped on the
- * floor. A failure from the disk side never sets it and stays as it happened.
  */
 async function* readingBody(
   body: AsyncIterable<Uint8Array>,
   jobId: string,
   onChunk: () => void,
-  failure: { error?: Error },
-): AsyncGenerator<Buffer> {
+): AsyncGenerator<Uint8Array> {
   try {
     for await (const chunk of body) {
       onChunk();
-      yield chunk as Buffer;
+      yield chunk;
     }
   } catch (err) {
-    failure.error = downloadCutOff(err, jobId);
-    throw failure.error;
+    throw downloadCutOff(err, jobId);
   }
 }
 
@@ -714,36 +711,36 @@ export class Image2PPTClient {
             // (mirrors the Python client's iter_content streaming). A deck of any
             // size downloads fine as long as bytes keep arriving — see `timeoutMs`.
             //
-            // `readingBody` goes in as a transform *stage*, not wrapped in
-            // `Readable.from`: that wrapper defaults to object mode, so it would sit
-            // in the middle holding up to sixteen buffered chunks — around a megabyte
-            // of deck that need never be in memory — and add a push/read/backpressure
-            // round trip to every chunk on the way past.
-            const bodyFailure: { error?: Error } = {};
+            // `writeFile` over an async iterable, not a `pipeline`: it awaits each
+            // write, so back-pressure is inherent and the deck never piles up in
+            // memory, and — the reason this download stopped using `pipeline` — it
+            // keeps the two ends' failures apart. See `readingBody`.
+            //
+            // `Readable.fromWeb` rather than iterating the web stream directly:
+            // async iteration over a `ReadableStream` has not been available for the
+            // whole range of Node versions this package supports, and the adapter
+            // has. It is a byte-mode wrapper, so it does not buffer a megabyte of
+            // deck the way an object-mode one would.
             const source = Readable.fromWeb(
               res.body as Parameters<typeof Readable.fromWeb>[0],
             );
-            // Catch the body's failure at the source, where it happens, rather than
-            // relying on it surfacing inside the transform stage. Which stage's
-            // error `pipeline` reports, and whether a destroyed transform gets to
-            // see the one that killed it, differ across the Node versions this
-            // package supports: on Node 20 the raw source error wins and the
-            // transform never observes it, so a dropped download reached callers
-            // unwrapped. Listening here is version-independent.
-            source.on("error", (err: unknown) => {
-              bodyFailure.error ??= downloadCutOff(err, jobId);
-            });
+            // Load-bearing, despite doing nothing: a stream's `error` with no listener
+            // takes the whole process down, and `pipeline` is no longer here to hold
+            // one open. `fromWeb` wires the body's failure to this stream from the
+            // moment it is built, but nothing is iterating it yet while `writeFile`
+            // is opening the file — so a connection reset inside that window has
+            // nowhere to go. It decides nothing: a failure that reaches the iterator
+            // is still what the caller hears, wrapped by `readingBody`.
+            source.on("error", () => undefined);
             try {
-              await pipeline(
-                source,
-                (piped) => readingBody(piped, jobId, () => watchdog.kick(), bodyFailure),
-                createWriteStream(partial),
-              );
-            } catch (err) {
-              // Prefer the wrapped body failure when there is one. Anything else —
-              // the disk side — passes through untouched: it is not a transport
-              // failure and must not be dressed up as one.
-              throw bodyFailure.error ?? err;
+              await writeFile(partial, readingBody(source, jobId, () => watchdog.kick()));
+            } finally {
+              // A destination that could not even be opened leaves `writeFile` never
+              // starting the iterator at all, so nothing closes the body and the
+              // connection stays open for the life of the process. (A write that
+              // fails midway does close it, by throwing out of the `for await`.)
+              // Destroying the source covers both, and is a no-op once it has ended.
+              source.destroy();
             }
           } else {
             // No body stream (shouldn't happen for a 200 download): buffer as a
