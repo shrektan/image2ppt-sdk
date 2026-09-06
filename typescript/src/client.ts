@@ -342,7 +342,13 @@ function downloadCutOff(err: unknown, jobId: string): Error {
  * has always had, where only the read side sits inside the transport wrapper.
  *
  * `onChunk` is the idle watchdog's per-chunk signal, which is what lets a
- * slow-but-moving download run as long as it needs to.
+ * slow-but-moving download run as long as it needs to. A *stalled* disk is still
+ * not told apart from a stalled connection, the same as before this rewrite: the
+ * watchdog is only kicked when a body chunk is read, and the write is awaited
+ * before the next one is pulled, so a destination that has stopped accepting bytes
+ * without failing eventually trips the idle timeout and the message talks about the
+ * request rather than the disk. Rare, and the transfer really has stopped either
+ * way, but the reason it names may be the wrong one.
  */
 async function* readingBody(
   body: AsyncIterable<Uint8Array>,
@@ -982,11 +988,18 @@ export class Image2PPTClient {
    * bodies do not need to, since a JSON reply that takes longer than the whole
    * idle budget to arrive genuinely is stuck.
    *
-   * Every failure leaves here as an `Image2PPTError`. The READMEs promise that,
-   * and four different platform errors used to escape it: a transport failure as
-   * undici's opaque `TypeError: fetch failed`, an unparseable 2xx body as a raw
-   * `SyntaxError`, a job body missing its own id as no error at all, and a
+   * Every failure *of the request* leaves here as an `Image2PPTError`. The READMEs
+   * promise that, and four different platform errors used to escape it: a transport
+   * failure as undici's opaque `TypeError: fetch failed`, an unparseable 2xx body as
+   * a raw `SyntaxError`, a job body missing its own id as no error at all, and a
    * download cut off mid-stream as whatever the stream happened to throw.
+   *
+   * The caller's own disk is the one deliberate exception, and it is deliberate:
+   * `download` writes inside its `consume`, and an `ENOSPC` / `EACCES` / `ENOENT`
+   * from that write passes through here untouched, because the operating system
+   * already named the thing the caller has to go and fix. Do not be tempted to wrap
+   * it — a disk that is full is not a transport failure and must not carry
+   * `isTransient`. See `readingBody`.
    */
   async #request<T>(
     method: string,
