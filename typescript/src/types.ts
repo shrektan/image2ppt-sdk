@@ -266,6 +266,18 @@ export interface CancellationResult {
  * a job that is still draining.
  *
  * `false` is a real answer for both booleans and passes — see `requireFields`.
+ *
+ * Both are read by **identity, never truthiness** — the rule `PageError.retryable`
+ * already reads by. `[]` is truthy in JavaScript and falsy in Python, so a coerced
+ * field meant opposite things to the two clients for one API. Identity is the same
+ * test in both, and each field falls to the side that costs the caller nothing when
+ * the value cannot be read — which is why the two comparisons point opposite ways:
+ *
+ * - `cancellationRequested` needs a real `true`. Claiming a cancellation the service
+ *   never accepted is the expensive mistake; repeating the call is safe.
+ * - `finalizing` needs a real `false` to mean settled — otherwise an unreadable
+ *   value ends the wait exactly as the cast described above would. One more poll
+ *   costs nothing, and `getJob` is the authority on when the job is really terminal.
  */
 export function parseCancellationResult(data: unknown): CancellationResult {
   const d = requireFields(
@@ -275,8 +287,8 @@ export function parseCancellationResult(data: unknown): CancellationResult {
   );
   return {
     jobId: d.jobId as string,
-    cancellationRequested: Boolean(d.cancellationRequested),
-    finalizing: Boolean(d.finalizing),
+    cancellationRequested: d.cancellationRequested === true,
+    finalizing: d.finalizing !== false,
   };
 }
 
@@ -355,13 +367,13 @@ export class Job {
     this.creditsRefunded = d.creditsRefunded ?? null;
     this.createdAt = d.createdAt ?? null;
     this.completedAt = d.completedAt ?? null;
-    // `Boolean`, not `?? false`: the field is declared `boolean`, and a body that
-    // sends something else must not be allowed to sit in it. `parseCancellationResult`
-    // in this same file already coerces, and this matches the Python client's
-    // `bool()` on every scalar. It does not close the gap entirely — `[]` is truthy
-    // in JavaScript and falsy in Python — and that remainder is filed, not fixed
-    // here.
-    this.cancellationRequested = Boolean(d.cancellationRequested);
+    // Identity, not `?? false` and not `Boolean(...)`: the field is declared
+    // `boolean`, and coercing it left the two clients reading the same malformed
+    // body differently, because `[]` is truthy in JavaScript and falsy in Python.
+    // `true` is the only value that says the service accepted a cancellation. See
+    // `parseCancellationResult` for why the envelope's `finalizing` compares the
+    // other way round.
+    this.cancellationRequested = d.cancellationRequested === true;
     this.downloadUrl = d.downloadUrl ?? null;
     // Same rule as a page entry's `error` one level down: present but not an object
     // says nothing this model could report, so it reads as absent. The original is
