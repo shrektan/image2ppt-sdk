@@ -225,15 +225,24 @@ describe("submitting over a real socket", () => {
     // this test exists to rule out. It sat that way for a while — a 10s budget on a
     // 3.5s transfer — and proved nothing.
     //
-    // Neither margin is threatened by a loaded runner, and they are not threatened
-    // symmetrically. Elapsed time cannot fall below `pieces × sipMs`, because a
-    // timer never fires early and load only slows a transfer down, so the ~3.5x it
-    // clears the budget by is a floor rather than an average. The pause between
-    // pieces belongs to the receiver rather than to the runner — the server hands
-    // the socket back after `sipMs` — and stays a fiftieth of the budget however
-    // slow the machine is. Widening either number costs seconds on every run for
-    // headroom that is already structural: `sipMs` is what this test spends its
-    // wall clock on, one piece at a time.
+    // The two margins are threatened by completely different things, so they are
+    // bought separately.
+    //
+    // Elapsed time is the cheap one: it cannot fall below `pieces × sipMs` — a
+    // timer never fires early and load only slows a transfer down — so ~3.1s is a
+    // floor rather than an average, and clearing the budget is structural rather
+    // than lucky. Buying more of that margin means raising `sipMs`, which is the
+    // one number this test spends its wall clock on, a piece at a time. It is not
+    // worth seconds a run.
+    //
+    // The budget is the one that has to be bought, and it is free. The receiver
+    // lives on this same event loop, so a long enough stall holds off the
+    // `setTimeout` that resumes the socket while the watchdog's own deadline goes
+    // right on expiring — the gap between pieces is only `sipMs` when the loop is
+    // actually turning. What the budget really has to outlast is therefore the
+    // worst stall a loaded CI runner can produce, not the pause this server asks
+    // for, and doubling it costs nothing because the transfer's length does not
+    // depend on it.
     //
     // What only a real socket can add is here and nowhere else: that the runtime
     // paces the body against back-pressure instead of swallowing it whole. The
@@ -242,7 +251,7 @@ describe("submitting over a real socket", () => {
     // 64KiB piece size by another — this test is the end-to-end counterpart to
     // both, not their replacement.
     const sipMs = 20;
-    const idleBudgetMs = 1_000;
+    const idleBudgetMs = 2_000;
     await new Promise<void>((resolve) => server.close(() => resolve()));
     let bytesIn = 0;
     server = createServer((req, res) => {
