@@ -2015,8 +2015,8 @@ def test_page_results_expose_retryable():
 
 
 def test_page_results_absent_is_none_and_not_an_empty_list():
-    """The field is omitted while a job is running, and for jobs submitted before
-    the ledger existed. None means "no ledger reported"; [] would mean "a job with
+    """The field is omitted while a job is running, and for early jobs with no
+    per-page record. None means "no ledger reported"; [] would mean "a job with
     no pages" — a caller who cannot tell them apart reports zero failed pages for a
     job whose ledger simply is not there yet."""
     running = Job.from_dict({"jobId": "j", "status": "processing", "progress": 40})
