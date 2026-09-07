@@ -18,7 +18,9 @@ here. The two clients share a single version number.
 
   This also repairs links that never worked outside GitHub: both package READMEs
   pointed at `../docs/api.md`, a relative path that resolves to nothing on the
-  PyPI and npm pages where those READMEs are actually read.
+  PyPI and npm pages where those READMEs are actually read. The `Documentation`
+  URL in the Python package metadata pointed at the Chinese page next to an
+  English README, and now points at the English one.
 
 ### Fixed
 
