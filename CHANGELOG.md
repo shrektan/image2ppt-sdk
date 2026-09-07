@@ -23,6 +23,16 @@ here. The two clients share a single version number.
   caller unchanged, naming the problem they have to fix. A download that stops
   *arriving* is unaffected and still raises `APIConnectionError`; the Python
   client already drew the line here.
+- **Docs, both clients** — nothing now names a date for when `pageResults` is
+  absent. Every place that described it — this file, both package READMEs, both
+  clients' API reference for the field, and the API contract doc — said the
+  ledger is missing for jobs submitted before September 2026, and that was not
+  true: jobs submitted well inside that window do carry one. Anyone who read the
+  sentence as a rule and skipped `pageResults` for those jobs was skipping data
+  that is really there, on our own instruction. No date replaces it, because the
+  boundary is not a date a caller can check a job against. **Test whether the
+  field is present** — the same advice those sentences always ended with, and now
+  the only thing they say.
 
 ## 0.5.0
 
@@ -40,7 +50,7 @@ raises subclasses `Image2PPTError`* — is finally true.
   `PAGE_NOT_ATTEMPTED` is the code worth branching on: that page is **not in the
   delivered deck at all**, while every other failed page is present as the
   original image. The field is absent — `None` / `null`, never an empty list —
-  while a job is still running and for jobs submitted before September 2026, so
+  while a job is still running and for early jobs with no per-page record, so
   check that it is present rather than assuming a terminal job carries it.
 - **Both clients** — `APIConnectionError` for transport failures (connection
   refused or reset, DNS or TLS failure, a body that stopped arriving), with

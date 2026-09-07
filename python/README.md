@@ -125,9 +125,9 @@ since a code added later may carry `False`.
 
 **`None` and `[]` are different facts.** `page_results` is `None` when the job reported
 no ledger at all: it is still running (while it is, "this page failed" and "this page
-has not had its turn" are indistinguishable), or it was submitted before September
-2026. An empty list would mean a job with no pages. Check
-`is not None` before iterating.
+has not had its turn" are indistinguishable), or it is an early job with no per-page
+record. An empty list would mean a job with no pages. Check `is not None` before
+iterating.
 
 ## What language error messages come back in
 
@@ -164,7 +164,7 @@ Whatever the language, `code` never changes with it. Keep branching on `code`.
 - **The 60-second request timeout is idle time, not total time.** `timeout` (default 60) is how long one request may go with **no data moving** — it is not a cap on how long a request may take. A 40MB upload or a large PPTX download that keeps making progress runs as long as it needs to; only a transfer that actually stalls is given up on, as `APITimeoutError`. A request that never gets a response at all is covered by the same clock. The Node SDK's `timeoutMs` means exactly the same thing, so the two clients behave the same way on a slow link.
 - **Every request identifies the client** with a `User-Agent` of `image2ppt-python/<version>`. The service uses this to tell SDK versions apart — it is not part of authentication and never changes a request's outcome.
 - **A deprecated SDK version logs one warning.** If this version is below the lowest the service still supports, the response carries a `Deprecation` header and the client warns once (logger `image2ppt`). Pass `warn_on_deprecated=False` to `Image2PPTClient` to silence it.
-- **Client-side pre-compression.** Images are compressed to the server's spec before upload (≤2000px, ≤1MB, JPEG), so the server's own pass is a no-op and you send fewer bytes. PDFs are uploaded as-is and rendered server-side.
+- **Client-side pre-compression.** Images are compressed before upload (≤2000px, ≤1MB, JPEG) — the same shape the API works from, so you send fewer bytes without changing the result. PDFs are uploaded as-is.
 
 ## More files than one request can hold
 

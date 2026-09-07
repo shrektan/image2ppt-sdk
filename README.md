@@ -2,7 +2,7 @@
 
 Official SDKs for the [image2ppt](https://image2ppt.com) API — turn images and PDFs into **editable** PowerPoint (`.pptx`) decks.
 
-You send a batch of images or PDF pages; image2ppt reconstructs the layout with AI (OCR, vision, segmentation) into editable text and shapes, and hands you back one `.pptx`.
+You send a batch of images or PDF pages; image2ppt reconstructs the layout with AI into editable text and shapes, and hands you back one `.pptx`.
 
 > This repository contains only the client SDKs, examples, and API docs. The conversion engine is a hosted service at [image2ppt.com](https://image2ppt.com).
 

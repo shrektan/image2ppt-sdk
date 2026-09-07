@@ -2434,8 +2434,8 @@ describe("pageResults", () => {
   });
 
   it("tells an absent ledger apart from an empty one", async () => {
-    // Absent is what a running job and a pre-September-2026 job both look like:
-    // "no per-page record exists". Empty would claim the job had no pages.
+    // Absent is what a running job and an early job with no per-page record both
+    // look like: "no per-page record exists". Empty would claim the job had no pages.
     const older = await client(
       fetchSequence(json(200, { jobId: "j", status: "completed", slideCount: 2 })),
     ).getJob("j");

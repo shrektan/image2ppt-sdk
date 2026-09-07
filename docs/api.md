@@ -3,8 +3,8 @@
 # Image2PPT API
 
 Batch-convert images and PDFs into **editable** PowerPoint (`.pptx`). You upload a
-batch of files; Image2PPT reconstructs the layout with AI (OCR, vision,
-segmentation) into editable text and shapes, and hands you back one `.pptx`.
+batch of files; Image2PPT reconstructs the layout with AI into editable text and
+shapes, and hands you back one `.pptx`.
 
 This doc is for developers integrating the API — read it top to bottom and you're
 ready to ship.
@@ -239,9 +239,8 @@ page in page order; its length equals `slideCount`. It is omitted before that �
 while a job is still running, "this page didn't convert" and "this page hasn't
 had its turn yet" are not distinguishable.
 
-(It is also omitted for jobs submitted before September 2026, which have no
-per-page record. Check whether the field is present rather than assuming every
-terminal job carries it.)
+(It is also omitted for early jobs that have no per-page record. Check whether
+the field is present rather than assuming every terminal job carries it.)
 
 `creditsRefunded` only tells you **how many** pages did not convert.
 `pageResults` tells you **which ones**.
@@ -290,7 +289,8 @@ it would silently stop matching those branches. The finer reasons live in
 `pageResults`, which is new field surface with no such history.
 
 `message` is a human-readable sentence that follows your `Accept-Language`
-header — **do not branch on it**, branch on `code`.
+header — **do not branch on it**, branch on `code`. It never carries
+diagnostic detail.
 
 Either level may gain new codes later. Treat a `code` you do not recognise as
 `CONVERSION_FAILED`.
