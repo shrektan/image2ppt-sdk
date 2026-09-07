@@ -5,6 +5,23 @@ here. The two clients share a single version number.
 
 ## Unreleased
 
+### Changed
+
+- **Docs** — the HTTP reference is no longer kept as a copy in this repository.
+  `docs/api.md` and `docs/api.zh.md` are now short pointers to the published
+  reference at <https://image2ppt.com/en/docs/api> (中文：<https://image2ppt.com/docs/api>),
+  and every link in the READMEs goes straight there. A copy has to be re-synced
+  by hand each time the contract moves, and in between it can be wrong without
+  anyone noticing — the `pageResults` date entry below is what that looks like
+  in practice, and re-aligning the copy afterwards took a release of its own.
+  There is one published page now, and nothing to keep in step with it.
+
+  This also repairs links that never worked outside GitHub: both package READMEs
+  pointed at `../docs/api.md`, a relative path that resolves to nothing on the
+  PyPI and npm pages where those READMEs are actually read. The `Documentation`
+  URL in the Python package metadata pointed at the Chinese page next to an
+  English README, and now points at the English one.
+
 ### Fixed
 
 - **Both clients** — the two booleans in a cancellation response, and the

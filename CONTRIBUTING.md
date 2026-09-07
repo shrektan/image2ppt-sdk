@@ -14,9 +14,10 @@ Please don't paste your API key into an issue.
 
 ## What lives here
 
-This repo holds only the client SDKs, examples, and API docs. The conversion
-engine is a hosted service — SDK changes here are about the client experience
-(ergonomics, error handling, docs, types), not the conversion itself.
+This repo holds only the client SDKs and their examples. The HTTP reference is
+published at <https://image2ppt.com/en/docs/api> and is not kept here. The
+conversion engine is a hosted service — SDK changes here are about the client
+experience (ergonomics, error handling, docs, types), not the conversion itself.
 
 ## Local development
 

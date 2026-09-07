@@ -1605,9 +1605,9 @@ describe("download atomicity", () => {
 // --------------------------------------------------------------------------- //
 // Client identification
 //
-// The shape `docs/api.md` documents, pinned here so the header cannot drift out of
-// it. The whole string has to match: appending another product token means the
-// caller is no longer recognised as an official SDK.
+// The shape the published API reference documents, pinned here so the header
+// cannot drift out of it. The whole string has to match: appending another
+// product token means the caller is no longer recognised as an official SDK.
 // --------------------------------------------------------------------------- //
 const SDK_USER_AGENT_RE = /^image2ppt-(python|node)\/\S+$/;
 

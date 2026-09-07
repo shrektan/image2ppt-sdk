@@ -117,7 +117,7 @@ The per-page `error.code` values the contract defines today are exactly
 `CONVERSION_FAILED`, `CONVERSION_TIMEOUT`, and `PAGE_NOT_ATTEMPTED`. Treat a code you do
 not recognise as `CONVERSION_FAILED`. Note this is a *finer* set than the job-level
 `job.error["code"]`, which still has only its two long-standing values — the two levels
-differ deliberately, and the [API reference](../docs/api.md) explains why.
+differ deliberately, and the [API reference](https://image2ppt.com/en/docs/api) explains why.
 
 `error.retryable` says whether resubmitting the same image could succeed. Every code
 above carries `True` today — **branch on the field anyway** rather than hardcoding it,
@@ -275,7 +275,7 @@ It is `True` for `ServerError` (any 5xx), `RateLimitedError`, `APIConnectionErro
 
 ## Full API reference
 
-See [../docs/api.md](../docs/api.md) for the complete HTTP contract (endpoints, fields, error codes). 中文版：[../docs/api.zh.md](../docs/api.zh.md)。
+See <https://image2ppt.com/en/docs/api> for the complete HTTP contract (endpoints, fields, error codes). 中文版：<https://image2ppt.com/docs/api>。
 
 ## License
 
