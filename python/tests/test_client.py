@@ -1422,9 +1422,10 @@ def test_a_2xx_body_that_stops_arriving_is_a_connection_failure():
 # --------------------------------------------------------------------------- #
 # Client identification
 #
-# The shape `docs/api.md` documents, pinned here so the header cannot drift out of
-# it. The whole string has to match: appending another product token
-# (python-requests/2.x) means the caller is no longer recognised as an official SDK.
+# The shape the published API reference documents, pinned here so the header
+# cannot drift out of it. The whole string has to match: appending another
+# product token (python-requests/2.x) means the caller is no longer recognised
+# as an official SDK.
 # --------------------------------------------------------------------------- #
 _SDK_USER_AGENT_RE = re.compile(r"^image2ppt-(python|node)/\S+$")
 

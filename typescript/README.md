@@ -254,7 +254,7 @@ try {
 
 ## Full API reference
 
-See [../docs/api.md](../docs/api.md) for the complete HTTP contract (endpoints, fields, error codes). 中文版：[../docs/api.zh.md](../docs/api.zh.md)。
+See <https://image2ppt.com/en/docs/api> for the complete HTTP contract (endpoints, fields, error codes). 中文版：<https://image2ppt.com/docs/api>。
 
 ## Develop
 
