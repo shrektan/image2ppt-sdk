@@ -3,54 +3,6 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
-## Unreleased
-
-### Changed
-
-- **Docs** — the HTTP reference is no longer kept as a copy in this repository.
-  `docs/api.md` and `docs/api.zh.md` are now short pointers to the published
-  reference at <https://image2ppt.com/en/docs/api> (中文：<https://image2ppt.com/docs/api>),
-  and every link in the READMEs goes straight there. A copy has to be re-synced
-  by hand each time the contract moves, and in between it can be wrong without
-  anyone noticing — the `pageResults` date entry below is what that looks like
-  in practice, and re-aligning the copy afterwards took a release of its own.
-  There is one published page now, and nothing to keep in step with it.
-
-  This also repairs links that never worked outside GitHub: both package READMEs
-  pointed at `../docs/api.md`, a relative path that resolves to nothing on the
-  PyPI and npm pages where those READMEs are actually read. The `Documentation`
-  URL in the Python package metadata pointed at the Chinese page next to an
-  English README, and now points at the English one.
-
-### Fixed
-
-- **Both clients** — the two booleans in a cancellation response, and the
-  `cancellation_requested` / `cancellationRequested` marker on a job snapshot, are
-  read by identity rather than truthiness. Coercing them was not the same test in
-  the two languages — `[]` is truthy in JavaScript and falsy in Python — so a
-  malformed body meant opposite things to the two clients for one API. Each field
-  now falls to the side that costs a caller nothing when the value cannot be read:
-  only a real `true` says a cancellation was accepted, and only a real `false` says
-  a job has finished winding down. A well-formed response is unaffected.
-- **Node** — a download that fails because of the *disk* — no space, no
-  permission, a destination directory that is not there — is no longer reported
-  as `APIConnectionError`. It was, complete with the `isTransient` marker that
-  invites a retry, so a caller with a full disk could retry forever. The
-  operating system's own error (`ENOSPC`, `EACCES`, `ENOENT`) now reaches the
-  caller unchanged, naming the problem they have to fix. A download that stops
-  *arriving* is unaffected and still raises `APIConnectionError`; the Python
-  client already drew the line here.
-- **Docs, both clients** — nothing now names a date for when `pageResults` is
-  absent. Every place that described it — this file, both package READMEs, both
-  clients' API reference for the field, and the API contract doc — said the
-  ledger is missing for jobs submitted before September 2026, and that was not
-  true: jobs submitted well inside that window do carry one. Anyone who read the
-  sentence as a rule and skipped `pageResults` for those jobs was skipping data
-  that is really there, on our own instruction. No date replaces it, because the
-  boundary is not a date a caller can check a job against. **Test whether the
-  field is present** — the same advice those sentences always ended with, and now
-  the only thing they say.
-
 ## 0.5.0
 
 Error handling, end to end. Both clients now report **which pages** of a job did
@@ -136,9 +88,33 @@ raises subclasses `Image2PPTError`* — is finally true.
   `examples/step_by_step.py` read `page.error.code` with no guard, so it raised
   `AttributeError` on a failed page whose `error` this client could not read —
   a value the new parsing rule above produces. The Node examples already guarded.
-- **Node** — `Job.cancellationRequested` is coerced to a real boolean instead of
-  passing any non-null value through into a field declared `boolean`. The
-  cancellation response has always coerced; the job snapshot did not.
+
+- **Both clients** — the two booleans in a cancellation response, and the
+  `cancellation_requested` / `cancellationRequested` marker on a job snapshot, are
+  read by identity rather than truthiness. Coercing them was not the same test in
+  the two languages — `[]` is truthy in JavaScript and falsy in Python — so a
+  malformed body meant opposite things to the two clients for one API. Each field
+  now falls to the side that costs a caller nothing when the value cannot be read:
+  only a real `true` says a cancellation was accepted, and only a real `false` says
+  a job has finished winding down. A well-formed response is unaffected.
+- **Node** — a download that fails because of the *disk* — no space, no
+  permission, a destination directory that is not there — is no longer reported
+  as `APIConnectionError`. It was, complete with the `isTransient` marker that
+  invites a retry, so a caller with a full disk could retry forever. The
+  operating system's own error (`ENOSPC`, `EACCES`, `ENOENT`) now reaches the
+  caller unchanged, naming the problem they have to fix. A download that stops
+  *arriving* is unaffected and still raises `APIConnectionError`; the Python
+  client already drew the line here.
+- **Docs, both clients** — nothing now names a date for when `pageResults` is
+  absent. Every place that described it — this file, both package READMEs, both
+  clients' API reference for the field, and the API contract doc — said the
+  ledger is missing for jobs submitted before September 2026, and that was not
+  true: jobs submitted well inside that window do carry one. Anyone who read the
+  sentence as a rule and skipped `pageResults` for those jobs was skipping data
+  that is really there, on our own instruction. No date replaces it, because the
+  boundary is not a date a caller can check a job against. **Test whether the
+  field is present** — the same advice those sentences always ended with, and now
+  the only thing they say.
 
 ### Changed
 
@@ -165,12 +141,20 @@ raises subclasses `Image2PPTError`* — is finally true.
   optional, so a `Job`-shaped object literal in your own code has to carry it.
   `Image2PPTError` accepts a `cause`, and `ErrorInit` — already exported from the
   errors module — is now re-exported from the package entry point.
-- **Docs** — `docs/api.md` / `docs/api.zh.md` re-synced with the published
-  contract: per-page results, the finer per-page failure codes, the
-  `Accept-Language` rule, and clarified cancellation wording (a page being
-  dispatched as cancellation arrives may still run to completion and be billed;
-  `JOB_ALREADY_FINISHED` also covers a job past the point where cancellation
-  could change the outcome).
+- **Docs** — the HTTP reference is no longer kept as a copy in this repository.
+  `docs/api.md` and `docs/api.zh.md` are now short pointers to the published
+  reference at <https://image2ppt.com/en/docs/api> (中文：<https://image2ppt.com/docs/api>),
+  and every link in the READMEs goes straight there. A copy has to be re-synced
+  by hand each time the contract moves, and in between it can be wrong without
+  anyone noticing — the `pageResults` date entry under **Fixed** above is what
+  that looks like in practice. There is one published page now, and nothing to
+  keep in step with it.
+
+  This also repairs links that never worked outside GitHub: both package READMEs
+  pointed at `../docs/api.md`, a relative path that resolves to nothing on the
+  PyPI and npm pages where those READMEs are actually read. The `Documentation`
+  URL in the Python package metadata pointed at the Chinese page next to an
+  English README, and now points at the English one.
 
 ### Deployment Notes
 
